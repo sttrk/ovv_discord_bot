@@ -10,9 +10,6 @@ from openai import OpenAI
 # =======================================
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
 if DISCORD_BOT_TOKEN is None:
     raise RuntimeError("環境変数 DISCORD_BOT_TOKEN が設定されていません。")
@@ -21,147 +18,112 @@ if OPENAI_API_KEY is None:
     raise RuntimeError("環境変数 OPENAI_API_KEY が設定されていません。")
 
 # =======================================
-# 外部ブートストラップ読み込み（本物）
+# Bootstrapping
 # =======================================
 def load_bootstrap() -> str:
-    """
-    GitHub/Render上の bootstrap_ovv.txt を読み込む。
-    """
     path = "bootstrap_ovv.txt"
     if not os.path.exists(path):
         raise RuntimeError(f"ブートストラップファイル {path} が存在しません。")
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-# 外部ファイルの内容が OVV の人格
 OVV_SYSTEM_PROMPT = load_bootstrap()
 
 # =======================================
-# OpenAI Client（必要・必須）
+# OpenAI Client
 # =======================================
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+def call_ovv(prompt: str, mode: str = "general") -> str:
+    messages = [
+        {"role": "system", "content": OVV_SYSTEM_PROMPT},
+        {"role": "user", "content": f"[MODE={mode}]\n{prompt}"}
+    ]
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages,
+        temperature=0.3,
+    )
+    return completion.choices[0].message.content.strip()
 
 # =======================================
 # Discord Bot
 # =======================================
 intents = discord.Intents.default()
 intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# =======================================
-# OpenAI Call Helper
-# =======================================
-def call_ovv(prompt: str, mode: str = "general") -> str:
-    messages = [
-        {"role": "system", "content": OVV_SYSTEM_PROMPT},
-        {"role": "user", "content": f"[MODE={mode}]\n{prompt}"},
-    ]
-
-    completion = openai_client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages,
-        temperature=0.3,
-    )
-
-    return completion.choices[0].message.content.strip()
-
-# =======================================
-# Logging
-# =======================================
-LOG_FILE_PATH = "learning_logs.txt"
-
-def save_log_local(user_id: int, content: str):
-    now = datetime.utcnow().isoformat()
-    line = f"{now}\tuser={user_id}\t{content}\n"
-    try:
-        with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception as e:
-        print(f"[WARN] {e}")
-
-def register_learning_log(user_id: int, content: str):
-    save_log_local(user_id, content)
+# OVV 専用チャンネル ID の設定
+OVV_CHANNEL_ID = 1442797863145967616  # ← 後で実際のチャンネル ID に置き換えてください
 
 # =======================================
 # Events
 # =======================================
 @bot.event
 async def on_ready():
-    print(f"[INFO] Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"[INFO] Logged in as {bot.user}")
     print("[INFO] Ovv Discord Bot is ready.")
 
 # =======================================
-# Commands
+# OVV 自動応答（チャンネル＋スレッド対応）
 # =======================================
-@bot.command(name="ovv")
-async def ovv_command(ctx: commands.Context, *, question: str):
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    await bot.process_commands(message)  # コマンド処理を先に実行
+
+    # 通常チャンネル or スレッド判定
+    parent_id = getattr(message.channel, "parent_id", None)
+
+    is_main = message.channel.id == OVV_CHANNEL_ID
+    is_thread = parent_id == OVV_CHANNEL_ID
+
+    if not (is_main or is_thread):
+        return  # OVV チャンネル以外は OFF
+
+    # 先頭が "!" のメッセージはコマンド扱いなので無視
+    if message.content.startswith("!"):
+        return
+
+    # OVV 自動応答
+    async with message.channel.typing():
+        try:
+            answer = call_ovv(message.content)
+        except Exception as e:
+            print(f"[ERROR] call_ovv failed: {e}")
+            await message.channel.send("OVV との通信中にエラーが発生しました。")
+            return
+
+    await message.channel.send(answer)
+
+# =======================================
+# コマンド定義 (!o = ovv)
+# =======================================
+@bot.command(name="o")  # ← !o で反応
+async def ovv_short(ctx: commands.Context, *, question: str):
     async with ctx.channel.typing():
         try:
             answer = call_ovv(question)
         except Exception as e:
-            print(f"[ERROR] {e}")
+            print(f"[ERROR] call_ovv failed: {e}")
             await ctx.send("OVV との通信中にエラーが発生しました。")
             return
 
-    # 2000文字制限対応
-    if len(answer) <= 1900:
-        await ctx.send(answer)
-    else:
-        buf = ""
-        for line in answer.splitlines(True):
-            if len(buf) + len(line) > 1900:
-                await ctx.send(buf)
-                buf = line
-            else:
-                buf += line
-        if buf:
-            await ctx.send(buf)
-
-@bot.command(name="log")
-async def log_command(ctx: commands.Context, *, content: str):
-    user_id = ctx.author.id
-    register_learning_log(user_id, content)
-    await ctx.send("学習ログを記録しました。")
-
-@bot.command(name="plan")
-async def plan_command(ctx: commands.Context, *, goal: Optional[str] = None):
-    if goal is None:
-        goal = "Python を実務レベルで使えるようになること"
-
-    prompt = f"次のゴールに向けた学習ロードマップを作ってください。\nゴール: {goal}"
-
-    async with ctx.channel.typing():
-        try:
-            answer = call_ovv(prompt, mode="plan")
-        except Exception as e:
-            print(f"[ERROR] {e}")
-            await ctx.send("学習プラン生成中にエラーが発生しました。")
-            return
-
-    if len(answer) <= 1900:
-        await ctx.send(answer)
-    else:
-        buf = ""
-        for line in answer.splitlines(True):
-            if len(buf) + len(line) > 1900:
-                await ctx.send(buf)
-                buf = line
-            else:
-                buf += line
-        if buf:
-            await ctx.send(buf)
+    await ctx.send(answer)
 
 @bot.command(name="help")
 async def help_command(ctx: commands.Context):
-    msg = (
-        "OVV Discord Bot コマンド一覧：\n"
+    txt = (
+        "OVV Bot コマンド一覧\n"
         "```text\n"
-        "!ovv <質問内容>\n"
-        "!log <内容>\n"
-        "!plan [ゴール]\n"
+        "!o <質問内容>   : OVV に簡易質問\n"
+        "通常メッセージ : OVV がチャンネル or スレッドで自動応答\n"
         "```"
     )
-    await ctx.send(msg)
+    await ctx.send(txt)
 
 # =======================================
 # Run
