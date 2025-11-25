@@ -19,44 +19,33 @@ if DISCORD_BOT_TOKEN is None:
 
 if OPENAI_API_KEY is None:
     raise RuntimeError("環境変数 OPENAI_API_KEY が設定されていません。")
+
 # =======================================
-# 外部ブートストラップ読み込み
+# 外部ブートストラップ読み込み（本物）
 # =======================================
 def load_bootstrap() -> str:
     """
     GitHub/Render上の bootstrap_ovv.txt を読み込む。
-    ファイルが無い場合は RuntimeError として停止する。
     """
     path = "bootstrap_ovv.txt"
     if not os.path.exists(path):
         raise RuntimeError(f"ブートストラップファイル {path} が存在しません。")
-
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
+# 外部ファイルの内容が OVV の人格
 OVV_SYSTEM_PROMPT = load_bootstrap()
 
-
 # =======================================
-# OpenAI Client
+# OpenAI Client（必要・必須）
 # =======================================
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-OVV_SYSTEM_PROMPT = """
-You are Ovv (“Universal Product Engineer”).
-You design learning plans, development roadmaps, and perform light architecture thinking
-for Python learning + Discord bot + GitHub + Notion integration.
-
-日本語ユーザを前提に、回答は日本語で行う。
-Proposal / Audit / Final の3フェーズを意識しつつ、Discord で読める長さにまとめること。
-"""
 
 # =======================================
 # Discord Bot
 # =======================================
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # =======================================
@@ -77,7 +66,7 @@ def call_ovv(prompt: str, mode: str = "general") -> str:
     return completion.choices[0].message.content.strip()
 
 # =======================================
-# Local Logging (暫定)
+# Logging
 # =======================================
 LOG_FILE_PATH = "learning_logs.txt"
 
@@ -88,11 +77,10 @@ def save_log_local(user_id: int, content: str):
         with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
             f.write(line)
     except Exception as e:
-        print(f"[WARN] Failed to write local log: {e}")
+        print(f"[WARN] {e}")
 
 def register_learning_log(user_id: int, content: str):
     save_log_local(user_id, content)
-    # GitHub / Notion は将来追加
 
 # =======================================
 # Events
@@ -107,14 +95,15 @@ async def on_ready():
 # =======================================
 @bot.command(name="ovv")
 async def ovv_command(ctx: commands.Context, *, question: str):
-    async with ctx.channel.typing():   # ← 修正：trigger_typing() は廃止
+    async with ctx.channel.typing():
         try:
             answer = call_ovv(question)
         except Exception as e:
-            print(f"[ERROR] call_ovv failed: {e}")
+            print(f"[ERROR] {e}")
             await ctx.send("OVV との通信中にエラーが発生しました。")
             return
 
+    # 2000文字制限対応
     if len(answer) <= 1900:
         await ctx.send(answer)
     else:
@@ -139,16 +128,13 @@ async def plan_command(ctx: commands.Context, *, goal: Optional[str] = None):
     if goal is None:
         goal = "Python を実務レベルで使えるようになること"
 
-    prompt = (
-        "次のゴールに向けた学習ロードマップを作ってください。\n"
-        f"・ゴール: {goal}\n"
-    )
+    prompt = f"次のゴールに向けた学習ロードマップを作ってください。\nゴール: {goal}"
 
     async with ctx.channel.typing():
         try:
             answer = call_ovv(prompt, mode="plan")
         except Exception as e:
-            print(f"[ERROR] plan call_ovv failed: {e}")
+            print(f"[ERROR] {e}")
             await ctx.send("学習プラン生成中にエラーが発生しました。")
             return
 
