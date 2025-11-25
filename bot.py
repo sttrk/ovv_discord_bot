@@ -19,6 +19,23 @@ if DISCORD_BOT_TOKEN is None:
 
 if OPENAI_API_KEY is None:
     raise RuntimeError("環境変数 OPENAI_API_KEY が設定されていません。")
+# =======================================
+# 外部ブートストラップ読み込み
+# =======================================
+def load_bootstrap() -> str:
+    """
+    GitHub/Render上の bootstrap_ovv.txt を読み込む。
+    ファイルが無い場合は RuntimeError として停止する。
+    """
+    path = "bootstrap_ovv.txt"
+    if not os.path.exists(path):
+        raise RuntimeError(f"ブートストラップファイル {path} が存在しません。")
+
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+OVV_SYSTEM_PROMPT = load_bootstrap()
+
 
 # =======================================
 # OpenAI Client
