@@ -131,12 +131,13 @@ def register_learning_log(user_id: int, content: str) -> None:
 
 # =======================================
 # Bot イベント
-# =======================================
-@bot.event
-async def on_ready():
-    print(f"[INFO] Logged in as {bot.user} (ID: {bot.user.id})")
-    print("[INFO] Ovv Discord Bot is ready.")
-
+# =======================================@bot.event
+async def on_message(message: discord.Message):
+    if message.author == bot.user:
+        return
+    
+    # これがないとコマンドが無視されることがある
+    await bot.process_commands(message)
 
 # =======================================
 # コマンド: !ovv  – Ovv に質問する
