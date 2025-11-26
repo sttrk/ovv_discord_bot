@@ -5,21 +5,20 @@ from openai import OpenAI
 from typing import Dict, List
 
 # ============================================================
-# Environment Variables
+# Environment
 # ============================================================
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not DISCORD_BOT_TOKEN:
-    raise RuntimeError("環境変数 DISCORD_BOT_TOKEN が未設定です。")
-
+    raise RuntimeError("DISCORD_BOT_TOKEN が未設定です。")
 if not OPENAI_API_KEY:
-    raise RuntimeError("環境変数 OPENAI_API_KEY が未設定です。")
+    raise RuntimeError("OPENAI_API_KEY が未設定です。")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ============================================================
-# Load Core + External Contract
+# Load Core + External
 # ============================================================
 def load_text(path: str) -> str:
     if not os.path.exists(path):
@@ -33,84 +32,91 @@ OVV_EXTERNAL = load_text("ovv_external_contract.txt")
 SYSTEM_PROMPT = OVV_CORE + "\n\n" + OVV_EXTERNAL
 
 # ============================================================
-# Discord Bot Setup
+# Discord Setup
 # ============================================================
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ============================================================
-# Memory store（チャンネル / スレッド単位）
+# Memory store
 # ============================================================
 memory: Dict[int, List[Dict[str, str]]] = {}
 MEMORY_LIMIT = 20
 
-def get_key(msg: discord.Message) -> int:
+def key_from(msg: discord.Message) -> int:
     if isinstance(msg.channel, discord.Thread):
         return msg.channel.id
     return msg.channel.id
 
-def append_message(key: int, role: str, content: str):
+def push(key: int, role: str, content: str):
     memory.setdefault(key, [])
     memory[key].append({"role": role, "content": content})
     if len(memory[key]) > MEMORY_LIMIT:
         memory[key] = memory[key][-MEMORY_LIMIT:]
 
 # ============================================================
-# Call Ovv
+# Parse FINAL section
 # ============================================================
-def call_ovv(key: int, prompt: str) -> str:
+def extract_final_section(text: str) -> str:
+    marker = "[FINAL]"
+    if marker in text:
+        return text.split(marker, 1)[1].strip()
+    return text  # fallback（Ovv が FINAL を書き忘れても安全）
+
+# ============================================================
+# Ovv Call
+# ============================================================
+def call_ovv(key: int, user_msg: str) -> str:
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     msgs.extend(memory.get(key, []))
-    msgs.append({"role": "user", "content": prompt})
+    msgs.append({"role": "user", "content": user_msg})
 
     res = openai_client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=msgs,
         temperature=0.3,
     )
-    return res.choices[0].message.content.strip()
+
+    full_reply = res.choices[0].message.content.strip()
+    push(key, "assistant", full_reply)
+
+    return extract_final_section(full_reply)
 
 # ============================================================
-# 自然言語モード（!o不要 / ovv-◯◯限定）
+# Natural conversation mode（!o不要）
+# ovv-◯◯ チャンネル & そのスレッドのみ
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 追加：スレッド作成通知を無視（最重要）
-    if message.type == discord.MessageType.thread_created:
-        return
-
-    # ovv-◯◯ チャンネルのみ有効
+    # ovv-◯◯ チャンネル以外は応答しない
     if isinstance(message.channel, discord.Thread):
-        parent = message.channel.parent.name.lower()
-        if not parent.startswith("ovv-"):
+        if not message.channel.parent.name.lower().startswith("ovv-"):
             return
     else:
         if not message.channel.name.lower().startswith("ovv-"):
             return
 
-    key = get_key(message)
-    append_message(key, "user", message.content)
+    key = key_from(message)
+    push(key, "user", message.content)
 
     async with message.channel.typing():
         try:
-            response = call_ovv(key, message.content)
+            answer = call_ovv(key, message.content)
         except Exception as e:
             print("[ERROR call_ovv]", e)
             await message.channel.send("Ovv との通信中にエラーが発生しました。")
             return
 
-    append_message(key, "assistant", response)
-
-    # 文字数制限
-    if len(response) <= 1900:
-        await message.channel.send(response)
+    # send FINAL only
+    if len(answer) <= 1900:
+        await message.channel.send(answer)
     else:
         buf = ""
-        for line in response.splitlines(True):
+        for line in answer.splitlines(True):
             if len(buf) + len(line) > 1900:
                 await message.channel.send(buf)
                 buf = line
@@ -119,22 +125,20 @@ async def on_message(message: discord.Message):
         if buf:
             await message.channel.send(buf)
 
-    # コマンド処理も通す
     await bot.process_commands(message)
 
 # ============================================================
-# !o — 明示コマンド
+# !o — 明示コマンド（任意）
 # ============================================================
 @bot.command(name="o")
 async def o_command(ctx: commands.Context, *, question: str):
-    key = get_key(ctx.message)
-    append_message(key, "user", question)
+    key = key_from(ctx.message)
+    push(key, "user", question)
 
     async with ctx.channel.typing():
-        response = call_ovv(key, question)
+        answer = call_ovv(key, question)
 
-    append_message(key, "assistant", response)
-    await ctx.send(response)
+    await ctx.send(answer)
 
 # ============================================================
 # Run
