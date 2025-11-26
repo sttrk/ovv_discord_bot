@@ -79,6 +79,10 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
+    # 追加：スレッド作成通知を無視（最重要）
+    if message.type == discord.MessageType.thread_created:
+        return
+
     # ovv-◯◯ チャンネルのみ有効
     if isinstance(message.channel, discord.Thread):
         parent = message.channel.parent.name.lower()
