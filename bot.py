@@ -3,166 +3,126 @@ import discord
 from discord.ext import commands
 from openai import OpenAI
 from datetime import datetime
+from typing import Optional
 
-# =======================================
-# Environment Variables
-# =======================================
+# ============================================================
+# 1. Environment Variables
+# ============================================================
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not DISCORD_BOT_TOKEN:
+if DISCORD_BOT_TOKEN is None:
     raise RuntimeError("環境変数 DISCORD_BOT_TOKEN が設定されていません。")
-if not OPENAI_API_KEY:
+
+if OPENAI_API_KEY is None:
     raise RuntimeError("環境変数 OPENAI_API_KEY が設定されていません。")
 
-# =======================================
-# OpenAI Client
-# =======================================
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# =======================================
-# Bootstrap Load
-# =======================================
-def load_bootstrap() -> str:
-    path = "bootstrap_ovv.txt"
+# ============================================================
+# 2. File Loader（Ovvコア＋外部契約 読み込み）
+# ============================================================
+def load_file(path: str) -> str:
     if not os.path.exists(path):
-        raise RuntimeError(f"ブートストラップ {path} が見つかりません。Render にアップロードされているか確認してください。")
+        raise RuntimeError(f"ブートストラップファイル {path} が存在しません。")
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-OVV_SYSTEM_PROMPT = load_bootstrap()
+OVV_CORE = load_file("ovv_core.txt")
+OVV_EXTERNAL = load_file("ovv_external.txt")
 
-# =======================================
-# Context Memory (channel/thread separate)
-# =======================================
-MEMORY_LIMIT = 20
-conversation_memory = {}  # {channel_id: [msg, msg, ...]}
+# コア＋外部契約の合成（人格→運用ルール）
+OVV_SYSTEM_PROMPT = OVV_CORE + "\n\n" + OVV_EXTERNAL
 
-def add_memory(channel_id: int, role: str, content: str):
-    if channel_id not in conversation_memory:
-        conversation_memory[channel_id] = []
-    conversation_memory[channel_id].append({"role": role, "content": content})
-    if len(conversation_memory[channel_id]) > MEMORY_LIMIT:
-        conversation_memory[channel_id] = conversation_memory[channel_id][-MEMORY_LIMIT:]
 
-def get_memory(channel_id: int):
-    return conversation_memory.get(channel_id, [])
+# ============================================================
+# 3. OpenAI Client
+# ============================================================
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-def is_ovv_channel(channel) -> bool:
-    """
-    自動応答対象：
-    1. チャンネル名が ovv で始まる (#ovv, #ovv-dev, ...)
-    2. スレッド → 親チャンネル名が ovv で始まる
-    """
-    if isinstance(channel, discord.TextChannel):
-        return channel.name.startswith("ovv")
 
-    if isinstance(channel, discord.Thread):
-        if channel.parent and channel.parent.name.startswith("ovv"):
-            return True
-
-    return False
-
-# =======================================
-# OpenAI Call
-# =======================================
-def call_ovv(prompt: str, memory):
-    messages = [{"role": "system", "content": OVV_SYSTEM_PROMPT}]
-    messages.extend(memory)
-    messages.append({"role": "user", "content": prompt})
-
-    completion = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages,
-        temperature=0.3,
-    )
-
-    return completion.choices[0].message.content.strip()
-
-# =======================================
-# Discord Bot Setup
-# =======================================
+# ============================================================
+# 4. Discord Bot Setup
+# ============================================================
 intents = discord.Intents.default()
 intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# =======================================
-# Events
-# =======================================
+
+# ============================================================
+# 5. Channel-based Memory（外部契約 v1.0）
+# ============================================================
+CHANNEL_MEMORY = {}       # {channel_id: [ {"role": "user", ...}, ... ]}
+MAX_MEMORY = 20           # メモリ保持件数（20件）
+
+
+def push_memory(channel_id: int, role: str, content: str):
+    if channel_id not in CHANNEL_MEMORY:
+        CHANNEL_MEMORY[channel_id] = []
+    CHANNEL_MEMORY[channel_id].append({"role": role, "content": content})
+
+    # メモリ上限（20件）
+    if len(CHANNEL_MEMORY[channel_id]) > MAX_MEMORY:
+        CHANNEL_MEMORY[channel_id].pop(0)
+
+
+def get_memory(channel_id: int):
+    return CHANNEL_MEMORY.get(channel_id, [])
+
+
+# ============================================================
+# 6. Call Ovv（文脈＋システムプロンプトを合成）
+# ============================================================
+def call_ovv_with_context(channel_id: int, user_message: str):
+    # 1. ユーザメッセージをメモリへ
+    push_memory(channel_id, "user", user_message)
+
+    # 2. 文脈取得
+    ctx_history = get_memory(channel_id)
+
+    # 3. プロンプト生成
+    messages = [{"role": "system", "content": OVV_SYSTEM_PROMPT}]
+    messages.extend(ctx_history)
+
+    # 4. OpenAI 呼び出し
+    completion = openai_client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages,
+        temperature=0.2,
+    )
+
+    answer = completion.choices[0].message.content.strip()
+
+    # 5. メモリへ保存
+    push_memory(channel_id, "assistant", answer)
+
+    return answer
+
+
+# ============================================================
+# 7. Events
+# ============================================================
 @bot.event
 async def on_ready():
-    print(f"[INFO] Logged in as {bot.user} ({bot.user.id})")
-    print("[INFO] Ovv Discord Bot Ready.")
+    print(f"[INFO] Logged in as {bot.user} (ID: {bot.user.id})")
+    print("[INFO] Ovv Discord Bot is ready.")
 
-# =======================================
-# Main auto-reply handler (3方式)
-# =======================================
-@bot.event
-async def on_message(message: discord.Message):
-    # bot自身 or DM は無視
-    if message.author.bot:
-        return
-    if isinstance(message.channel, discord.DMChannel):
-        return
 
-    # コマンド処理を先に通す
-    await bot.process_commands(message)
-
-    # 自動応答対象判定
-    if not is_ovv_channel(message.channel):
-        return
-
-    # "!o" コマンド以外の通常メッセージも処理
-    user_text = message.content.strip()
-
-    # メモリ追加（user）
-    add_memory(message.channel.id, "user", user_text)
-
-    async with message.channel.typing():
-        try:
-            memory = get_memory(message.channel.id)
-            answer = call_ovv(user_text, memory)
-        except Exception as e:
-            print(f"[ERROR] call_ovv failed: {e}")
-            await message.channel.send("OVVとの通信中にエラーが発生しました。")
-            return
-
-    # メモリ追加（assistant）
-    add_memory(message.channel.id, "assistant", answer)
-
-    # Discordの制限に合わせて分割
-    if len(answer) <= 1900:
-        await message.channel.send(answer)
-    else:
-        buf = ""
-        for line in answer.splitlines(True):
-            if len(buf) + len(line) > 1900:
-                await message.channel.send(buf)
-                buf = line
-            else:
-                buf += line
-        if buf:
-            await message.channel.send(buf)
-
-# =======================================
-# "!o" コマンド（省略版）
-# =======================================
+# ============================================================
+# 8. !o コマンド（Ovv に話しかける）
+# ============================================================
 @bot.command(name="o")
 async def o_command(ctx: commands.Context, *, question: str):
-    user_text = question
-    add_memory(ctx.channel.id, "user", user_text)
+    channel_id = ctx.channel.id
 
     async with ctx.channel.typing():
         try:
-            memory = get_memory(ctx.channel.id)
-            answer = call_ovv(user_text, memory)
+            answer = call_ovv_with_context(channel_id, question)
         except Exception as e:
-            print(f"[ERROR] !o failed: {e}")
-            await ctx.send("OVVとの通信中にエラーが発生しました。")
+            print(f"[ERROR] call_ovv failed: {e}")
+            await ctx.send("通信中にエラーが発生しました。")
             return
 
-    add_memory(ctx.channel.id, "assistant", answer)
-
+    # Discord 文字数制限（2000字）
     if len(answer) <= 1900:
         await ctx.send(answer)
     else:
@@ -176,9 +136,25 @@ async def o_command(ctx: commands.Context, *, question: str):
         if buf:
             await ctx.send(buf)
 
-# =======================================
-# RUN
-# =======================================
+
+# ============================================================
+# 9. Help
+# ============================================================
+@bot.command(name="help")
+async def help_command(ctx: commands.Context):
+    msg = (
+        "OVV Discord Bot コマンド一覧：\n"
+        "```text\n"
+        "!o <質問内容>     : Ovv（Universal Product Engineer）に相談\n"
+        "（チャンネル単位で文脈を保持し、外部契約に基づき安全処理）\n"
+        "```"
+    )
+    await ctx.send(msg)
+
+
+# ============================================================
+# 10. Run
+# ============================================================
 def main():
     bot.run(DISCORD_BOT_TOKEN)
 
