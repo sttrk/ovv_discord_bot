@@ -1,5 +1,6 @@
 import os
 import discord
+from discord import MessageType
 from discord.ext import commands
 from openai import OpenAI
 from typing import Dict, List
@@ -90,6 +91,9 @@ def call_ovv(key: int, user_msg: str) -> str:
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
+        return
+    # スレッド作成時の自動メッセージは無視
+    if message.type == MessageType.thread_created:
         return
 
     # ovv-◯◯ チャンネル以外は応答しない
