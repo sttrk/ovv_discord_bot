@@ -114,7 +114,26 @@ async def notion_add_log(session_id: str, content: str, timestamp: str):
     except Exception as e:
         print("[ERROR notion_add_log]", e)
         return False
-        
+
+# ============================================================
+# Task / Session Runtime Memory（追記）
+# ============================================================
+
+# thread_id → task_id
+THREAD_TASK_MAP: Dict[int, str] = {}
+
+# thread_id → session_id（作業中のみ入る）
+THREAD_SESSION_MAP: Dict[int, str] = {}
+
+# thread_id → セッション開始時刻（datetime オブジェクト）
+THREAD_SESSION_START: Dict[int, datetime] = {}
+
+# thread_id → 未保存ログ（バッチ処理用）
+THREAD_LOG_BUFFER: Dict[int, List[Dict[str, str]]] = {}
+
+# バッチ処理の閾値（例：10件 or 300秒ごとなど）
+LOG_BUFFER_LIMIT = 10
+
 # ============================================================
 # Load Core + External
 # ============================================================
