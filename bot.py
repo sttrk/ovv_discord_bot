@@ -111,7 +111,7 @@ async def end_session(
     Sessions.DB のセッションを終了扱いにする。
     - status      : completed
     - ended_at    : date
-    - Summary 等のプロパティに要約を書き込む（ここでは 'Summary' 固定）
+    - summary 等のプロパティに要約を書き込む（ここでは 'summary' 固定）
     """
     try:
         notion.pages.update(
@@ -119,7 +119,7 @@ async def end_session(
             properties={
                 "status": {"select": {"name": "completed"}},
                 "ended_at": {"date": {"start": ended_at.astimezone(timezone.utc).isoformat()}},
-                "Summary": {
+                "summary": {
                     "rich_text": [{"text": {"content": summary[:2000]}}]
                 },
             },
@@ -605,7 +605,7 @@ async def task_end(ctx: commands.Context):
         await ctx.send(
             "セッションを終了しました。\n"
             f"保存ログ件数: {len(logs)}\n"
-            "要約は Notion の Sessions.DB の Summary で確認してください。"
+            "要約は Notion の Sessions.DB の summary で確認してください。"
         )
 
 # ============================================================
