@@ -17,6 +17,25 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY が未設定です。")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# ============================================================
+# Notion Client Setup（追記）
+# ============================================================
+NOTION_API_KEY = os.getenv("NOTION_API_KEY")
+NOTION_TASKS_DB_ID = os.getenv("NOTION_TASKS_DB_ID")
+NOTION_SESSIONS_DB_ID = os.getenv("NOTION_SESSIONS_DB_ID")
+NOTION_LOGS_DB_ID = os.getenv("NOTION_LOGS_DB_ID")
+
+if not NOTION_API_KEY:
+    raise RuntimeError("NOTION_API_KEY が未設定です。")
+if not NOTION_TASKS_DB_ID:
+    raise RuntimeError("NOTION_TASKS_DB_ID が未設定です。")
+if not NOTION_SESSIONS_DB_ID:
+    raise RuntimeError("NOTION_SESSIONS_DB_ID が未設定です。")
+if not NOTION_LOGS_DB_ID:
+    raise RuntimeError("NOTION_LOGS_DB_ID が未設定です。")
+
+from notion_client import Client
+notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
 # Load Core + External
