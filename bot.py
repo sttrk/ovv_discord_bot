@@ -38,6 +38,84 @@ from notion_client import Client
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
+# Notion CRUD Functions（追記）
+# ============================================================
+
+# タスク作成
+async def notion_create_task(title: str, thread_id: int):
+    """タスク(Tasks.DB)を作成し、task_id を返す。"""
+    try:
+        res = notion.pages.create(
+            parent={"database_id": NOTION_TASKS_DB_ID},
+            properties={
+                "title": [{"text": {"content": title}}],
+                "status": {"status": {"name": "active"}},
+                "discord_thread_id": {"rich_text": [{"text": {"content": str(thread_id)}}]},
+            },
+        )
+        return res["id"]
+    except Exception as e:
+        print("[ERROR notion_create_task]", e)
+        return None
+
+
+# セッション開始
+async def notion_start_session(task_id: str, thread_id: int):
+    """Sessions.DB に新規セッションを作成し session_id を返す。"""
+    try:
+        res = notion.pages.create(
+            parent={"database_id": NOTION_SESSIONS_DB_ID},
+            properties={
+                "title": [{"text": {"content": f"Session {thread_id}"}}],
+                "task": {"relation": [{"id": task_id}]},
+                "discord_thread_id": {"rich_text": [{"text": {"content": str(thread_id)}}]},
+                "status": {"status": {"name": "active"}},
+                "started_at": {"date": {"start": datetime.utcnow().isoformat()}},
+            },
+        )
+        return res["id"]
+    except Exception as e:
+        print("[ERROR notion_start_session]", e)
+        return None
+
+
+# セッション終了（end_session）
+async def notion_end_session(session_id: str, duration_minutes: int, summary: str):
+    """セッションを終了し、Duration と Summary を更新する。"""
+    try:
+        notion.pages.update(
+            page_id=session_id,
+            properties={
+                "status": {"status": {"name": "completed"}},
+                "ended_at": {"date": {"start": datetime.utcnow().isoformat()}},
+                "duration": {"number": duration_minutes},
+                "summary": {"rich_text": [{"text": {"content": summary}}]},
+            },
+        )
+        return True
+    except Exception as e:
+        print("[ERROR notion_end_session]", e)
+        return False
+
+
+# 会話ログ登録
+async def notion_add_log(session_id: str, content: str, timestamp: str):
+    """ログを Logs.DB に追加する。"""
+    try:
+        notion.pages.create(
+            parent={"database_id": NOTION_LOGS_DB_ID},
+            properties={
+                "session": {"relation": [{"id": session_id}]},
+                "content": {"rich_text": [{"text": {"content": content}}]},
+                "timestamp": {"date": {"start": timestamp}},
+            },
+        )
+        return True
+    except Exception as e:
+        print("[ERROR notion_add_log]", e)
+        return False
+        
+# ============================================================
 # Load Core + External
 # ============================================================
 def load_text(path: str) -> str:
