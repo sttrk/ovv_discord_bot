@@ -38,28 +38,27 @@ if not NOTION_LOGS_DB_ID:
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
-# 2. Notion CRUD (External v1.4 準拠)
+# 2. Notion CRUD (Notion_DB_Spec_v1 準拠)
 # ============================================================
 
 async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional[str]:
     """
     Tasks.DB にタスクを作成する。
-    プロパティ仕様（External v1.4 §8.2.1 準拠）:
-      - Name              : title
-      - goal              : rich_text
-      - status            : select (active / paused / completed)
-      - discord_channel_id: rich_text
+    Notion_DB_Spec_v1 §1 準拠:
+
+      - Name      : title
+      - Goal      : rich_text
+      - Status    : select (active / paused / completed)
+      - ChannelId : number（Discord チャンネル ID）
     """
     try:
         res = notion.pages.create(
             parent={"database_id": NOTION_TASKS_DB_ID},
             properties={
                 "Name": {"title": [{"text": {"content": name}}]},
-                "goal": {"rich_text": [{"text": {"content": goal}}]} if goal else {"rich_text": []},
-                "status": {"select": {"name": "active"}},
-                "discord_channel_id": {
-                    "rich_text": [{"text": {"content": str(discord_channel_id)}}]
-                },
+                "Goal": {"rich_text": [{"text": {"content": goal}}]} if goal else {"rich_text": []},
+                "Status": {"select": {"name": "active"}},
+                "ChannelId": {"number": int(discord_channel_id)},
             },
         )
         return res["id"]
@@ -76,24 +75,25 @@ async def start_session(
 ) -> Optional[str]:
     """
     Sessions.DB に active セッションを作成する。
-    プロパティ仕様（External v1.4 §8.2.2 準拠）:
-      - Name              : title
-      - task              : relation → Tasks.DB
-      - status            : select
-      - discord_thread_id : rich_text
-      - started_at        : date
+    Notion_DB_Spec_v1 §2 準拠:
+
+      - Name      : title
+      - Task      : relation → Tasks.DB
+      - ThreadId  : number
+      - Status    : select
+      - StartTime : date
     """
     try:
         res = notion.pages.create(
             parent={"database_id": NOTION_SESSIONS_DB_ID},
             properties={
                 "Name": {"title": [{"text": {"content": name}}]},
-                "task": {"relation": [{"id": task_id}]},
-                "status": {"select": {"name": "active"}},
-                "discord_thread_id": {
-                    "rich_text": [{"text": {"content": str(discord_thread_id)}}]
+                "Task": {"relation": [{"id": task_id}]},
+                "Status": {"select": {"name": "active"}},
+                "ThreadId": {"number": int(discord_thread_id)},
+                "StartTime": {
+                    "date": {"start": started_at.astimezone(timezone.utc).isoformat()}
                 },
-                "started_at": {"date": {"start": started_at.astimezone(timezone.utc).isoformat()}},
             },
         )
         return res["id"]
@@ -109,17 +109,21 @@ async def end_session(
 ) -> bool:
     """
     Sessions.DB のセッションを終了扱いにする。
-    - status      : completed
-    - ended_at    : date
-    - summary 等のプロパティに要約を書き込む（ここでは 'summary' 固定）
+    Notion_DB_Spec_v1 §2 準拠:
+
+      - Status   : completed
+      - EndTime  : date
+      - Summary  : rich_text（ここでは 'Summary' 固定）
     """
     try:
         notion.pages.update(
             page_id=session_id,
             properties={
-                "status": {"select": {"name": "completed"}},
-                "ended_at": {"date": {"start": ended_at.astimezone(timezone.utc).isoformat()}},
-                "summary": {
+                "Status": {"select": {"name": "completed"}},
+                "EndTime": {
+                    "date": {"start": ended_at.astimezone(timezone.utc).isoformat()}
+                },
+                "Summary": {
                     "rich_text": [{"text": {"content": summary[:2000]}}]
                 },
             },
@@ -133,31 +137,27 @@ async def end_session(
 async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
     """
     Logs.DB にログをバッチ追加する。
-    External v1.4 §8.2.3 のモデル前提:
-      - Name               : title
-      - session            : relation → Sessions.DB
-      - discord_message_id : rich_text
-      - author             : rich_text
-      - content            : rich_text
-      - created_at         : date
+    Notion_DB_Spec_v1 §3 準拠:
+
+      - Session   : relation → Sessions.DB
+      - AuthorName: rich_text
+      - Content   : rich_text
+      - CreatedAt : date
     """
     try:
         for log in logs:
             created_iso = log["created_at"]
-            title = f"{created_iso} / {log['author']}"
             notion.pages.create(
                 parent={"database_id": NOTION_LOGS_DB_ID},
                 properties={
-                    "Name": {"title": [{"text": {"content": title}}]},
-                    "session": {"relation": [{"id": session_id}]},
-                    "discord_message_id": {
-                        "rich_text": [{"text": {"content": log["discord_message_id"]}}]
+                    "Session": {"relation": [{"id": session_id}]},
+                    "AuthorName": {
+                        "rich_text": [{"text": {"content": log["author"]}}]
                     },
-                    "author": {"rich_text": [{"text": {"content": log["author"]}}]},
-                    "content": {
+                    "Content": {
                         "rich_text": [{"text": {"content": log["content"][:2000]}}]
                     },
-                    "created_at": {"date": {"start": created_iso}},
+                    "CreatedAt": {"date": {"start": created_iso}},
                 },
             )
         return True
@@ -171,14 +171,17 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     """
-    Tasks.DB から discord_channel_id に紐づく task_id を 1 件取得。
+    Tasks.DB から ChannelId に紐づく task_id を 1 件取得。
+    Notion_DB_Spec_v1 §1 準拠:
+
+      - ChannelId : number
     """
     try:
         resp = notion.databases.query(
             database_id=NOTION_TASKS_DB_ID,
             filter={
-                "property": "discord_channel_id",
-                "rich_text": {"equals": str(discord_channel_id)},
+                "property": "ChannelId",
+                "number": {"equals": int(discord_channel_id)},
             },
             page_size=1,
         )
@@ -193,7 +196,11 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
 
 def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
     """
-    Sessions.DB から discord_thread_id に紐づく active な session_id を 1 件取得。
+    Sessions.DB から ThreadId に紐づく active な session_id を 1 件取得。
+    Notion_DB_Spec_v1 §2 準拠:
+
+      - ThreadId : number
+      - Status   : select = active
     """
     try:
         resp = notion.databases.query(
@@ -201,11 +208,11 @@ def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
             filter={
                 "and": [
                     {
-                        "property": "discord_thread_id",
-                        "rich_text": {"equals": str(discord_thread_id)},
+                        "property": "ThreadId",
+                        "number": {"equals": int(discord_thread_id)},
                     },
                     {
-                        "property": "status",
+                        "property": "Status",
                         "select": {"equals": "active"},
                     },
                 ]
@@ -452,12 +459,12 @@ async def task_info(ctx: commands.Context):
             name = "(名称未設定)"
 
         try:
-            status = props["status"]["select"]["name"]
+            status = props["Status"]["select"]["name"]
         except Exception:
             status = "(不明)"
 
         try:
-            goal = "".join(rt["plain_text"] for rt in props["goal"]["rich_text"])
+            goal = "".join(rt["plain_text"] for rt in props["Goal"]["rich_text"])
         except Exception:
             goal = "(未設定)"
 
@@ -605,7 +612,7 @@ async def task_end(ctx: commands.Context):
         await ctx.send(
             "セッションを終了しました。\n"
             f"保存ログ件数: {len(logs)}\n"
-            "要約は Notion の Sessions.DB の summary で確認してください。"
+            "要約は Notion の Sessions.DB の Summary で確認してください。"
         )
 
 # ============================================================
