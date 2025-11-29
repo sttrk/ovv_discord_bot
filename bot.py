@@ -174,35 +174,49 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     """
-    Tasks.DB から channel_id に一致する task を取得する。
-    Notion rich_text フィルタは長整数文字列との一致が不安定なため、
-    DB 全件を取得して Python 側で手動フィルタする方式に変更する。
+    Tasks.DB から ChannelId に紐づく task_id を取得（pull 方式）。
+    rich_text の equals/contains が Notion API で動作しないケースに対応。
     """
     try:
-        # 1. フィルタ無しで全件取得（最大100件まで）
-        resp = notion.databases.query(
-            database_id=NOTION_TASKS_DB_ID,
-            page_size=100
-        )
-
         target = str(discord_channel_id)
+        cursor = None
 
-        for r in resp.get("results", []):
-            props = r["properties"]
-            channel_field = props.get("ChannelId", {}).get("rich_text", [])
+        while True:
+            if cursor:
+                resp = notion.databases.query(
+                    database_id=NOTION_TASKS_DB_ID,
+                    start_cursor=cursor
+                )
+            else:
+                resp = notion.databases.query(
+                    database_id=NOTION_TASKS_DB_ID
+                )
 
-            # rich_text が複数ブロックに割れても連結すれば良い
-            plain = "".join(block["plain_text"] for block in channel_field)
+            results = resp.get("results", [])
+            for page in results:
+                props = page.get("properties", {})
+                channel_prop = props.get("ChannelId", {})
 
-            if plain == target:
-                return r["id"]
+                # rich_text から plain_text を抽出して結合
+                blocks = channel_prop.get("rich_text", [])
+                merged = "".join(b.get("plain_text", "") for b in blocks)
+
+                # 完全一致
+                if merged == target:
+                    return page["id"]
+
+            # ページが続いている場合
+            if resp.get("has_more"):
+                cursor = resp.get("next_cursor")
+            else:
+                break
 
         return None
 
     except Exception as e:
         print("[ERROR get_task_id_by_channel]", e)
         return None
-
+        
 def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
     """
     Sessions.DB から ThreadId に紐づく active な session_id を 1 件取得。
