@@ -174,23 +174,31 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     """
-    Tasks.DB から ChannelId に紐づく task_id を 1 件取得。
-    ChannelId は rich_text 型で保持されているため、
-    Notion API の rich_text.contains を使用する。
+    Tasks.DB から channel_id に一致する task を取得する。
+    Notion rich_text フィルタは長整数文字列との一致が不安定なため、
+    DB 全件を取得して Python 側で手動フィルタする方式に変更する。
     """
     try:
+        # 1. フィルタ無しで全件取得（最大100件まで）
         resp = notion.databases.query(
             database_id=NOTION_TASKS_DB_ID,
-            filter={
-                "property": "ChannelId",
-                "rich_text": {"contains": str(discord_channel_id)},
-            },
-            page_size=1,
+            page_size=100
         )
-        rs = resp.get("results", [])
-        if not rs:
-            return None
-        return rs[0]["id"]
+
+        target = str(discord_channel_id)
+
+        for r in resp.get("results", []):
+            props = r["properties"]
+            channel_field = props.get("ChannelId", {}).get("rich_text", [])
+
+            # rich_text が複数ブロックに割れても連結すれば良い
+            plain = "".join(block["plain_text"] for block in channel_field)
+
+            if plain == target:
+                return r["id"]
+
+        return None
+
     except Exception as e:
         print("[ERROR get_task_id_by_channel]", e)
         return None
