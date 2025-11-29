@@ -44,12 +44,12 @@ notion = Client(auth=NOTION_API_KEY)
 async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional[str]:
     """
     Tasks.DB にタスクを作成する。
-    Notion_DB_Spec_v1 §1 準拠:
+    Notion_DB_Spec_v1.1 §1 準拠:
 
       - Name      : title
       - Goal      : rich_text
       - Status    : select (active / paused / completed)
-      - ChannelId : number（Discord チャンネル ID）
+      - ChannelId : rich_text（Discord チャンネル ID 文字列）
     """
     try:
         res = notion.pages.create(
@@ -58,14 +58,17 @@ async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional
                 "Name": {"title": [{"text": {"content": name}}]},
                 "Goal": {"rich_text": [{"text": {"content": goal}}]} if goal else {"rich_text": []},
                 "Status": {"select": {"name": "active"}},
-                "ChannelId": {"number": int(discord_channel_id)},
+                "ChannelId": {
+                    "rich_text": [
+                        {"text": {"content": str(discord_channel_id)}}
+                    ]
+                },
             },
         )
         return res["id"]
     except Exception as e:
         print("[ERROR create_task]", e)
         return None
-
 
 async def start_session(
     task_id: str,
@@ -172,16 +175,16 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     """
     Tasks.DB から ChannelId に紐づく task_id を 1 件取得。
-    Notion_DB_Spec_v1 §1 準拠:
+    Notion_DB_Spec_v1.1 §1 準拠:
 
-      - ChannelId : number
+      - ChannelId : rich_text（Discord チャンネル ID 文字列）
     """
     try:
         resp = notion.databases.query(
             database_id=NOTION_TASKS_DB_ID,
             filter={
                 "property": "ChannelId",
-                "number": {"equals": int(discord_channel_id)},
+                "rich_text": {"equals": str(discord_channel_id)},
             },
             page_size=1,
         )
@@ -192,7 +195,6 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     except Exception as e:
         print("[ERROR get_task_id_by_channel]", e)
         return None
-
 
 def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
     """
