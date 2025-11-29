@@ -175,16 +175,15 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     """
     Tasks.DB から ChannelId に紐づく task_id を 1 件取得。
-    Notion_DB_Spec_v1.1 §1 準拠:
-
-      - ChannelId : rich_text（Discord チャンネル ID 文字列）
+    ChannelId は rich_text 型で保持されているため、
+    Notion API の rich_text.contains を使用する。
     """
     try:
         resp = notion.databases.query(
             database_id=NOTION_TASKS_DB_ID,
             filter={
                 "property": "ChannelId",
-                "rich_text": {"equals": str(discord_channel_id)},
+                "rich_text": {"contains": str(discord_channel_id)},
             },
             page_size=1,
         )
