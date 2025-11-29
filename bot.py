@@ -322,24 +322,36 @@ def get_thread_and_channel(message: discord.Message):
 
 @bot.event
 async def on_message(message: discord.Message):
+    # 1. Bot の発言は無視
     if message.author.bot:
         return
+
+    # 2. Discord の thread_created 等（システムメッセージ）は無視
     if message.type == MessageType.thread_created:
         return
 
-    # ovv-◯◯ チャンネル以外は無視
+    # 3. チャンネル名チェック（ovv-◯◯ のみ対象）
     if isinstance(message.channel, discord.Thread):
         parent = message.channel.parent
         if not parent.name.lower().startswith("ovv-"):
+            # ovv-以外のスレッドは完全無視
             return
     else:
         if not message.channel.name.lower().startswith("ovv-"):
+            # ovv-以外の通常チャンネルは完全無視
             return
 
+    # 4. ***** コマンドなら Ovv を呼ばず、コマンド処理だけする *****
+    # これが今回の最大の修正点
+    if message.content.startswith("!"):
+        await bot.process_commands(message)
+        return
+
+    # 5. Ovv 用メモリ登録
     context_key = get_context_key(message)
     push_ovv_memory(context_key, "user", message.content)
 
-    # セッション中ならログに積む（ユーザ発話）
+    # 6. セッション中であればログバッファに追加（ユーザ発話）
     thread_id, _ = get_thread_and_channel(message)
     if thread_id is not None and thread_id in THREAD_SESSION_MAP:
         THREAD_LOG_BUFFER.setdefault(thread_id, [])
@@ -352,7 +364,7 @@ async def on_message(message: discord.Message):
             }
         )
 
-    # Ovv 呼び出し
+    # 7. Ovv 呼び出し（通常メッセージのみ）
     async with message.channel.typing():
         try:
             ans = call_ovv(context_key, message.content)
@@ -361,14 +373,13 @@ async def on_message(message: discord.Message):
             await message.channel.send("Ovv との通信中にエラーが発生しました。")
             return
 
-    # FINAL のみ送信（2000字対策はシンプルにスライス）
+    # 8. Ovv の返答を送信（2000字対策）
     if len(ans) <= 1900:
         sent = await message.channel.send(ans)
     else:
-        # シンプルな分割（行単位などが必要なら後で強化）
         sent = await message.channel.send(ans[:1900])
 
-    # セッション中なら bot 側の応答もログに追加
+    # 9. セッション中なら bot 応答もログバッファへ追加
     if thread_id is not None and thread_id in THREAD_SESSION_MAP:
         THREAD_LOG_BUFFER.setdefault(thread_id, [])
         THREAD_LOG_BUFFER[thread_id].append(
@@ -379,9 +390,6 @@ async def on_message(message: discord.Message):
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
         )
-
-    # コマンド処理
-    await bot.process_commands(message)
 
 # ============================================================
 # 9. !o — 明示コマンド（任意）
