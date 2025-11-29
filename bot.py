@@ -43,13 +43,7 @@ notion = Client(auth=NOTION_API_KEY)
 
 async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional[str]:
     """
-    Tasks.DB にタスクを作成する。
-    Notion_DB_Spec_v1.1 §1 準拠:
-
-      - Name      : title
-      - Goal      : rich_text
-      - Status    : select (active / paused / completed)
-      - ChannelId : rich_text（Discord チャンネル ID 文字列）
+    Tasks.DB にタスクを作成 (Notion_DB_Spec_v1準拠)
     """
     try:
         res = notion.pages.create(
@@ -58,11 +52,7 @@ async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional
                 "Name": {"title": [{"text": {"content": name}}]},
                 "Goal": {"rich_text": [{"text": {"content": goal}}]} if goal else {"rich_text": []},
                 "Status": {"select": {"name": "active"}},
-                "ChannelId": {
-                    "rich_text": [
-                        {"text": {"content": str(discord_channel_id)}}
-                    ]
-                },
+                "ChannelId": {"rich_text": [{"text": {"content": str(discord_channel_id)}}]},
             },
         )
         return res["id"]
@@ -70,21 +60,10 @@ async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional
         print("[ERROR create_task]", e)
         return None
 
-async def start_session(
-    task_id: str,
-    name: str,
-    discord_thread_id: int,
-    started_at: datetime,
-) -> Optional[str]:
-    """
-    Sessions.DB に active セッションを作成する。
-    Notion_DB_Spec_v1 §2 準拠:
 
-      - Name      : title
-      - Task      : relation → Tasks.DB
-      - ThreadId  : number
-      - Status    : select
-      - StartTime : date
+async def start_session(task_id: str, name: str, discord_thread_id: int, started_at: datetime) -> Optional[str]:
+    """
+    Sessions.DB に active セッションを作成
     """
     try:
         res = notion.pages.create(
@@ -94,9 +73,7 @@ async def start_session(
                 "Task": {"relation": [{"id": task_id}]},
                 "Status": {"select": {"name": "active"}},
                 "ThreadId": {"number": int(discord_thread_id)},
-                "StartTime": {
-                    "date": {"start": started_at.astimezone(timezone.utc).isoformat()}
-                },
+                "StartTime": {"date": {"start": started_at.astimezone(timezone.utc).isoformat()}},
             },
         )
         return res["id"]
@@ -105,30 +82,17 @@ async def start_session(
         return None
 
 
-async def end_session(
-    session_id: str,
-    ended_at: datetime,
-    summary: str,
-) -> bool:
+async def end_session(session_id: str, ended_at: datetime, summary: str) -> bool:
     """
-    Sessions.DB のセッションを終了扱いにする。
-    Notion_DB_Spec_v1 §2 準拠:
-
-      - Status   : completed
-      - EndTime  : date
-      - Summary  : rich_text（ここでは 'Summary' 固定）
+    セッション終了処理 (Sessions.DB → completed)
     """
     try:
         notion.pages.update(
             page_id=session_id,
             properties={
                 "Status": {"select": {"name": "completed"}},
-                "EndTime": {
-                    "date": {"start": ended_at.astimezone(timezone.utc).isoformat()}
-                },
-                "Summary": {
-                    "rich_text": [{"text": {"content": summary[:2000]}}]
-                },
+                "EndTime": {"date": {"start": ended_at.astimezone(timezone.utc).isoformat()}},
+                "Summary": {"rich_text": [{"text": {"content": summary[:2000]}}]},
             },
         )
         return True
@@ -139,28 +103,17 @@ async def end_session(
 
 async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
     """
-    Logs.DB にログをバッチ追加する。
-    Notion_DB_Spec_v1 §3 準拠:
-
-      - Session   : relation → Sessions.DB
-      - AuthorName: rich_text
-      - Content   : rich_text
-      - CreatedAt : date
+    Logs.DB にログをバッチ追加
     """
     try:
         for log in logs:
-            created_iso = log["created_at"]
             notion.pages.create(
                 parent={"database_id": NOTION_LOGS_DB_ID},
                 properties={
                     "Session": {"relation": [{"id": session_id}]},
-                    "AuthorName": {
-                        "rich_text": [{"text": {"content": log["author"]}}]
-                    },
-                    "Content": {
-                        "rich_text": [{"text": {"content": log["content"][:2000]}}]
-                    },
-                    "CreatedAt": {"date": {"start": created_iso}},
+                    "AuthorName": {"rich_text": [{"text": {"content": log["author"]}}]},
+                    "Content": {"rich_text": [{"text": {"content": log["content"][:2000]}}]},
+                    "CreatedAt": {"date": {"start": log["created_at"]}},
                 },
             )
         return True
@@ -169,12 +122,13 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
         return False
 
 # ============================================================
-# 3. Notion Query Utilities
+# 3. Notion Query Utilities（完全保証版）
 # ============================================================
 
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     """
-    Tasks.DB から ChannelId に紐づく task_id を取得（pull 方式、全API差異対応）。
+    Tasks.DB から ChannelId に紐づく task_id を完全保証で取得する。
+    plain_text が null の Notion スマホ仕様にも確実対応。
     """
     try:
         target = str(discord_channel_id).strip()
@@ -182,14 +136,9 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
 
         while True:
             if cursor:
-                resp = notion.databases.query(
-                    database_id=NOTION_TASKS_DB_ID,
-                    start_cursor=cursor
-                )
+                resp = notion.databases.query(database_id=NOTION_TASKS_DB_ID, start_cursor=cursor)
             else:
-                resp = notion.databases.query(
-                    database_id=NOTION_TASKS_DB_ID
-                )
+                resp = notion.databases.query(database_id=NOTION_TASKS_DB_ID)
 
             results = resp.get("results", [])
             for page in results:
@@ -198,17 +147,18 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
 
                 blocks = channel_prop.get("rich_text", [])
 
-                # plain_text or text.content の両対応
                 merged = "".join(
-                    (b.get("plain_text") or b.get("text", {}).get("content", ""))
+                    (
+                        b.get("plain_text") or
+                        b.get("text", {}).get("content", "") or
+                        ""
+                    )
                     for b in blocks
                 ).strip()
 
-                # 一致判定
                 if merged == target:
                     return page["id"]
 
-            # 次ページ
             if resp.get("has_more"):
                 cursor = resp.get("next_cursor")
             else:
@@ -219,60 +169,43 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     except Exception as e:
         print("[ERROR get_task_id_by_channel]", e)
         return None
-        
-def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
-    """
-    Sessions.DB から ThreadId に紐づく active な session_id を 1 件取得。
-    Notion_DB_Spec_v1 §2 準拠:
 
-      - ThreadId : number
-      - Status   : select = active
-    """
+
+def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
+    """ active セッション取得 """
     try:
         resp = notion.databases.query(
             database_id=NOTION_SESSIONS_DB_ID,
             filter={
                 "and": [
-                    {
-                        "property": "ThreadId",
-                        "number": {"equals": int(discord_thread_id)},
-                    },
-                    {
-                        "property": "Status",
-                        "select": {"equals": "active"},
-                    },
+                    {"property": "ThreadId", "number": {"equals": int(discord_thread_id)}},
+                    {"property": "Status", "select": {"equals": "active"}},
                 ]
             },
             page_size=1,
         )
         rs = resp.get("results", [])
-        if not rs:
-            return None
-        return rs[0]["id"]
+        return rs[0]["id"] if rs else None
     except Exception as e:
         print("[ERROR get_active_session_id_by_thread]", e)
         return None
 
 # ============================================================
-# 4. Runtime Memory（内部ステート）
+# 4. Runtime Memory
 # ============================================================
 
-# Ovv 用コンテキストメモリ（スレッド/チャンネル単位）
 OVV_MEMORY: Dict[int, List[Dict[str, str]]] = {}
 OVV_MEMORY_LIMIT = 20
 
-# タスク・セッション・ログ用ランタイムメモリ
-THREAD_TASK_CACHE: Dict[int, str] = {}          # channel_id → task_id
-THREAD_SESSION_MAP: Dict[int, str] = {}         # thread_id → session_id
-THREAD_LOG_BUFFER: Dict[int, List[Dict[str, str]]] = {}  # thread_id → logs
-
+THREAD_TASK_CACHE: Dict[int, str] = {}
+THREAD_SESSION_MAP: Dict[int, str] = {}
+THREAD_LOG_BUFFER: Dict[int, List[Dict[str, str]]] = {}
 
 def push_ovv_memory(key: int, role: str, content: str):
     OVV_MEMORY.setdefault(key, [])
     OVV_MEMORY[key].append({"role": role, "content": content})
     if len(OVV_MEMORY[key]) > OVV_MEMORY_LIMIT:
         OVV_MEMORY[key] = OVV_MEMORY[key][-OVV_MEMORY_LIMIT:]
-
 
 # ============================================================
 # 5. Load Core + External
@@ -289,13 +222,12 @@ OVV_EXTERNAL = load_text("ovv_external_contract.txt")
 SYSTEM_PROMPT = OVV_CORE + "\n\n" + OVV_EXTERNAL
 
 # ============================================================
-# 6. Ovv Call（[FINAL] 抽出）
+# 6. Ovv Call
 # ============================================================
 
 def extract_final(text: str) -> str:
-    marker = "[FINAL]"
-    if marker in text:
-        return text.split(marker, 1)[1].strip()
+    if "[FINAL]" in text:
+        return text.split("[FINAL]", 1)[1].strip()
     return text
 
 def call_ovv(context_key: int, user_msg: str) -> str:
@@ -321,63 +253,47 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 def get_context_key(msg: discord.Message) -> int:
-    # スレッドなら thread_id、そうでなければ channel_id
-    if isinstance(msg.channel, discord.Thread):
-        return msg.channel.id
     return msg.channel.id
 
 def get_thread_and_channel(message: discord.Message):
-    """
-    戻り値:
-      thread_id: int または None
-      channel_id: int
-    """
     if isinstance(message.channel, discord.Thread):
-        thread_id = message.channel.id
-        channel_id = message.channel.parent.id
+        return message.channel.id, message.channel.parent.id
     else:
-        thread_id = None
-        channel_id = message.channel.id
-    return thread_id, channel_id
+        return None, message.channel.id
 
 # ============================================================
-# 8. on_message（自然言語応答 + ログ収集）
+# 8. on_message
 # ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
-    # 1. Bot の発言は無視
+
     if message.author.bot:
         return
 
-    # 2. Discord の thread_created 等（システムメッセージ）は無視
     if message.type == MessageType.thread_created:
         return
 
-    # 3. チャンネル名チェック（ovv-◯◯ のみ対象）
+    # ovv-チャンネルのみ
     if isinstance(message.channel, discord.Thread):
-        parent = message.channel.parent
-        if not parent.name.lower().startswith("ovv-"):
-            # ovv-以外のスレッドは完全無視
+        if not message.channel.parent.name.lower().startswith("ovv-"):
             return
     else:
         if not message.channel.name.lower().startswith("ovv-"):
-            # ovv-以外の通常チャンネルは完全無視
             return
 
-    # 4. ***** コマンドなら Ovv を呼ばず、コマンド処理だけする *****
-    # これが今回の最大の修正点
+    # コマンド時は Ovv を呼ばない
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
 
-    # 5. Ovv 用メモリ登録
+    # Ovv メモリ
     context_key = get_context_key(message)
     push_ovv_memory(context_key, "user", message.content)
 
-    # 6. セッション中であればログバッファに追加（ユーザ発話）
+    # スレッド中ならログバッファへ
     thread_id, _ = get_thread_and_channel(message)
-    if thread_id is not None and thread_id in THREAD_SESSION_MAP:
+    if thread_id and thread_id in THREAD_SESSION_MAP:
         THREAD_LOG_BUFFER.setdefault(thread_id, [])
         THREAD_LOG_BUFFER[thread_id].append(
             {
@@ -388,7 +304,7 @@ async def on_message(message: discord.Message):
             }
         )
 
-    # 7. Ovv 呼び出し（通常メッセージのみ）
+    # Ovv 呼び出し
     async with message.channel.typing():
         try:
             ans = call_ovv(context_key, message.content)
@@ -397,15 +313,10 @@ async def on_message(message: discord.Message):
             await message.channel.send("Ovv との通信中にエラーが発生しました。")
             return
 
-    # 8. Ovv の返答を送信（2000字対策）
-    if len(ans) <= 1900:
-        sent = await message.channel.send(ans)
-    else:
-        sent = await message.channel.send(ans[:1900])
+    sent = await message.channel.send(ans[:1900])
 
-    # 9. セッション中なら bot 応答もログバッファへ追加
-    if thread_id is not None and thread_id in THREAD_SESSION_MAP:
-        THREAD_LOG_BUFFER.setdefault(thread_id, [])
+    # bot応答もログに積む
+    if thread_id and thread_id in THREAD_SESSION_MAP:
         THREAD_LOG_BUFFER[thread_id].append(
             {
                 "discord_message_id": str(sent.id),
@@ -416,7 +327,7 @@ async def on_message(message: discord.Message):
         )
 
 # ============================================================
-# 9. !o — 明示コマンド（任意）
+# 9. !o
 # ============================================================
 
 @bot.command(name="o")
@@ -435,10 +346,9 @@ async def o_command(ctx: commands.Context, *, question: str):
 
     sent = await ctx.send(ans[:1900])
 
-    # セッション中なら応答もログに積む
+    # セッション中ならログへ
     thread_id, _ = get_thread_and_channel(msg)
-    if thread_id is not None and thread_id in THREAD_SESSION_MAP:
-        THREAD_LOG_BUFFER.setdefault(thread_id, [])
+    if thread_id and thread_id in THREAD_SESSION_MAP:
         THREAD_LOG_BUFFER[thread_id].append(
             {
                 "discord_message_id": str(sent.id),
@@ -449,18 +359,14 @@ async def o_command(ctx: commands.Context, *, question: str):
         )
 
 # ============================================================
-# 10. !Task — タスク情報の参照
+# 10. !Task
 # ============================================================
 
 @bot.command(name="Task")
 async def task_info(ctx: commands.Context):
-    """
-    現在のチャンネル（ovv-◯◯）に紐づく Tasks.DB の情報を表示。
-    （タスク = チャンネル単位）
-    """
+
     channel = ctx.channel
 
-    # ovv-◯◯ のみ許可
     if isinstance(channel, discord.Thread):
         parent = channel.parent
         if not parent.name.lower().startswith("ovv-"):
@@ -473,34 +379,20 @@ async def task_info(ctx: commands.Context):
             return
         channel_id = channel.id
 
-    task_id = THREAD_TASK_CACHE.get(channel_id)
-    if not task_id:
-        task_id = get_task_id_by_channel(channel_id)
-        if task_id:
-            THREAD_TASK_CACHE[channel_id] = task_id
-
+    task_id = THREAD_TASK_CACHE.get(channel_id) or get_task_id_by_channel(channel_id)
     if not task_id:
         await ctx.send("このチャンネルに対応するタスクが Notion に存在しません。")
         return
+
+    THREAD_TASK_CACHE[channel_id] = task_id
 
     try:
         page = notion.pages.retrieve(task_id)
         props = page["properties"]
 
-        try:
-            name = props["Name"]["title"][0]["plain_text"]
-        except Exception:
-            name = "(名称未設定)"
-
-        try:
-            status = props["Status"]["select"]["name"]
-        except Exception:
-            status = "(不明)"
-
-        try:
-            goal = "".join(rt["plain_text"] for rt in props["Goal"]["rich_text"])
-        except Exception:
-            goal = "(未設定)"
+        name = props["Name"]["title"][0]["plain_text"] if props["Name"]["title"] else "(名称未設定)"
+        status = props["Status"]["select"]["name"] if props["Status"]["select"] else "(不明)"
+        goal = "".join(rt.get("plain_text", "") for rt in props["Goal"]["rich_text"]) or "(未設定)"
 
         await ctx.send(
             f"【タスク情報】\n"
@@ -508,20 +400,18 @@ async def task_info(ctx: commands.Context):
             f"状態: {status}\n"
             f"目標: {goal}"
         )
+
     except Exception as e:
         print("[ERROR task_info]", e)
         await ctx.send("タスク情報の取得中にエラーが発生しました。")
 
 # ============================================================
-# 11. !Task_s — セッション開始
+# 11. !Task_s
 # ============================================================
 
 @bot.command(name="Task_s")
 async def task_start(ctx: commands.Context):
-    """
-    現在のスレッドを 1 セッションとして開始する。
-    - 1スレッド = 1セッション前提
-    """
+
     channel = ctx.channel
 
     if not isinstance(channel, discord.Thread):
@@ -536,28 +426,22 @@ async def task_start(ctx: commands.Context):
     thread_id = channel.id
     channel_id = parent.id
 
-    # 既に active セッションがないか
-    existing_session_id = THREAD_SESSION_MAP.get(thread_id) or get_active_session_id_by_thread(thread_id)
-    if existing_session_id:
+    existing_session = THREAD_SESSION_MAP.get(thread_id) or get_active_session_id_by_thread(thread_id)
+    if existing_session:
         await ctx.send("すでに active セッションがあります。（!Task_e で終了してください）")
         return
 
-    # タスク取得（チャンネル単位）
     task_id = THREAD_TASK_CACHE.get(channel_id) or get_task_id_by_channel(channel_id)
     if not task_id:
-        await ctx.send("このチャンネルに対応するタスクが Notion に存在しません。Tasks.DB を確認してください。")
+        await ctx.send("このチャンネルに対応するタスクが Notion に存在しません。")
         return
+
     THREAD_TASK_CACHE[channel_id] = task_id
 
     started_at = datetime.now(timezone.utc)
     session_name = channel.name or f"Session-{thread_id}"
 
-    session_id = await start_session(
-        task_id=task_id,
-        name=session_name,
-        discord_thread_id=thread_id,
-        started_at=started_at,
-    )
+    session_id = await start_session(task_id, session_name, thread_id, started_at)
     if not session_id:
         await ctx.send("Notion セッションの作成に失敗しました。")
         return
@@ -568,18 +452,12 @@ async def task_start(ctx: commands.Context):
     await ctx.send("セッションを開始しました。（このスレッド内の会話をログ収集します）")
 
 # ============================================================
-# 12. !Task_e — セッション終了
+# 12. !Task_e
 # ============================================================
 
 @bot.command(name="Task_e")
 async def task_end(ctx: commands.Context):
-    """
-    現在のスレッドに紐づく active セッションを終了し、
-    - Logs.DB にバッチ書き込み
-    - 要約生成
-    - Sessions.DB を completed へ
-    まで実施する。
-    """
+
     channel = ctx.channel
 
     if not isinstance(channel, discord.Thread):
@@ -600,48 +478,38 @@ async def task_end(ctx: commands.Context):
 
     logs = THREAD_LOG_BUFFER.get(thread_id, [])
 
-    # 要約用テキストを生成
     if logs:
         joined = "\n".join(f"{l['author']}: {l['content']}" for l in logs)
     else:
         joined = "このセッションではログが記録されていません。"
 
-    # 要約生成（Ovv コアとは別枠の簡易サマライザー）
     try:
         completion = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {
                     "role": "system",
-                    "content": "以下は Discord スレッド内の学習ログです。学習内容・ポイント・次にやるべきことを日本語で簡潔に要約してください。",
+                    "content": "以下は Discord スレッド内の学習ログです。学習内容・ポイント・次にやるべきことを日本語で簡潔にまとめてください。",
                 },
                 {"role": "user", "content": joined},
             ],
             temperature=0.2,
         )
         summary = completion.choices[0].message.content.strip()
+
     except Exception as e:
         print("[ERROR summary_generation]", e)
         summary = "要約生成に失敗しましたが、ログは保存されました。"
 
-    # Logs.DB へ書き込み
-    try:
-        ok_logs = await append_logs(session_id, logs)
-    except Exception as e:
-        print("[ERROR append_logs]", e)
-        await ctx.send("ログ保存中にエラーが発生しました。")
-        return
-
-    # Sessions.DB を completed へ
+    ok_logs = await append_logs(session_id, logs)
     ended_at = datetime.now(timezone.utc)
     ok_session = await end_session(session_id, ended_at, summary)
 
-    # ランタイムメモリをクリア
     THREAD_SESSION_MAP.pop(thread_id, None)
     THREAD_LOG_BUFFER.pop(thread_id, None)
 
     if not ok_logs or not ok_session:
-        await ctx.send("セッション終了処理の一部でエラーが発生しました。（Notion を確認してください）")
+        await ctx.send("セッション終了処理の一部でエラーが発生しました。")
     else:
         await ctx.send(
             "セッションを終了しました。\n"
