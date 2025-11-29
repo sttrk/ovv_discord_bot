@@ -174,11 +174,10 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     """
-    Tasks.DB から ChannelId に紐づく task_id を取得（pull 方式）。
-    rich_text の equals/contains が Notion API で動作しないケースに対応。
+    Tasks.DB から ChannelId に紐づく task_id を取得（pull 方式、全API差異対応）。
     """
     try:
-        target = str(discord_channel_id)
+        target = str(discord_channel_id).strip()
         cursor = None
 
         while True:
@@ -197,15 +196,19 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
                 props = page.get("properties", {})
                 channel_prop = props.get("ChannelId", {})
 
-                # rich_text から plain_text を抽出して結合
                 blocks = channel_prop.get("rich_text", [])
-                merged = "".join(b.get("plain_text", "") for b in blocks)
 
-                # 完全一致
+                # plain_text or text.content の両対応
+                merged = "".join(
+                    (b.get("plain_text") or b.get("text", {}).get("content", ""))
+                    for b in blocks
+                ).strip()
+
+                # 一致判定
                 if merged == target:
                     return page["id"]
 
-            # ページが続いている場合
+            # 次ページ
             if resp.get("has_more"):
                 cursor = resp.get("next_cursor")
             else:
