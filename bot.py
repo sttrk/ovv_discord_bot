@@ -44,6 +44,7 @@ notion = Client(auth=NOTION_API_KEY)
 async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional[str]:
     """
     Tasks.DB にタスクを作成 (Notion_DB_Spec_v1準拠)
+    ChannelId は rich_text(文字列) で保持する運用。
     """
     try:
         res = notion.pages.create(
@@ -128,7 +129,8 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
     """
     Tasks.DB から ChannelId に紐づく task_id を完全保証で取得する。
-    plain_text が null の Notion スマホ仕様にも確実対応。
+    ChannelId は rich_text として保存されている前提。
+    plain_text が null のケース（スマホ入力など）にも対応。
     """
     try:
         target = str(discord_channel_id).strip()
@@ -154,9 +156,9 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
 
                 merged = "".join(
                     (
-                        b.get("plain_text") or
-                        b.get("text", {}).get("content", "") or
-                        ""
+                        b.get("plain_text")
+                        or b.get("text", {}).get("content", "")
+                        or ""
                     )
                     for b in blocks
                 ).strip()
@@ -177,7 +179,7 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
 
 
 def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
-    """ active セッション取得 """
+    """Sessions.DB から active セッションを取得"""
     try:
         resp = notion.databases.query(
             database_id=NOTION_SESSIONS_DB_ID,
@@ -213,7 +215,7 @@ def push_ovv_memory(key: int, role: str, content: str):
         OVV_MEMORY[key] = OVV_MEMORY[key][-OVV_MEMORY_LIMIT:]
 
 # ============================================================
-# 5. Load Core + External
+# 5. Load Core + External + Bridge
 # ============================================================
 
 def load_text(path: str) -> str:
@@ -225,15 +227,27 @@ def load_text(path: str) -> str:
 OVV_CORE = load_text("ovv_core.txt")
 OVV_EXTERNAL = load_text("ovv_external_contract.txt")
 
-# ★ ここが大きな変更点：
-#   - SYSTEM_PROMPT は「柔らかい UI 版っぽい指示」だけ
-#   - Ovv Core / External は assistant メッセージとして渡す
-SYSTEM_PROMPT_BASE = """
-あなたは Discord 上で動作する日本語アシスタントです。
-- ユーザーの意図をできるだけ汲み取り、過度に形式張らずに素直にタスクをこなしてください。
-- 仕様書やルールが与えられている場合は「必要なときだけ」参考にし、ユーザー体験を最優先します。
-- 単純な指示（テストで数を数えて、など）は、そのまま素直に実行してください。
+# UI版と同等の頭に近づけるためのブリッジ指示
+OVV_BRIDGE = """
+あなたは「Ovv v2.1」として動作します。
+
+- これから与える Ovv Core / External Contract（全文）は、あなたの哲学・CDC（Clarify / Diverge / Converge）・
+  PAF（PROPOSAL / AUDIT / FINAL）・疑い監査のルールを定義したものです。
+- あなたはそれらを「内部の思考プロセス」として用い、Discord 上のユーザーにとって自然で素直なアシスタントとして振る舞います。
+
+【優先方針】
+1. ユーザーの意図をできるだけ汲み取り、過度に形式張らずにタスクをこなすこと。
+2. 単純な依頼（例: 「テストで1から5まで数えて」「この文を少しわかりやすく」など）は、
+   TASK 構文や重いワークフローを持ち出さず、そのまま素直に実行すること。
+3. 意味が曖昧なときだけ Clarification を行い、明らかに意図が取れる場合は CDC を軽めに走らせて素直に応答すること。
+4. 「仕様上できません」「範囲外です」などの回答は、Ovv Core 上で本当に禁止されている場合を除き、極力避けること。
+5. 誤った“それっぽい補完”は避け、わからない点は質問で確認し、それ以外は最大限具体的に答えること。
+
+これらの方針は、Ovv Core の哲学と矛盾しない範囲で、
+Discord UI でのユーザー体験を滑らかにするためのブリッジです。
 """.strip()
+
+SYSTEM_PROMPT = OVV_BRIDGE + "\n\n" + OVV_CORE + "\n\n" + OVV_EXTERNAL
 
 # ============================================================
 # 6. Ovv Call
@@ -246,23 +260,23 @@ def extract_final(text: str) -> str:
 
 def call_ovv(context_key: int, user_msg: str) -> str:
     """
-    UI 版に近い「柔らかい ovv」として呼び出す。
-    - system には軽い方針だけ
-    - Ovv Core / External は knowledge 用 assistant メッセージとして渡す
+    Ovv Core / External を system としてフルに渡しつつ、
+    Discord 向けブリッジ指示で UI 版に近い挙動をさせる。
     """
     msgs = [
-        {"role": "system", "content": SYSTEM_PROMPT_BASE},
-        {"role": "assistant", "content": OVV_CORE},
-        {"role": "assistant", "content": OVV_EXTERNAL},
+        {"role": "system", "content": SYSTEM_PROMPT},
     ]
 
+    # 過去コンテキスト
     msgs.extend(OVV_MEMORY.get(context_key, []))
+
+    # 今回のユーザー入力
     msgs.append({"role": "user", "content": user_msg})
 
     res = openai_client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-4.1-mini",   # モデル自体は従来通り。必要ならここを gpt-4.1 に上げる選択肢もある。
         messages=msgs,
-        temperature=0.4,  # 少しだけゆるめる
+        temperature=0.25,       # やや柔らかめだが暴走しない程度
     )
     full = res.choices[0].message.content.strip()
     push_ovv_memory(context_key, "assistant", full)
@@ -328,7 +342,7 @@ async def on_message(message: discord.Message):
             }
         )
 
-    # Ovv 呼び出し（柔らか設定）
+    # Ovv 呼び出し
     async with message.channel.typing():
         try:
             ans = call_ovv(context_key, message.content)
