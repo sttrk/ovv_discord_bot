@@ -2,4 +2,4 @@ discord.py
 python-dotenv
 requests
 openai
-notion-client
+notion-client==2.2.1
