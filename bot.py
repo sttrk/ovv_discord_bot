@@ -362,6 +362,19 @@ async def o_command(ctx: commands.Context, *, question: str):
 # 10. !Task
 # ============================================================
 
+# DEBUG
+resp = notion.databases.query(database_id=NOTION_TASKS_DB_ID)
+for page in resp["results"]:
+    cid = "".join(
+        (
+            b.get("plain_text") or
+            b.get("text", {}).get("content", "") or
+            ""
+        )
+        for b in page["properties"]["ChannelId"]["rich_text"]
+    )
+    await ctx.send(f"[DEBUG] Page={page['id']} ChannelId='{cid}'")
+
 @bot.command(name="Task")
 async def task_info(ctx: commands.Context):
 
