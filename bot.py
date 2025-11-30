@@ -362,62 +362,29 @@ async def o_command(ctx: commands.Context, *, question: str):
 # 10. !Task
 # ============================================================
 
-# DEBUG
-resp = notion.databases.query(database_id=NOTION_TASKS_DB_ID)
-for page in resp["results"]:
-    cid = "".join(
-        (
-            b.get("plain_text") or
-            b.get("text", {}).get("content", "") or
-            ""
-        )
-        for b in page["properties"]["ChannelId"]["rich_text"]
-    )
-    await ctx.send(f"[DEBUG] Page={page['id']} ChannelId='{cid}'")
-
 @bot.command(name="Task")
 async def task_info(ctx: commands.Context):
 
     channel = ctx.channel
 
-    if isinstance(channel, discord.Thread):
-        parent = channel.parent
-        if not parent.name.lower().startswith("ovv-"):
-            await ctx.send("このコマンドは ovv-* チャンネル内でのみ使用できます。")
-            return
-        channel_id = parent.id
-    else:
-        if not channel.name.lower().startswith("ovv-"):
-            await ctx.send("このコマンドは ovv-* チャンネル内でのみ使用できます。")
-            return
-        channel_id = channel.id
-
-    task_id = THREAD_TASK_CACHE.get(channel_id) or get_task_id_by_channel(channel_id)
-    if not task_id:
-        await ctx.send("このチャンネルに対応するタスクが Notion に存在しません。")
-        return
-
-    THREAD_TASK_CACHE[channel_id] = task_id
-
+    # ============================================================
+    # DEBUG: Notion Tasks.DB の ChannelId を全件ダンプ
+    # ============================================================
     try:
-        page = notion.pages.retrieve(task_id)
-        props = page["properties"]
-
-        name = props["Name"]["title"][0]["plain_text"] if props["Name"]["title"] else "(名称未設定)"
-        status = props["Status"]["select"]["name"] if props["Status"]["select"] else "(不明)"
-        goal = "".join(rt.get("plain_text", "") for rt in props["Goal"]["rich_text"]) or "(未設定)"
-
-        await ctx.send(
-            f"【タスク情報】\n"
-            f"タスク名: {name}\n"
-            f"状態: {status}\n"
-            f"目標: {goal}"
-        )
-
+        resp = notion.databases.query(database_id=NOTION_TASKS_DB_ID)
+        for page in resp.get("results", []):
+            blocks = page["properties"]["ChannelId"]["rich_text"]
+            merged = "".join(
+                (
+                    b.get("plain_text")
+                    or b.get("text", {}).get("content", "")
+                    or ""
+                )
+                for b in blocks
+            )
+            await ctx.send(f"[DEBUG] page_id={page['id']}  ChannelId='{merged}'")
     except Exception as e:
-        print("[ERROR task_info]", e)
-        await ctx.send("タスク情報の取得中にエラーが発生しました。")
-
+        await ctx.send(f"[DEBUG ERROR] {e}")
 # ============================================================
 # 11. !Task_s
 # ============================================================
