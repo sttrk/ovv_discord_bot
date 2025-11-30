@@ -42,9 +42,6 @@ notion = Client(auth=NOTION_API_KEY)
 # ============================================================
 
 async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional[str]:
-    """
-    Tasks.DB にタスクを作成 (Notion_DB_Spec_v1準拠)
-    """
     try:
         res = notion.pages.create(
             parent={"database_id": NOTION_TASKS_DB_ID},
@@ -62,9 +59,6 @@ async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional
 
 
 async def start_session(task_id: str, name: str, discord_thread_id: int, started_at: datetime) -> Optional[str]:
-    """
-    Sessions.DB に active セッションを作成
-    """
     try:
         res = notion.pages.create(
             parent={"database_id": NOTION_SESSIONS_DB_ID},
@@ -83,9 +77,6 @@ async def start_session(task_id: str, name: str, discord_thread_id: int, started
 
 
 async def end_session(session_id: str, ended_at: datetime, summary: str) -> bool:
-    """
-    セッション終了処理 (Sessions.DB → completed)
-    """
     try:
         notion.pages.update(
             page_id=session_id,
@@ -102,9 +93,6 @@ async def end_session(session_id: str, ended_at: datetime, summary: str) -> bool
 
 
 async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
-    """
-    Logs.DB にログをバッチ追加
-    """
     try:
         for log in logs:
             notion.pages.create(
@@ -126,10 +114,6 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 # ============================================================
 
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
-    """
-    Tasks.DB から ChannelId に紐づく task_id を完全保証で取得する。
-    plain_text が null の Notion スマホ仕様にも確実対応。
-    """
     try:
         target = str(discord_channel_id).strip()
         cursor = None
@@ -144,7 +128,6 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
             for page in results:
                 props = page.get("properties", {})
                 channel_prop = props.get("ChannelId", {})
-
                 blocks = channel_prop.get("rich_text", [])
 
                 merged = "".join(
@@ -156,6 +139,8 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
                     for b in blocks
                 ).strip()
 
+                print(f"[DEBUG] page_id={page['id']}  ChannelId='{merged}'")
+
                 if merged == target:
                     return page["id"]
 
@@ -165,14 +150,12 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
                 break
 
         return None
-
     except Exception as e:
         print("[ERROR get_task_id_by_channel]", e)
         return None
 
 
 def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
-    """ active セッション取得 """
     try:
         resp = notion.databases.query(
             database_id=NOTION_SESSIONS_DB_ID,
@@ -262,11 +245,14 @@ def get_thread_and_channel(message: discord.Message):
         return None, message.channel.id
 
 # ============================================================
-# 8. on_message
+# 8. on_message（DEBUG 追加済み）
 # ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
+
+    # DEBUG: discord 内部名確認
+    print(f"[DEBUG] channel.name={message.channel.name}")
 
     if message.author.bot:
         return
@@ -274,7 +260,7 @@ async def on_message(message: discord.Message):
     if message.type == MessageType.thread_created:
         return
 
-    # ovv-チャンネルのみ
+    # ovv- チャンネル判定
     if isinstance(message.channel, discord.Thread):
         if not message.channel.parent.name.lower().startswith("ovv-"):
             return
@@ -282,16 +268,15 @@ async def on_message(message: discord.Message):
         if not message.channel.name.lower().startswith("ovv-"):
             return
 
-    # コマンド時は Ovv を呼ばない
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
 
-    # Ovv メモリ
+    # Ovv memory
     context_key = get_context_key(message)
     push_ovv_memory(context_key, "user", message.content)
 
-    # スレッド中ならログバッファへ
+    # thread logging
     thread_id, _ = get_thread_and_channel(message)
     if thread_id and thread_id in THREAD_SESSION_MAP:
         THREAD_LOG_BUFFER.setdefault(thread_id, [])
@@ -304,7 +289,6 @@ async def on_message(message: discord.Message):
             }
         )
 
-    # Ovv 呼び出し
     async with message.channel.typing():
         try:
             ans = call_ovv(context_key, message.content)
@@ -315,7 +299,6 @@ async def on_message(message: discord.Message):
 
     sent = await message.channel.send(ans[:1900])
 
-    # bot応答もログに積む
     if thread_id and thread_id in THREAD_SESSION_MAP:
         THREAD_LOG_BUFFER[thread_id].append(
             {
@@ -327,66 +310,55 @@ async def on_message(message: discord.Message):
         )
 
 # ============================================================
-# 9. !o
-# ============================================================
-
-@bot.command(name="o")
-async def o_command(ctx: commands.Context, *, question: str):
-    msg = ctx.message
-    context_key = get_context_key(msg)
-    push_ovv_memory(context_key, "user", question)
-
-    async with ctx.channel.typing():
-        try:
-            ans = call_ovv(context_key, question)
-        except Exception as e:
-            print("[ERROR !o call_ovv]", e)
-            await ctx.send("Ovv との通信中にエラーが発生しました。")
-            return
-
-    sent = await ctx.send(ans[:1900])
-
-    # セッション中ならログへ
-    thread_id, _ = get_thread_and_channel(msg)
-    if thread_id and thread_id in THREAD_SESSION_MAP:
-        THREAD_LOG_BUFFER[thread_id].append(
-            {
-                "discord_message_id": str(sent.id),
-                "author": "ovv-bot",
-                "content": ans,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-
-# ============================================================
-# 10. !Task
+# 9. !Task（キャッシュクリア追加済み）
 # ============================================================
 
 @bot.command(name="Task")
 async def task_info(ctx: commands.Context):
 
+    # キャッシュクリア（これで永続的なNoneを破壊）
+    THREAD_TASK_CACHE.clear()
+
     channel = ctx.channel
 
-    # ============================================================
-    # DEBUG: Notion Tasks.DB の ChannelId を全件ダンプ
-    # ============================================================
+    if isinstance(channel, discord.Thread):
+        parent = channel.parent
+        if not parent.name.lower().startswith("ovv-"):
+            await ctx.send("このコマンドは ovv-* チャンネル内でのみ使用できます。")
+            return
+        channel_id = parent.id
+    else:
+        if not channel.name.lower().startswith("ovv-"):
+            await ctx.send("このコマンドは ovv-* チャンネル内でのみ使用できます。")
+            return
+        channel_id = channel.id
+
+    task_id = get_task_id_by_channel(channel_id)
+    if not task_id:
+        await ctx.send("このチャンネルに対応するタスクが Notion に存在しません。")
+        return
+
     try:
-        resp = notion.databases.query(database_id=NOTION_TASKS_DB_ID)
-        for page in resp.get("results", []):
-            blocks = page["properties"]["ChannelId"]["rich_text"]
-            merged = "".join(
-                (
-                    b.get("plain_text")
-                    or b.get("text", {}).get("content", "")
-                    or ""
-                )
-                for b in blocks
-            )
-            await ctx.send(f"[DEBUG] page_id={page['id']}  ChannelId='{merged}'")
+        page = notion.pages.retrieve(task_id)
+        props = page["properties"]
+
+        name = props["Name"]["title"][0]["plain_text"] if props["Name"]["title"] else "(名称未設定)"
+        status = props["Status"]["select"]["name"] if props["Status"]["select"] else "(不明)"
+        goal = "".join(rt.get("plain_text", "") for rt in props["Goal"]["rich_text"]) or "(未設定)"
+
+        await ctx.send(
+            f"【タスク情報】\n"
+            f"タスク名: {name}\n"
+            f"状態: {status}\n"
+            f"目標: {goal}"
+        )
+
     except Exception as e:
-        await ctx.send(f"[DEBUG ERROR] {e}")
+        print("[ERROR task_info]", e)
+        await ctx.send("タスク情報の取得中にエラーが発生しました。")
+
 # ============================================================
-# 11. !Task_s
+# 10. !Task_s
 # ============================================================
 
 @bot.command(name="Task_s")
@@ -411,7 +383,7 @@ async def task_start(ctx: commands.Context):
         await ctx.send("すでに active セッションがあります。（!Task_e で終了してください）")
         return
 
-    task_id = THREAD_TASK_CACHE.get(channel_id) or get_task_id_by_channel(channel_id)
+    task_id = get_task_id_by_channel(channel_id)
     if not task_id:
         await ctx.send("このチャンネルに対応するタスクが Notion に存在しません。")
         return
@@ -432,7 +404,7 @@ async def task_start(ctx: commands.Context):
     await ctx.send("セッションを開始しました。（このスレッド内の会話をログ収集します）")
 
 # ============================================================
-# 12. !Task_e
+# 11. !Task_e
 # ============================================================
 
 @bot.command(name="Task_e")
@@ -498,7 +470,7 @@ async def task_end(ctx: commands.Context):
         )
 
 # ============================================================
-# 13. Run
+# 12. Run
 # ============================================================
 
 def main():
