@@ -42,6 +42,9 @@ notion = Client(auth=NOTION_API_KEY)
 # ============================================================
 
 async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional[str]:
+    """
+    Tasks.DB にタスクを作成 (Notion_DB_Spec_v1準拠)
+    """
     try:
         res = notion.pages.create(
             parent={"database_id": NOTION_TASKS_DB_ID},
@@ -59,6 +62,9 @@ async def create_task(name: str, goal: str, discord_channel_id: int) -> Optional
 
 
 async def start_session(task_id: str, name: str, discord_thread_id: int, started_at: datetime) -> Optional[str]:
+    """
+    Sessions.DB に active セッションを作成
+    """
     try:
         res = notion.pages.create(
             parent={"database_id": NOTION_SESSIONS_DB_ID},
@@ -77,6 +83,9 @@ async def start_session(task_id: str, name: str, discord_thread_id: int, started
 
 
 async def end_session(session_id: str, ended_at: datetime, summary: str) -> bool:
+    """
+    セッション終了処理 (Sessions.DB → completed)
+    """
     try:
         notion.pages.update(
             page_id=session_id,
@@ -93,6 +102,9 @@ async def end_session(session_id: str, ended_at: datetime, summary: str) -> bool
 
 
 async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
+    """
+    Logs.DB にログをバッチ追加
+    """
     try:
         for log in logs:
             notion.pages.create(
@@ -114,20 +126,30 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 # ============================================================
 
 def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
+    """
+    Tasks.DB から ChannelId に紐づく task_id を完全保証で取得する。
+    plain_text が null の Notion スマホ仕様にも確実対応。
+    """
     try:
         target = str(discord_channel_id).strip()
         cursor = None
 
         while True:
             if cursor:
-                resp = notion.databases.query(database_id=NOTION_TASKS_DB_ID, start_cursor=cursor)
+                resp = notion.databases.query(
+                    database_id=NOTION_TASKS_DB_ID,
+                    start_cursor=cursor
+                )
             else:
-                resp = notion.databases.query(database_id=NOTION_TASKS_DB_ID)
+                resp = notion.databases.query(
+                    database_id=NOTION_TASKS_DB_ID
+                )
 
             results = resp.get("results", [])
             for page in results:
                 props = page.get("properties", {})
                 channel_prop = props.get("ChannelId", {})
+
                 blocks = channel_prop.get("rich_text", [])
 
                 merged = "".join(
@@ -139,8 +161,6 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
                     for b in blocks
                 ).strip()
 
-                print(f"[DEBUG] page_id={page['id']}  ChannelId='{merged}'")
-
                 if merged == target:
                     return page["id"]
 
@@ -150,12 +170,14 @@ def get_task_id_by_channel(discord_channel_id: int) -> Optional[str]:
                 break
 
         return None
+
     except Exception as e:
         print("[ERROR get_task_id_by_channel]", e)
         return None
 
 
 def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
+    """ active セッション取得 """
     try:
         resp = notion.databases.query(
             database_id=NOTION_SESSIONS_DB_ID,
@@ -202,7 +224,16 @@ def load_text(path: str) -> str:
 
 OVV_CORE = load_text("ovv_core.txt")
 OVV_EXTERNAL = load_text("ovv_external_contract.txt")
-SYSTEM_PROMPT = OVV_CORE + "\n\n" + OVV_EXTERNAL
+
+# ★ ここが大きな変更点：
+#   - SYSTEM_PROMPT は「柔らかい UI 版っぽい指示」だけ
+#   - Ovv Core / External は assistant メッセージとして渡す
+SYSTEM_PROMPT_BASE = """
+あなたは Discord 上で動作する日本語アシスタントです。
+- ユーザーの意図をできるだけ汲み取り、過度に形式張らずに素直にタスクをこなしてください。
+- 仕様書やルールが与えられている場合は「必要なときだけ」参考にし、ユーザー体験を最優先します。
+- 単純な指示（テストで数を数えて、など）は、そのまま素直に実行してください。
+""".strip()
 
 # ============================================================
 # 6. Ovv Call
@@ -214,14 +245,24 @@ def extract_final(text: str) -> str:
     return text
 
 def call_ovv(context_key: int, user_msg: str) -> str:
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+    """
+    UI 版に近い「柔らかい ovv」として呼び出す。
+    - system には軽い方針だけ
+    - Ovv Core / External は knowledge 用 assistant メッセージとして渡す
+    """
+    msgs = [
+        {"role": "system", "content": SYSTEM_PROMPT_BASE},
+        {"role": "assistant", "content": OVV_CORE},
+        {"role": "assistant", "content": OVV_EXTERNAL},
+    ]
+
     msgs.extend(OVV_MEMORY.get(context_key, []))
     msgs.append({"role": "user", "content": user_msg})
 
     res = openai_client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=msgs,
-        temperature=0.2,
+        temperature=0.4,  # 少しだけゆるめる
     )
     full = res.choices[0].message.content.strip()
     push_ovv_memory(context_key, "assistant", full)
@@ -245,14 +286,11 @@ def get_thread_and_channel(message: discord.Message):
         return None, message.channel.id
 
 # ============================================================
-# 8. on_message（DEBUG 追加済み）
+# 8. on_message
 # ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
-
-    # DEBUG: discord 内部名確認
-    print(f"[DEBUG] channel.name={message.channel.name}")
 
     if message.author.bot:
         return
@@ -260,7 +298,7 @@ async def on_message(message: discord.Message):
     if message.type == MessageType.thread_created:
         return
 
-    # ovv- チャンネル判定
+    # ovv-チャンネルのみ
     if isinstance(message.channel, discord.Thread):
         if not message.channel.parent.name.lower().startswith("ovv-"):
             return
@@ -268,15 +306,16 @@ async def on_message(message: discord.Message):
         if not message.channel.name.lower().startswith("ovv-"):
             return
 
+    # コマンド時は Ovv を呼ばない
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
 
-    # Ovv memory
+    # Ovv メモリ
     context_key = get_context_key(message)
     push_ovv_memory(context_key, "user", message.content)
 
-    # thread logging
+    # スレッド中ならログバッファへ
     thread_id, _ = get_thread_and_channel(message)
     if thread_id and thread_id in THREAD_SESSION_MAP:
         THREAD_LOG_BUFFER.setdefault(thread_id, [])
@@ -289,6 +328,7 @@ async def on_message(message: discord.Message):
             }
         )
 
+    # Ovv 呼び出し（柔らか設定）
     async with message.channel.typing():
         try:
             ans = call_ovv(context_key, message.content)
@@ -299,6 +339,7 @@ async def on_message(message: discord.Message):
 
     sent = await message.channel.send(ans[:1900])
 
+    # bot応答もログに積む
     if thread_id and thread_id in THREAD_SESSION_MAP:
         THREAD_LOG_BUFFER[thread_id].append(
             {
@@ -310,14 +351,43 @@ async def on_message(message: discord.Message):
         )
 
 # ============================================================
-# 9. !Task（キャッシュクリア追加済み）
+# 9. !o
+# ============================================================
+
+@bot.command(name="o")
+async def o_command(ctx: commands.Context, *, question: str):
+    msg = ctx.message
+    context_key = get_context_key(msg)
+    push_ovv_memory(context_key, "user", question)
+
+    async with ctx.channel.typing():
+        try:
+            ans = call_ovv(context_key, question)
+        except Exception as e:
+            print("[ERROR !o call_ovv]", e)
+            await ctx.send("Ovv との通信中にエラーが発生しました。")
+            return
+
+    sent = await ctx.send(ans[:1900])
+
+    # セッション中ならログへ
+    thread_id, _ = get_thread_and_channel(msg)
+    if thread_id and thread_id in THREAD_SESSION_MAP:
+        THREAD_LOG_BUFFER[thread_id].append(
+            {
+                "discord_message_id": str(sent.id),
+                "author": "ovv-bot",
+                "content": ans,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+# ============================================================
+# 10. !Task
 # ============================================================
 
 @bot.command(name="Task")
 async def task_info(ctx: commands.Context):
-
-    # キャッシュクリア（これで永続的なNoneを破壊）
-    THREAD_TASK_CACHE.clear()
 
     channel = ctx.channel
 
@@ -333,10 +403,12 @@ async def task_info(ctx: commands.Context):
             return
         channel_id = channel.id
 
-    task_id = get_task_id_by_channel(channel_id)
+    task_id = THREAD_TASK_CACHE.get(channel_id) or get_task_id_by_channel(channel_id)
     if not task_id:
         await ctx.send("このチャンネルに対応するタスクが Notion に存在しません。")
         return
+
+    THREAD_TASK_CACHE[channel_id] = task_id
 
     try:
         page = notion.pages.retrieve(task_id)
@@ -358,7 +430,7 @@ async def task_info(ctx: commands.Context):
         await ctx.send("タスク情報の取得中にエラーが発生しました。")
 
 # ============================================================
-# 10. !Task_s
+# 11. !Task_s
 # ============================================================
 
 @bot.command(name="Task_s")
@@ -383,7 +455,7 @@ async def task_start(ctx: commands.Context):
         await ctx.send("すでに active セッションがあります。（!Task_e で終了してください）")
         return
 
-    task_id = get_task_id_by_channel(channel_id)
+    task_id = THREAD_TASK_CACHE.get(channel_id) or get_task_id_by_channel(channel_id)
     if not task_id:
         await ctx.send("このチャンネルに対応するタスクが Notion に存在しません。")
         return
@@ -404,7 +476,7 @@ async def task_start(ctx: commands.Context):
     await ctx.send("セッションを開始しました。（このスレッド内の会話をログ収集します）")
 
 # ============================================================
-# 11. !Task_e
+# 12. !Task_e
 # ============================================================
 
 @bot.command(name="Task_e")
@@ -441,11 +513,11 @@ async def task_end(ctx: commands.Context):
             messages=[
                 {
                     "role": "system",
-                    "content": "以下は Discord スレッド内の学習ログです。学習内容・ポイント・次にやるべきことを日本語で簡潔にまとめてください。",
+                    "content": "以下は Discord スレッド内のログです。学習内容・ポイント・次にやるべきことを日本語で簡潔にまとめてください。",
                 },
                 {"role": "user", "content": joined},
             ],
-            temperature=0.2,
+            temperature=0.3,
         )
         summary = completion.choices[0].message.content.strip()
 
@@ -470,7 +542,7 @@ async def task_end(ctx: commands.Context):
         )
 
 # ============================================================
-# 12. Run
+# 13. Run
 # ============================================================
 
 def main():
