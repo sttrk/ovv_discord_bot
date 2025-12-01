@@ -1,0 +1,95 @@
+DDL1
+-- ============================================================
+-- Ovv Database Schema v1.0
+-- Compatible with Unified Logging Schema v2.1
+-- ============================================================
+
+-- ===========================================
+-- 1. Tasks
+-- ===========================================
+CREATE TABLE tasks (
+    id              SERIAL PRIMARY KEY,
+    notion_id       TEXT UNIQUE,
+    name            TEXT NOT NULL,
+    goal            TEXT,
+    status          TEXT NOT NULL DEFAULT 'active',
+    thread_id       BIGINT,
+    channel_id      BIGINT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_tasks_thread_id ON tasks(thread_id);
+CREATE INDEX idx_tasks_notion_id ON tasks(notion_id);
+
+-- ===========================================
+-- 2. Sessions
+-- ===========================================
+CREATE TABLE sessions (
+    id              SERIAL PRIMARY KEY,
+    notion_id       TEXT UNIQUE,
+    task_id         INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    status          TEXT NOT NULL DEFAULT 'active',
+    thread_id       BIGINT NOT NULL,
+    start_time      TIMESTAMPTZ NOT NULL,
+    end_time        TIMESTAMPTZ,
+    summary         TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_sessions_thread_id ON sessions(thread_id);
+CREATE INDEX idx_sessions_task_id ON sessions(task_id);
+
+-- ===========================================
+-- 3. Logs
+-- ===========================================
+CREATE TABLE logs (
+    id                  SERIAL PRIMARY KEY,
+    session_id          INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+    author              TEXT NOT NULL,
+    content             TEXT NOT NULL,
+    discord_message_id  TEXT,
+    created_at          TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_logs_session_id ON logs(session_id);
+
+-- ===========================================
+-- 4. Runtime Memory
+-- ===========================================
+CREATE TABLE runtime_memory (
+    id              SERIAL PRIMARY KEY,
+    context_key     BIGINT NOT NULL,
+    role            TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_runtime_context ON runtime_memory(context_key);
+
+-- ===========================================
+-- 5. Durable Summary Cache
+-- ===========================================
+CREATE TABLE durable_summary (
+    context_key     BIGINT PRIMARY KEY,
+    summary_text    TEXT NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+SELECT 'Ovv schema created successfully.' AS status;
+
+
+DDL2
+
+CREATE TABLE IF NOT EXISTS runtime_memory (
+    id SERIAL PRIMARY KEY,
+    context_key BIGINT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- context_key 単位で古い→新しいを高速にするための index
+CREATE INDEX IF NOT EXISTS idx_runtime_memory_context_key_created_at
+    ON runtime_memory (context_key, created_at);
