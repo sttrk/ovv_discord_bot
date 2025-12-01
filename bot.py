@@ -11,8 +11,13 @@ from datetime import datetime, timezone
 # 1. Environment
 # ============================================================
 
+print("[BOOT] bot.py started")
+
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+print("[BOOT] DISCORD_BOT_TOKEN set:", bool(DISCORD_BOT_TOKEN))
+print("[BOOT] OPENAI_API_KEY set:", bool(OPENAI_API_KEY))
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN が未設定です。")
@@ -27,6 +32,11 @@ NOTION_TASKS_DB_ID = os.getenv("NOTION_TASKS_DB_ID")
 NOTION_SESSIONS_DB_ID = os.getenv("NOTION_SESSIONS_DB_ID")
 NOTION_LOGS_DB_ID = os.getenv("NOTION_LOGS_DB_ID")
 
+print("[BOOT] NOTION_API_KEY set:", bool(NOTION_API_KEY))
+print("[BOOT] NOTION_TASKS_DB_ID set:", bool(NOTION_TASKS_DB_ID))
+print("[BOOT] NOTION_SESSIONS_DB_ID set:", bool(NOTION_SESSIONS_DB_ID))
+print("[BOOT] NOTION_LOGS_DB_ID set:", bool(NOTION_LOGS_DB_ID))
+
 if not NOTION_API_KEY:
     raise RuntimeError("NOTION_API_KEY が未設定です。")
 if not NOTION_TASKS_DB_ID:
@@ -39,24 +49,25 @@ if not NOTION_LOGS_DB_ID:
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
-# 1.5 PostgreSQL（Phase 1: 接続＋初期テーブルのみ）
+# 1.5 PostgreSQL
 # ============================================================
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 POSTGRES_URL = os.getenv("POSTGRES_URL")
+print("[BOOT] POSTGRES_URL present:", bool(POSTGRES_URL))
+if POSTGRES_URL:
+    print("[BOOT] POSTGRES_URL =", POSTGRES_URL)
 
 pg_conn = None
 
 def pg_connect():
-    """
-    POSTGRES_URL = "postgresql://user:pw@host:5432/dbname"
-    """
     global pg_conn
+    print("[BOOT] pg_connect() called")
 
     if not POSTGRES_URL:
-        print("[WARN] POSTGRES_URL が未設定のため PostgreSQL 無効化")
+        print("[WARN] POSTGRES_URL 未設定 → PostgreSQL 無効化")
         pg_conn = None
         return
 
@@ -73,10 +84,8 @@ def pg_connect():
 
 
 def init_db():
-    """
-    Phase 1：runtime_memory テーブルのみ作成。
-    実際の SQL 永続化は Phase 2 で実施する。
-    """
+    print("[BOOT] init_db() called")
+
     if pg_conn is None:
         print("[WARN] init_db skipped (no PostgreSQL connection).")
         return
@@ -99,16 +108,10 @@ def init_db():
 
 
 # ============================================================
-# 2. Notion CRUD（Unified Logging Schema v2.1 準拠）
+# 2. Notion CRUD（Unified Logging Schema）
 # ============================================================
 
-async def create_task(
-    name: str,
-    goal: str,
-    discord_thread_id: int,
-    discord_channel_id: int,
-) -> Optional[str]:
-
+async def create_task(name: str, goal: str, discord_thread_id: int, discord_channel_id: int) -> Optional[str]:
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
         res = notion.pages.create(
@@ -129,13 +132,7 @@ async def create_task(
         return None
 
 
-async def start_session(
-    task_id: str,
-    name: str,
-    discord_thread_id: int,
-    started_at: datetime,
-) -> Optional[str]:
-
+async def start_session(task_id: str, name: str, discord_thread_id: int, started_at: datetime) -> Optional[str]:
     start_iso = started_at.astimezone(timezone.utc).isoformat()
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -159,7 +156,6 @@ async def start_session(
 
 
 async def end_session(session_id: str, ended_at: datetime, summary: str) -> bool:
-
     end_iso = ended_at.astimezone(timezone.utc).isoformat()
 
     try:
@@ -182,8 +178,6 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
 
     try:
         for log in logs:
-            created_iso = log["created_at"]
-
             notion.pages.create(
                 parent={"database_id": NOTION_LOGS_DB_ID},
                 properties={
@@ -191,10 +185,8 @@ async def append_logs(session_id: str, logs: List[Dict[str, str]]) -> bool:
                     "session_id": {"relation": [{"id": session_id}]},
                     "author": {"rich_text": [{"text": {"content": log["author"]}}]},
                     "content": {"rich_text": [{"text": {"content": log["content"][:2000]}}]},
-                    "created_at": {"date": {"start": created_iso}},
-                    "discord_message_id": {
-                        "rich_text": [{"text": {"content": log["discord_message_id"]}}]
-                    },
+                    "created_at": {"date": {"start": log["created_at"]}},
+                    "discord_message_id": {"rich_text": [{"text": {"content": log["discord_message_id"]}}]},
                 },
             )
         return True
@@ -231,8 +223,7 @@ def get_task_id_by_thread(discord_thread_id: int) -> Optional[str]:
             )
 
             for page in resp.get("results", []):
-                merged = _merge_rich_text(page["properties"]["thread_id"])
-                if merged == target:
+                if _merge_rich_text(page["properties"]["thread_id"]) == target:
                     return page["id"]
 
             cursor = resp.get("next_cursor")
@@ -264,8 +255,7 @@ def get_active_session_id_by_thread(discord_thread_id: int) -> Optional[str]:
                 if props["status"]["select"] and props["status"]["select"]["name"] != "active":
                     continue
 
-                merged = _merge_rich_text(props["thread_id"])
-                if merged == target:
+                if _merge_rich_text(props["thread_id"]) == target:
                     return page["id"]
 
             cursor = resp.get("next_cursor")
@@ -289,7 +279,6 @@ THREAD_TASK_CACHE: Dict[int, str] = {}
 THREAD_SESSION_MAP: Dict[int, str] = {}
 THREAD_LOG_BUFFER: Dict[int, List[Dict[str, str]]] = {}
 PENDING_TASK_GOAL: Dict[int, bool] = {}
-
 
 def push_ovv_memory(key: int, role: str, content: str):
     OVV_MEMORY.setdefault(key, [])
@@ -328,6 +317,7 @@ SYSTEM_PROMPT_BASE = f"""
 Ovv Soft-Core を最優先し、過剰な厳格化を避ける。
 {OVV_SOFT_CORE}
 """
+
 
 # ============================================================
 # 6. Ovv Call
@@ -393,7 +383,6 @@ async def on_message(message: discord.Message):
     if message.type == MessageType.thread_created:
         return
 
-    # ovv-* 限定
     if isinstance(message.channel, discord.Thread):
         if not message.channel.parent.name.lower().startswith("ovv-"):
             return
@@ -401,14 +390,12 @@ async def on_message(message: discord.Message):
         if not message.channel.name.lower().startswith("ovv-"):
             return
 
-    # command
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
 
     thread_id, channel_id = get_thread_and_channel(message)
 
-    # goal 待ち
     if thread_id and PENDING_TASK_GOAL.get(thread_id):
 
         goal_text = message.content.strip()
@@ -450,7 +437,6 @@ async def on_message(message: discord.Message):
         )
         return
 
-    # 通常の Ovv 応答
     context_key = get_context_key(message)
     push_ovv_memory(context_key, "user", message.content)
 
@@ -505,7 +491,7 @@ async def o_command(ctx: commands.Context, *, question: str):
 
 
 # ============================================================
-# 10. !Task / !t
+# 10. !Task
 # ============================================================
 
 @bot.command(name="Task", aliases=["t"])
@@ -701,8 +687,11 @@ async def task_end(ctx: commands.Context):
 # PostgreSQL Connect + init_db
 # ============================================================
 
+print("[BOOT] about to call pg_connect")
 pg_connect()
+print("[BOOT] pg_connect finished, calling init_db")
 init_db()
+print("[BOOT] init_db finished")
 
 # ============================================================
 # 14. Run
