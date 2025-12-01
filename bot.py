@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 # ============================================================
 # 1. Environment
 # ============================================================
+
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -36,6 +37,51 @@ if not NOTION_LOGS_DB_ID:
     raise RuntimeError("NOTION_LOGS_DB_ID が未設定です。")
 
 notion = Client(auth=NOTION_API_KEY)
+
+# ============================================================
+# Postgres (Phase 1: 接続 + init_db のみ)
+# ============================================================
+
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+POSTGRES_URL = os.getenv("POSTGRES_URL")
+
+pg_conn = None
+
+def pg_connect():
+    global pg_conn
+    try:
+        pg_conn = psycopg2.connect(POSTGRES_URL, cursor_factory=RealDictCursor)
+        print("[INFO] Postgres connected.")
+    except Exception as e:
+        print("[ERROR] Postgres connection failed:", e)
+        pg_conn = None
+
+def init_db():
+    """
+    Phase 1 では最低限のテーブルのみ作成する。
+    runtime_memory は Phase 2 以降で使用。
+    """
+    if pg_conn is None:
+        print("[WARN] init_db skipped (no Postgres connection).")
+        return
+
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS runtime_memory (
+                    id SERIAL PRIMARY KEY,
+                    thread_key BIGINT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            pg_conn.commit()
+            print("[INFO] init_db: runtime_memory table ensured.")
+    except Exception as e:
+        print("[ERROR] init_db failed:", e)
 
 # ============================================================
 # 2. Notion CRUD  (Unified Logging Schema v2.1 準拠)
@@ -826,6 +872,12 @@ async def task_end(ctx: commands.Context):
             f"保存ログ件数: {len(logs)}\n"
             "要約は Notion の summary で確認できます。"
         )
+# ============================================================
+# Postgres Connect + init_db 起動時実行
+# ============================================================
+
+pg_connect()
+init_db()
 
 # ============================================================
 # 14. Run
