@@ -1,5 +1,7 @@
 import os
 import discord
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from discord import MessageType
 from discord.ext import commands
 from openai import OpenAI
