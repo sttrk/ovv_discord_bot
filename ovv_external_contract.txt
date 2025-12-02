@@ -1,4 +1,4 @@
-Ovv External Contract v1.4.1
+Ovv External Contract v1.4.1 
 (Full, Structured, Core-Aligned + Notion Integration + Discord Unified Edition / Notion_DB_Spec_v1 Consistent)
 
 ============================================================
