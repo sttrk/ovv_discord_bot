@@ -1,4 +1,4 @@
-Ovv v1.4-Core (Minimal Bootstrap Specification)
+Ovv v1.4-Core (Minimal Bootstrap Specification) 
 【Final Adopted Edition + Scope-Control Fix】
 
 [ROLE]
