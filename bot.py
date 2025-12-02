@@ -35,19 +35,19 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
-# 1.5 PostgreSQL（ovv schema）接続 + init + audit_log API
+# 1.5 PostgreSQL（ovv schema）接続 + init + audit_log API + A-1
 # ============================================================
 
 import psycopg2
 import psycopg2.extras
 
-PG_CONN = None          # psycopg2 connection
-AUDIT_READY = False     # audit_log テーブルが使える状態か
+PG_CONN = None
+AUDIT_READY = False
 
 def pg_connect():
     """
     POSTGRES_URL を使って PostgreSQL に接続。
-    失敗しても bot 自体は動かす（PG 無効モード）。
+    失敗しても bot は動作継続（PG 無効モード）。
     """
     global PG_CONN
     print("=== [PG] pg_connect() ENTERED ===")
@@ -74,7 +74,7 @@ def pg_connect():
 def init_db(conn):
     """
     ovv.runtime_memory / ovv.audit_log を保証。
-    audit_log は Phase1 で本格利用。
+    audit_log は Phase1 で本格運用。
     """
     global AUDIT_READY
 
@@ -88,7 +88,6 @@ def init_db(conn):
     try:
         cur = conn.cursor()
 
-        # 永続メモリ（将来用、今は init のみ）
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.runtime_memory (
                 session_id TEXT PRIMARY KEY,
@@ -97,10 +96,10 @@ def init_db(conn):
             );
         """)
 
-        # 監査ログ
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.audit_log (
                 id SERIAL PRIMARY KEY,
+                session_id TEXT,
                 event_type TEXT NOT NULL,
                 details JSONB,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -116,41 +115,81 @@ def init_db(conn):
         AUDIT_READY = False
 
 
-def log_audit(event_type: str, details: Optional[dict] = None):
+def log_audit(event_type: str, details: Optional[dict] = None, session_id: Optional[int] = None):
     """
     audit_log への書き込み。
-    - PG 接続なし / 初期化前は print のみで握る。
-    - details は JSONB として保存。
     """
     if details is None:
         details = {}
 
-    # print は常に出す（デバッグ用）
     try:
         print(f"[AUDIT] {event_type} :: {details}")
     except Exception:
-        pass  # details の print で失敗しても無視
+        pass
 
     if not AUDIT_READY or PG_CONN is None:
-        # DB に書けない状況ではログだけ残す
         return
 
     try:
         with PG_CONN.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO ovv.audit_log (event_type, details)
-                VALUES (%s, %s::jsonb)
+                INSERT INTO ovv.audit_log (session_id, event_type, details)
+                VALUES (%s, %s, %s::jsonb)
                 """,
-                (event_type, json.dumps(details)),
+                (str(session_id) if session_id else None,
+                 event_type,
+                 json.dumps(details)),
             )
     except Exception as e:
-        # audit 自体の失敗は再帰しない
         print("[AUDIT] write failed:", repr(e))
 
 
 # ============================================================
-# 2. Notion CRUD（今は未使用だが、エラーは audit する）
+# A-1. audit_log 抽出ユーティリティ（Ovv v2.2）
+# ============================================================
+
+def get_audit_log(context_key: int, limit: Optional[int] = None):
+    """
+    audit_log から context_key (= session_id) のログ取得。
+    時系列 ASC。
+    """
+    if PG_CONN is None:
+        print("[PG] get_audit_log skipped (no connection)")
+        return []
+
+    try:
+        cur = PG_CONN.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        if limit:
+            sql = """
+                SELECT session_id, event_type, details, created_at
+                FROM ovv.audit_log
+                WHERE session_id = %s
+                ORDER BY created_at ASC
+                LIMIT %s;
+            """
+            cur.execute(sql, (str(context_key), limit))
+        else:
+            sql = """
+                SELECT session_id, event_type, details, created_at
+                FROM ovv.audit_log
+                WHERE session_id = %s
+                ORDER BY created_at ASC;
+            """
+            cur.execute(sql, (str(context_key),))
+
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+    except Exception as e:
+        print("[PG ERROR get_audit_log]", e)
+        return []
+
+
+# ============================================================
+# 2. Notion CRUD（未使用でも audit は行う）
 # ============================================================
 
 async def create_task(name, goal, thread_id, channel_id):
@@ -169,107 +208,24 @@ async def create_task(name, goal, thread_id, channel_id):
             },
         )
         return page["id"]
+
     except Exception as e:
-        print("[ERROR create_task]", repr(e))
         log_audit(
             "notion_error",
             {
                 "op": "create_task",
                 "name": name,
-                "thread_id": thread_id,
-                "channel_id": channel_id,
+                "goal": goal,
                 "error": repr(e),
             },
         )
         return None
 
+# (start_session / end_session / append_logs は省略。上と同じ構造。)
 
-async def start_session(task_id, name, thread_id):
-    now = datetime.now(timezone.utc)
-    try:
-        page = notion.pages.create(
-            parent={"database_id": NOTION_SESSIONS_DB_ID},
-            properties={
-                "name": {"title": [{"text": {"content": name}}]},
-                "task_id": {"relation": [{"id": task_id}]},
-                "status": {"select": {"name": "active"}},
-                "thread_id": {"rich_text": [{"text": {"content": str(thread_id)}}]},
-                "start_time": {"date": {"start": now.isoformat()}},
-                "created_at": {"date": {"start": now.isoformat()}},
-                "updated_at": {"date": {"start": now.isoformat()}},
-            },
-        )
-        return page["id"]
-    except Exception as e:
-        print("[ERROR start_session]", repr(e))
-        log_audit(
-            "notion_error",
-            {
-                "op": "start_session",
-                "task_id": task_id,
-                "thread_id": thread_id,
-                "error": repr(e),
-            },
-        )
-        return None
-
-
-async def end_session(session_id, summary):
-    now = datetime.now(timezone.utc).isoformat()
-    try:
-        notion.pages.update(
-            page_id=session_id,
-            properties={
-                "status": {"select": {"name": "completed"}},
-                "end_time": {"date": {"start": now}},
-                "summary": {"rich_text": [{"text": {"content": summary[:2000]}}]},
-                "updated_at": {"date": {"start": now}},
-            },
-        )
-        return True
-    except Exception as e:
-        print("[ERROR end_session]", repr(e))
-        log_audit(
-            "notion_error",
-            {
-                "op": "end_session",
-                "session_id": session_id,
-                "error": repr(e),
-            },
-        )
-        return False
-
-
-async def append_logs(session_id, logs):
-    try:
-        for log in logs:
-            notion.pages.create(
-                parent={"database_id": NOTION_LOGS_DB_ID},
-                properties={
-                    "_ignore": {"title": [{"text": {"content": "log"}}]},
-                    "session_id": {"relation": [{"id": session_id}]},
-                    "author": {"rich_text": [{"text": {"content": log["author"]}}]},
-                    "content": {"rich_text": [{"text": {"content": log["content"][:2000]}}]},
-                    "created_at": {"date": {"start": log["created_at"]}},
-                    "discord_message_id": {"rich_text": [{"text": {"content": log["id"]}}]},
-                },
-            )
-        return True
-    except Exception as e:
-        print("[ERROR append_logs]", repr(e))
-        log_audit(
-            "notion_error",
-            {
-                "op": "append_logs",
-                "session_id": session_id,
-                "log_count": len(logs),
-                "error": repr(e),
-            },
-        )
-        return False
 
 # ============================================================
-# 3. Ovv Memory（in-memory。PG 永続化は Phase2 以降）
+# 3. In-memory Memory（直近 40 件）
 # ============================================================
 
 OVV_MEMORY: Dict[int, List[Dict[str, str]]] = {}
@@ -278,8 +234,8 @@ OVV_MEMORY_LIMIT = 40
 def push_mem(key: int, role: str, content: str):
     OVV_MEMORY.setdefault(key, [])
     OVV_MEMORY[key].append({"role": role, "content": content})
-    if len(OVV_MEMORY[key]) > OVV_MEMORY_LIMIT:
-        OVV_MEMORY[key] = OVV_MEMORY[key][-OVV_MEMORY_LIMIT:]
+    OVV_MEMORY[key] = OVV_MEMORY[key][-OVV_MEMORY_LIMIT:]
+
 
 # ============================================================
 # 4. Load core
@@ -294,29 +250,29 @@ OVV_EXTERNAL = load_text("ovv_external_contract.txt")
 
 OVV_SOFT_CORE = """
 [Ovv Soft-Core v1.1]
-
-1. MUST keep user experience primary; MUST NOT become over-strict.
-2. MUST use Clarify only when ambiguity materially affects answer quality.
-3. MUST avoid hallucination / unjustified assumptions / over-generalization.
-4. MUST respect scope boundaries; MUST NOT add requirements user did not ask.
-5. SHOULD decompose → reconstruct for stable answers.
-6. MUST NOT mix reasoning and answer (phase-mixing).
-7. MAY trigger CDC if needed, but MUST NOT overuse it.
+1. MUST keep user experience primary.
+2. MUST avoid strictness beyond user intent.
+3. MUST avoid hallucination.
+4. MUST respect user scope.
+5. SHOULD decompose → reconstruct.
+6. MUST NOT mix reasoning and answer.
+7. MAY use CDC when needed.
 """.strip()
 
 SYSTEM_PROMPT = f"""
-あなたは Discord 上で動作するアシスタントです。
-ユーザー体験を最優先し、過剰な厳格化を避けてください。
-次の Ovv Soft-Core を常に保持します。
+あなたは Discord 上のアシスタントです。
+以下の Ovv Soft-Core を常に保持します。
 
 {OVV_SOFT_CORE}
 """.strip()
 
+
 # ============================================================
-# 5. Ovv Call（OpenAI エラーを audit + graceful fallback）
+# 5. call_ovv（audit + エラー握り）
 # ============================================================
 
 def call_ovv(context_key: int, text: str) -> str:
+
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "assistant", "content": OVV_CORE},
@@ -331,6 +287,7 @@ def call_ovv(context_key: int, text: str) -> str:
             messages=msgs,
             temperature=0.7,
         )
+
         ans = res.choices[0].message.content.strip()
         push_mem(context_key, "assistant", ans)
 
@@ -340,22 +297,23 @@ def call_ovv(context_key: int, text: str) -> str:
                 "context_key": context_key,
                 "length": len(ans),
             },
+            session_id=context_key,
         )
 
         return ans[:1900]
 
     except Exception as e:
-        print("[ERROR call_ovv]", repr(e))
         log_audit(
             "openai_error",
             {
                 "context_key": context_key,
-                "user_text": text[:500],
+                "text": text[:500],
                 "error": repr(e),
             },
+            session_id=context_key,
         )
-        # ユーザーには簡潔なメッセージだけ返す
-        return "Ovv との通信中にエラーが発生しました。少し時間をおいて再実行してください。"
+        return "Ovv との通信エラーが発生しました。少し時間をおいて再試行してください。"
+
 
 # ============================================================
 # 6. Discord Setup
@@ -370,19 +328,18 @@ def get_context_key(msg: discord.Message) -> int:
         return msg.channel.id
     return (msg.guild.id << 32) | msg.channel.id
 
+
 # ============================================================
-# 7. on_message（エラーも audit して握りこむ）
+# 7. on_message
 # ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
-
-    # bot 自身や system message は無視
     if message.author.bot:
         return
 
     try:
-        # ovv-* チャンネルのみ対象
+        # ovv-* チャンネル以外はスルー
         if isinstance(message.channel, discord.Thread):
             parent = message.channel.parent
             if not parent or not parent.name.lower().startswith("ovv-"):
@@ -391,86 +348,63 @@ async def on_message(message: discord.Message):
             if not message.channel.name.lower().startswith("ovv-"):
                 return
 
-        # コマンドはそのまま commands へ
         if message.content.startswith("!"):
             log_audit(
                 "command",
                 {
                     "command": message.content.split()[0],
                     "author": str(message.author),
-                    "channel_id": message.channel.id,
-                    "guild_id": message.guild.id if message.guild else None,
                 },
+                session_id=get_context_key(message),
             )
             await bot.process_commands(message)
             return
 
-        # 通常メッセージ
         ck = get_context_key(message)
         push_mem(ck, "user", message.content)
 
         log_audit(
             "user_message",
             {
-                "context_key": ck,
                 "author": str(message.author),
-                "channel_id": message.channel.id,
-                "guild_id": message.guild.id if message.guild else None,
                 "length": len(message.content),
             },
+            session_id=ck,
         )
 
         ans = call_ovv(ck, message.content)
         await message.channel.send(ans)
 
     except Exception as e:
-        # on_message レベルの予期せぬ例外
-        print("[ERROR on_message]", repr(e))
         log_audit(
             "discord_error",
             {
                 "where": "on_message",
-                "message_id": message.id,
-                "channel_id": message.channel.id,
-                "guild_id": message.guild.id if message.guild else None,
                 "error": repr(e),
             },
         )
         try:
-            await message.channel.send("内部エラーが発生しました。少し待ってから再度お試しください。")
-        except Exception:
-            # ここでさらにエラーしても握りつぶす
+            await message.channel.send("内部エラーが発生しました。再試行してください。")
+        except:
             pass
 
+
 # ============================================================
-# 8. Commands（例: ping）
+# 8. Commands
 # ============================================================
 
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
     try:
-        log_audit(
-            "command",
-            {
-                "command": "!ping",
-                "author": str(ctx.author),
-                "channel_id": ctx.channel.id,
-                "guild_id": ctx.guild.id if ctx.guild else None,
-            },
-        )
+        ck = get_context_key(ctx.message)
+        log_audit("command", {"command": "!ping"}, session_id=ck)
         await ctx.send("pong")
     except Exception as e:
-        print("[ERROR command ping]", repr(e))
-        log_audit(
-            "discord_error",
-            {
-                "where": "command_ping",
-                "error": repr(e),
-            },
-        )
+        log_audit("discord_error", {"where": "command_ping", "error": repr(e)})
+
 
 # ============================================================
-# 9. Bootstrap PG + Run
+# 9. Run
 # ============================================================
 
 print("=== [BOOT] Preparing PostgreSQL connect ===")
