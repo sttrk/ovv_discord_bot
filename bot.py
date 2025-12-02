@@ -1,4 +1,5 @@
 import os
+import sys
 import discord
 from discord import MessageType
 from discord.ext import commands
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 # 1. Environment
 # ============================================================
 
-print("=== [BOOT] Loading environment variables ===")
+print("=== [BOOT] Loading environment variables ===", flush=True)
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -27,8 +28,8 @@ if not DISCORD_BOT_TOKEN or not OPENAI_API_KEY:
 if not NOTION_API_KEY:
     raise RuntimeError("NOTION_API_KEY missing")
 
-print("=== [ENV] Env OK ===")
-print("=== [ENV] POSTGRES_URL detected:", str(POSTGRES_URL)[:40], "...")
+print("=== [ENV] Env OK ===", flush=True)
+print("=== [ENV] POSTGRES_URL detected:", str(POSTGRES_URL)[:80], "...", flush=True)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
@@ -41,35 +42,34 @@ import psycopg2
 import psycopg2.extras
 
 def pg_connect():
-    print("=== [PG] pg_connect() ===")
+    print("=== [PG] pg_connect() ENTERED ===", flush=True)
 
     if not POSTGRES_URL:
-        print("[PG] POSTGRES_URL not set, skip PG")
+        print("[PG] POSTGRES_URL not set, skip PG", flush=True)
         return None
 
-    print("[PG] Connecting via:", POSTGRES_URL[:60], "...")
+    print("[PG] Connecting via:", POSTGRES_URL[:100], "...", flush=True)
 
     try:
         conn = psycopg2.connect(POSTGRES_URL)
         conn.autocommit = True
-        print("[PG] PostgreSQL connected OK")
+        print("[PG] PostgreSQL connected OK", flush=True)
         return conn
 
     except Exception as e:
-        print("[PG] Connection failed:", e)
+        print("[PG] Connection failed:", str(e), flush=True)
         return None
 
 
 def init_db(conn):
-    print("=== [PG] init_db() ===")
+    print("=== [PG] init_db() CALLED ===", flush=True)
 
     if conn is None:
-        print("[PG] init_db skipped (no connection)")
+        print("[PG] init_db skipped (no connection)", flush=True)
         return
 
     cur = conn.cursor()
 
-    # 永続メモリ
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ovv.runtime_memory (
             session_id TEXT PRIMARY KEY,
@@ -78,7 +78,6 @@ def init_db(conn):
         );
     """)
 
-    # 監査ログ
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ovv.audit_log (
             id SERIAL PRIMARY KEY,
@@ -89,7 +88,7 @@ def init_db(conn):
     """)
 
     cur.close()
-    print("[PG] init_db OK")
+    print("[PG] init_db OK", flush=True)
 
 # ============================================================
 # 2. Notion CRUD
@@ -112,7 +111,7 @@ async def create_task(name, goal, thread_id, channel_id):
         )
         return page["id"]
     except Exception as e:
-        print("[ERROR create_task]", e)
+        print("[ERROR create_task]", e, flush=True)
         return None
 
 async def start_session(task_id, name, thread_id):
@@ -132,7 +131,7 @@ async def start_session(task_id, name, thread_id):
         )
         return page["id"]
     except Exception as e:
-        print("[ERROR start_session]", e)
+        print("[ERROR start_session]", e, flush=True)
         return None
 
 async def end_session(session_id, summary):
@@ -149,7 +148,7 @@ async def end_session(session_id, summary):
         )
         return True
     except Exception as e:
-        print("[ERROR end_session]", e)
+        print("[ERROR end_session]", e, flush=True)
         return False
 
 async def append_logs(session_id, logs):
@@ -168,7 +167,7 @@ async def append_logs(session_id, logs):
             )
         return True
     except Exception as e:
-        print("[ERROR append_logs]", e)
+        print("[ERROR append_logs]", e, flush=True)
         return False
 
 # ============================================================
@@ -267,10 +266,16 @@ async def ping(ctx):
 # 9. Bootstrap PG + Run
 # ============================================================
 
-print("=== [BOOT] Preparing PostgreSQL connect ===")
-conn = pg_connect()
-init_db(conn)
+print("=== [BOOT] Preparing PostgreSQL connect ===", flush=True)
+sys.stdout.flush()
 
-print("=== [RUN] Starting Discord bot ===")
+conn = pg_connect()
+sys.stdout.flush()
+
+init_db(conn)
+sys.stdout.flush()
+
+print("=== [RUN] Starting Discord bot ===", flush=True)
+sys.stdout.flush()
 
 bot.run(DISCORD_BOT_TOKEN)
