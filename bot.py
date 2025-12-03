@@ -1,7 +1,6 @@
 import os
 import json
 import discord
-from discord import MessageType
 from discord.ext import commands
 from openai import OpenAI
 from notion_client import Client
@@ -44,6 +43,13 @@ import psycopg2.extras
 PG_CONN = None
 AUDIT_READY = False
 
+# runtime_memory パラメータ
+RUNTIME_LIMIT = 300          # 1 context_key あたり保持する最大メッセージ数
+RUNTIME_MAX_CHARS = 2000     # content の最大長（超えたら truncate）
+
+# PG が使えない場合のフォールバックメモリ
+RUNTIME_MEMORY_FALLBACK: Dict[int, List[Dict[str, str]]] = {}
+
 
 def pg_connect():
     global PG_CONN
@@ -79,6 +85,10 @@ def init_db(conn):
     try:
         cur = conn.cursor()
 
+        # スキーマ保証
+        cur.execute("CREATE SCHEMA IF NOT EXISTS ovv;")
+
+        # 永続メモリ（runtime_memory）
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.runtime_memory (
                 session_id TEXT PRIMARY KEY,
@@ -87,6 +97,7 @@ def init_db(conn):
             );
         """)
 
+        # 監査ログ
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.audit_log (
                 id SERIAL PRIMARY KEY,
@@ -96,6 +107,7 @@ def init_db(conn):
             );
         """)
 
+        # thread_brain
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.thread_brain (
                 context_key BIGINT PRIMARY KEY,
@@ -139,7 +151,7 @@ def log_audit(event_type: str, details: Optional[dict] = None):
 
 
 # ============================================================
-# 2. Notion CRUD（不変）
+# 2. Notion CRUD（現時点では未使用だが温存）
 # ============================================================
 
 async def create_task(name, goal, thread_id, channel_id):
@@ -184,6 +196,8 @@ async def start_session(task_id, name, thread_id):
         print("[ERROR start_session]", repr(e))
         log_audit("notion_error", {"op": "start_session", "task_id": task_id, "error": repr(e)})
         return None
+
+
 async def end_session(session_id, summary):
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -226,19 +240,119 @@ async def append_logs(session_id, logs):
         )
         return False
 
+
 # ============================================================
-# 3. OVV MEMORY
+# 3. runtime_memory（PG 永続メモリ） + フォールバック
 # ============================================================
 
-OVV_MEMORY: Dict[int, List[Dict[str, str]]] = {}
-OVV_MEMORY_LIMIT = 40
+def _runtime_session_id(context_key: int) -> str:
+    # 将来 format 変更する時もここだけ触ればよい
+    return str(context_key)
 
 
-def push_mem(key: int, role: str, content: str):
-    OVV_MEMORY.setdefault(key, [])
-    OVV_MEMORY[key].append({"role": role, "content": content})
-    if len(OVV_MEMORY[key]) > OVV_MEMORY_LIMIT:
-        OVV_MEMORY[key] = OVV_MEMORY[key][-OVV_MEMORY_LIMIT:]
+def _truncate_content(content: str) -> str:
+    if content is None:
+        return ""
+    if len(content) > RUNTIME_MAX_CHARS:
+        return content[:RUNTIME_MAX_CHARS]
+    return content
+
+
+def load_runtime_memory(context_key: int, limit: Optional[int] = None) -> List[Dict[str, str]]:
+    """
+    指定 context_key のメモリ（role, content の配列）を取得。
+    - 新しい順ではなく「古い→新しい」の順番で返す。
+    - limit が指定されていれば末尾 limit 件に絞る。
+    """
+    session_id = _runtime_session_id(context_key)
+
+    # PG 未接続時はフォールバック
+    if PG_CONN is None:
+        msgs = RUNTIME_MEMORY_FALLBACK.get(context_key, [])
+        if limit is not None and len(msgs) > limit:
+            return msgs[-limit:]
+        return msgs
+
+    try:
+        with PG_CONN.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT memory_json
+                FROM ovv.runtime_memory
+                WHERE session_id = %s
+                """,
+                (session_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return []
+            arr = row.get("memory_json") or []
+            if not isinstance(arr, list):
+                return []
+            if limit is not None and len(arr) > limit:
+                return arr[-limit:]
+            return arr
+    except Exception as e:
+        print("[runtime_memory] load error:", repr(e))
+        log_audit(
+            "runtime_load_error",
+            {"context_key": context_key, "error": repr(e)},
+        )
+        # フォールバックも見る
+        msgs = RUNTIME_MEMORY_FALLBACK.get(context_key, [])
+        if limit is not None and len(msgs) > limit:
+            return msgs[-limit:]
+        return msgs
+
+
+def _save_runtime_memory(context_key: int, messages: List[Dict[str, str]]) -> None:
+    """
+    runtime_memory をそのまま保存する内部関数。
+    フォールバック側も同期させる。
+    """
+    # フォールバック側更新
+    RUNTIME_MEMORY_FALLBACK[context_key] = list(messages)
+
+    if PG_CONN is None:
+        return
+
+    session_id = _runtime_session_id(context_key)
+    try:
+        with PG_CONN.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ovv.runtime_memory (session_id, memory_json, updated_at)
+                VALUES (%s, %s::jsonb, NOW())
+                ON CONFLICT (session_id)
+                DO UPDATE SET
+                    memory_json = EXCLUDED.memory_json,
+                    updated_at  = NOW();
+                """,
+                (session_id, json.dumps(messages, ensure_ascii=False)),
+            )
+    except Exception as e:
+        print("[runtime_memory] save error:", repr(e))
+        log_audit(
+            "runtime_save_error",
+            {"context_key": context_key, "error": repr(e)},
+        )
+
+
+def append_runtime_memory(context_key: int, role: str, content: str) -> None:
+    """
+    1メッセージを runtime_memory に追加し、RUNTIME_LIMIT を超えたら末尾だけ残す。
+    """
+    truncated = _truncate_content(content)
+
+    # 既存メモリ取得
+    current = load_runtime_memory(context_key, limit=None)
+    current.append({"role": role, "content": truncated})
+
+    # TRIM
+    if len(current) > RUNTIME_LIMIT:
+        current = current[-RUNTIME_LIMIT:]
+
+    _save_runtime_memory(context_key, current)
 
 
 # ============================================================
@@ -349,14 +463,12 @@ def save_thread_brain(context_key: int, summary: dict) -> bool:
 
 def _build_thread_brain_prompt(context_key: int) -> str:
     """
-    OVV_MEMORY と既存 summary を材料に、LLM 用のプロンプト本文を構築。
+    runtime_memory と既存 summary を材料に、LLM 用のプロンプト本文を構築。
     """
-    mem = OVV_MEMORY.get(context_key, [])
-    recent = mem[-30:] if len(mem) > 30 else mem
-
-    # STEP 1: USER/BOT の発言履歴 (短縮版)
+    # STEP 1: USER/BOT の発言履歴 (短縮版) – runtime_memory から取得
+    mem = load_runtime_memory(context_key, limit=60)  # thread_brain 用は少し多め
     lines: List[str] = []
-    for m in recent:
+    for m in mem:
         role = m.get("role", "user")
         content = m.get("content", "")
         if not content:
@@ -440,9 +552,11 @@ def _build_thread_brain_prompt(context_key: int) -> str:
 {history_block}
 """
     return body
+
+
 def generate_thread_brain(context_key: int) -> Optional[dict]:
     """
-    OVV_MEMORY と（あれば）既存 summary をもとに、
+    runtime_memory と（あれば）既存 summary をもとに、
     LLM で thread_brain JSON を生成 → dict で返す。
     """
     prompt_body = _build_thread_brain_prompt(context_key)
@@ -485,7 +599,7 @@ def generate_thread_brain(context_key: int) -> Optional[dict]:
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
-        text = text[start : end + 1]
+        text = text[start: end + 1]
 
     summary: Optional[dict] = None
     try:
@@ -524,14 +638,16 @@ def generate_thread_brain(context_key: int) -> Optional[dict]:
 # ============================================================
 
 def call_ovv(context_key: int, text: str) -> str:
-    msgs = [
+    msgs: List[Dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "assistant", "content": OVV_CORE},
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
-    # Phase 2: まだ推論には thread_brain を使わない（将来拡張）。
-    msgs.extend(OVV_MEMORY.get(context_key, []))
+    # runtime_memory から「短期記憶」を読み込んで追加（最新30件）
+    history = load_runtime_memory(context_key, limit=30)
+    msgs.extend(history)
+
     msgs.append({"role": "user", "content": text})
 
     try:
@@ -541,7 +657,9 @@ def call_ovv(context_key: int, text: str) -> str:
             temperature=0.7,
         )
         ans = res.choices[0].message.content.strip()
-        push_mem(context_key, "assistant", ans)
+
+        # assistant の返答も runtime_memory へ
+        append_runtime_memory(context_key, "assistant", ans)
 
         log_audit(
             "assistant_reply",
@@ -588,6 +706,8 @@ def get_context_key(msg: discord.Message) -> int:
         # DM 等ギルドが無い場合はチャンネル ID をそのまま利用
         return msg.channel.id
     return (msg.guild.id << 32) | msg.channel.id
+
+
 # ============================================================
 # 8. on_message（thread_brain 自動生成フック付き）
 # ============================================================
@@ -598,7 +718,7 @@ async def on_message(message: discord.Message):
         return
 
     try:
-        # ここからは全チャンネル対象（ovv- プレフィックス制限を撤廃）
+        # 全チャンネル対象（ovv- プレフィックス制限撤廃）
 
         # コマンドは専用処理へ
         if message.content.startswith("!"):
@@ -616,7 +736,9 @@ async def on_message(message: discord.Message):
 
         # 通常メッセージ
         ck = get_context_key(message)
-        push_mem(ck, "user", message.content)
+
+        # user メッセージを runtime_memory に保存
+        append_runtime_memory(ck, "user", message.content)
 
         log_audit(
             "user_message",
@@ -745,6 +867,42 @@ async def test_thread(ctx: commands.Context):
 
     except Exception as e:
         log_audit("discord_error", {"where": "test_thread", "error": repr(e)})
+        await ctx.send("内部エラーが発生しました。")
+
+
+# ------------------------------------------------------------
+# !runtime_stat（runtime_memory の確認用テストコマンド）
+# ------------------------------------------------------------
+@bot.command(name="runtime_stat")
+async def runtime_stat(ctx: commands.Context):
+    """
+    現行 context_key の runtime_memory 件数と末尾数件を確認するためのテストコマンド。
+    """
+    try:
+        ck = get_context_key(ctx.message)
+        mem = load_runtime_memory(ck, limit=None)
+        count = len(mem)
+        tail = mem[-5:] if count > 5 else mem
+
+        preview_lines = []
+        for i, m in enumerate(tail, start=max(1, count - len(tail) + 1)):
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            content = content.replace("\n", " ")
+            if len(content) > 40:
+                content = content[:40] + "..."
+            preview_lines.append(f"{i}. {role}: {content}")
+
+        preview_text = "\n".join(preview_lines) if preview_lines else "(no messages)"
+
+        await ctx.send(
+            f"runtime_memory status for context_key={ck}\n"
+            f"total={count} (limit={RUNTIME_LIMIT})\n"
+            f"tail preview:\n{preview_text}"
+        )
+
+    except Exception as e:
+        log_audit("discord_error", {"where": "runtime_stat", "error": repr(e)})
         await ctx.send("内部エラーが発生しました。")
 
 
