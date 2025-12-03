@@ -184,8 +184,6 @@ async def start_session(task_id, name, thread_id):
         print("[ERROR start_session]", repr(e))
         log_audit("notion_error", {"op": "start_session", "task_id": task_id, "error": repr(e)})
         return None
-
-
 async def end_session(session_id, summary):
     now = datetime.now(timezone.utc).isoformat()
     try:
@@ -227,6 +225,7 @@ async def append_logs(session_id, logs):
             {"op": "append_logs", "session_id": session_id, "log_count": len(logs), "error": repr(e)},
         )
         return False
+
 # ============================================================
 # 3. OVV MEMORY
 # ============================================================
@@ -355,6 +354,7 @@ def _build_thread_brain_prompt(context_key: int) -> str:
     mem = OVV_MEMORY.get(context_key, [])
     recent = mem[-30:] if len(mem) > 30 else mem
 
+    # STEP 1: USER/BOT の発言履歴 (短縮版)
     lines: List[str] = []
     for m in recent:
         role = m.get("role", "user")
@@ -369,12 +369,14 @@ def _build_thread_brain_prompt(context_key: int) -> str:
 
     history_block = "\n".join(lines) if lines else "(対話履歴がほとんどありません)"
 
+    # STEP 2: 前回 summary の JSON
     prev_summary = load_thread_brain(context_key)
     if prev_summary is not None:
         prev_summary_text = json.dumps(prev_summary, ensure_ascii=False)
     else:
         prev_summary_text = "null"
 
+    # STEP 3: LLM に渡す文章
     body = f"""
 あなたは「thread_brain」という名称の、Discord スレッド専用の長期メモリを設計するアシスタントです。
 
@@ -392,54 +394,52 @@ def _build_thread_brain_prompt(context_key: int) -> str:
     "total_tokens_estimate": <int>
   }},
   "status": {{
-    "phase": "<idle|active|blocked|done など簡潔な1語>",
-    "last_major_event": "<直近で重要だった出来事を一文で>",
+    "phase": "<idle|active|blocked|done>",
+    "last_major_event": "<重要イベントを1文で>",
     "risk": [
-      "<このスレッド固有のリスク1>",
+      "<リスク1>",
       "<リスク2>"
     ]
   }},
   "decisions": [
-    "<今のところ確定している決定事項1>",
+    "<決定事項1>",
     "<決定事項2>"
   ],
   "unresolved": [
-    "<まだ決まっていない論点1>",
-    "<未解決の課題2>"
+    "<論点1>",
+    "<課題2>"
   ],
   "constraints": [
-    "<前提条件や制約1>",
+    "<制約1>",
     "<制約2>"
   ],
   "next_actions": [
-    "<このスレッドで次にやるべき具体的な一手1>",
+    "<次にやるべき一手1>",
     "<次のアクション2>"
   ],
-  "history_digest": "<ここまでの流れを 28000 文字以内で要約する。重要な経緯と転換点を優先し、重複は避ける。>",
-  "high_level_goal": "<このスレッドが最終的に目指している状態を一文で>",
+  "history_digest": "<28000文字以内の詳細要約>",
+  "high_level_goal": "<最終目標>",
   "recent_messages": [
-    "<直近の出来事や発言1>",
-    "<直近の出来事や発言2>"
+    "<最近の出来事1>",
+    "<最近の出来事2>"
   ],
-  "current_position": "<今このスレッドが全体のどの辺りにいるかを、一段高い視点から説明した一文>"
+  "current_position": "<現在地を一文で説明>"
 }}
 
 重要な制約：
-- 出力は **上記 JSON 1 個のみ**。説明文やマークダウン、コードブロックは一切付けないこと。
-- キー名は絶対に変更しないこと（例: "meta", "status", "decisions" など）。
-- "history_digest" は最大でも 28000 文字以内に収めること。
-- 対話ログが少ない場合でも、構造は同じにし、内容が無い項目は短く「特記事項なし」などで埋めること。
-- 「前回の summary」が与えられている場合は、それを尊重しつつ差分をアップデートする形で再構成すること。
+- 上記 JSON 1 個だけ返す。説明文・コードブロック禁止。
+- キー名は絶対変更不可。
+- history_digest は 28000 文字以内。
+- 対話ログが少なくても構造は維持。
+- 前回 summary がある場合は極力継承しつつ更新。
 
-[前回の summary（無ければ null）]
+[前回の summary]
 {prev_summary_text}
 
-[直近の対話ログのダイジェスト]
+[直近ログ]
 {history_block}
 """
     return body
-
-
 def generate_thread_brain(context_key: int) -> Optional[dict]:
     """
     OVV_MEMORY と（あれば）既存 summary をもとに、
@@ -473,6 +473,7 @@ def generate_thread_brain(context_key: int) -> Optional[dict]:
         )
         return None
 
+    # LLM からの返答から JSON 部分を抽出
     text = raw
     if "```" in text:
         parts = text.split("```")
@@ -484,7 +485,7 @@ def generate_thread_brain(context_key: int) -> Optional[dict]:
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
-        text = text[start: end + 1]
+        text = text[start : end + 1]
 
     summary: Optional[dict] = None
     try:
@@ -497,6 +498,7 @@ def generate_thread_brain(context_key: int) -> Optional[dict]:
         )
         return None
 
+    # meta を上書き整形
     now_iso = datetime.now(timezone.utc).isoformat()
     meta = summary.get("meta", {}) if isinstance(summary, dict) else {}
     meta["version"] = "1.0"
@@ -515,6 +517,8 @@ def generate_thread_brain(context_key: int) -> Optional[dict]:
     )
 
     return summary
+
+
 # ============================================================
 # 6. Ovv Call（OpenAI エラーを audit + graceful fallback）
 # ============================================================
@@ -526,7 +530,7 @@ def call_ovv(context_key: int, text: str) -> str:
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
-    # Phase 2: まだ推論には thread_brain を使わない。
+    # Phase 2: まだ推論には thread_brain を使わない（将来拡張）。
     msgs.extend(OVV_MEMORY.get(context_key, []))
     msgs.append({"role": "user", "content": text})
 
@@ -572,14 +576,18 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
 def get_context_key(msg: discord.Message) -> int:
+    """
+    各メッセージを一意に識別する context_key を決定。
+    - Thread: thread.id
+    - Guild text: (guild_id << 32) | channel_id
+    - DM: channel.id そのまま
+    """
     if isinstance(msg.channel, discord.Thread):
         return msg.channel.id
     if msg.guild is None:
         # DM 等ギルドが無い場合はチャンネル ID をそのまま利用
         return msg.channel.id
     return (msg.guild.id << 32) | msg.channel.id
-
-
 # ============================================================
 # 8. on_message（thread_brain 自動生成フック付き）
 # ============================================================
@@ -591,6 +599,7 @@ async def on_message(message: discord.Message):
 
     try:
         # ここからは全チャンネル対象（ovv- プレフィックス制限を撤廃）
+
         # コマンドは専用処理へ
         if message.content.startswith("!"):
             log_audit(
@@ -649,6 +658,8 @@ async def on_message(message: discord.Message):
             await message.channel.send("内部エラーが発生しました。再度お試しください。")
         except Exception:
             pass
+
+
 # ============================================================
 # 9. Commands
 # ============================================================
