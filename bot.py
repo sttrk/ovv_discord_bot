@@ -34,7 +34,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
-# 1.5 PostgreSQL（ovv schema）接続 + init + audit_log API
+# 1.5 PostgreSQL connect + init + audit_log
 # ============================================================
 
 import psycopg2
@@ -43,14 +43,12 @@ import psycopg2.extras
 PG_CONN = None
 AUDIT_READY = False
 
-
 def pg_connect():
     global PG_CONN
     print("=== [PG] pg_connect() ENTERED ===")
 
     if not POSTGRES_URL:
-        print("[PG] POSTGRES_URL not set, skip PG")
-        PG_CONN = None
+        print("[PG] POSTGRES_URL not set")
         return None
 
     print("[PG] Connecting via:", POSTGRES_URL[:120], "...")
@@ -69,7 +67,6 @@ def pg_connect():
 
 def init_db(conn):
     global AUDIT_READY
-
     print("=== [PG] init_db() CALLED ===")
 
     if conn is None:
@@ -80,7 +77,10 @@ def init_db(conn):
     try:
         cur = conn.cursor()
 
-        # 永続メモリ
+        cur.execute("""
+            CREATE SCHEMA IF NOT EXISTS ovv;
+        """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.runtime_memory (
                 session_id TEXT PRIMARY KEY,
@@ -89,13 +89,20 @@ def init_db(conn):
             );
         """)
 
-        # 監査ログ
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.audit_log (
                 id SERIAL PRIMARY KEY,
                 event_type TEXT NOT NULL,
                 details JSONB,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ovv.thread_brain (
+                context_key BIGINT PRIMARY KEY,
+                summary JSONB NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
         """)
 
@@ -114,7 +121,7 @@ def log_audit(event_type: str, details: Optional[dict] = None):
 
     try:
         print(f"[AUDIT] {event_type} :: {details}")
-    except Exception:
+    except:
         pass
 
     if not AUDIT_READY or PG_CONN is None:
@@ -122,16 +129,19 @@ def log_audit(event_type: str, details: Optional[dict] = None):
 
     try:
         with PG_CONN.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO ovv.audit_log (event_type, details)
                 VALUES (%s, %s::jsonb)
-            """, (event_type, json.dumps(details)))
+                """,
+                (event_type, json.dumps(details)),
+            )
     except Exception as e:
         print("[AUDIT] write failed:", repr(e))
 
 
 # ============================================================
-# 2. Notion CRUD（未使用）
+# 2. Notion CRUD（今は未使用だが動く形で保持）
 # ============================================================
 
 async def create_task(name, goal, thread_id, channel_id):
@@ -154,14 +164,12 @@ async def create_task(name, goal, thread_id, channel_id):
         log_audit("notion_error", {"op": "create_task", "error": repr(e)})
         return None
 
-
 # ============================================================
-# 3. Ovv Memory（short-term）
+# 3. In-memory OVV memory
 # ============================================================
 
 OVV_MEMORY: Dict[int, List[Dict[str, str]]] = {}
 OVV_MEMORY_LIMIT = 40
-
 
 def push_mem(key: int, role: str, content: str):
     OVV_MEMORY.setdefault(key, [])
@@ -169,39 +177,98 @@ def push_mem(key: int, role: str, content: str):
     if len(OVV_MEMORY[key]) > OVV_MEMORY_LIMIT:
         OVV_MEMORY[key] = OVV_MEMORY[key][-OVV_MEMORY_LIMIT:]
 
-
 # ============================================================
-# 4. Load Core
+# 4. Load core
 # ============================================================
 
 def load_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-
 OVV_CORE = load_text("ovv_core.txt")
 OVV_EXTERNAL = load_text("ovv_external_contract.txt")
 
 OVV_SOFT_CORE = """
-[Ovv Soft-Core v1.6]
+[Ovv Soft-Core v1.1]
 
-1. MUST keep user experience primary
-2. MUST NOT become over-strict
-3. MUST avoid hallucination and unjustified assumptions
-4. MUST keep boundaries clean
-5. MUST separate reasoning phases
+1. MUST keep user experience primary.
+2. MUST avoid hallucination.
+3. MUST avoid phase-mixing.
+4. MUST keep boundaries stable.
+5. MUST decompose → reconstruct.
+6. Clarify only when necessary.
 """.strip()
 
 SYSTEM_PROMPT = f"""
-あなたは Discord 上で動作する Ovv です。
-次の Ovv Soft-Core を常に保持し動作します。
+あなたは Discord 上の Ovv アシスタントです。
+次の Ovv Soft-Core を常に保持します。
 
 {OVV_SOFT_CORE}
 """.strip()
 
+# ============================================================
+# 5. thread_brain load / save
+# ============================================================
+
+def load_thread_brain(context_key: int):
+    if PG_CONN is None:
+        return None
+
+    try:
+        with PG_CONN.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT summary
+                FROM ovv.thread_brain
+                WHERE context_key = %s
+                """,
+                (context_key,)
+            )
+            row = cur.fetchone()
+            if row:
+                summary = row["summary"]
+                log_audit("thread_brain_loaded", {
+                    "context_key": context_key,
+                    "exists": True
+                })
+                return summary
+            else:
+                log_audit("thread_brain_loaded", {
+                    "context_key": context_key,
+                    "exists": False
+                })
+                return None
+    except Exception as e:
+        log_audit("pg_error", {"op": "load_thread_brain", "error": repr(e)})
+        return None
+
+
+def save_thread_brain(context_key: int, summary_json: dict):
+    if PG_CONN is None:
+        return
+
+    try:
+        with PG_CONN.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ovv.thread_brain (context_key, summary, updated_at)
+                VALUES (%s, %s::jsonb, NOW())
+                ON CONFLICT (context_key)
+                DO UPDATE SET summary = EXCLUDED.summary,
+                              updated_at = NOW()
+                """,
+                (context_key, json.dumps(summary_json))
+            )
+        log_audit("thread_brain_saved", {
+            "context_key": context_key,
+            "size": len(json.dumps(summary_json))
+        })
+
+    except Exception as e:
+        log_audit("pg_error", {"op": "save_thread_brain", "error": repr(e)})
 
 # ============================================================
-# 5. call_ovv
+# 6. Ovv call
 # ============================================================
 
 def call_ovv(context_key: int, text: str) -> str:
@@ -210,6 +277,7 @@ def call_ovv(context_key: int, text: str) -> str:
         {"role": "assistant", "content": OVV_CORE},
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
+
     msgs.extend(OVV_MEMORY.get(context_key, []))
     msgs.append({"role": "user", "content": text})
 
@@ -222,42 +290,41 @@ def call_ovv(context_key: int, text: str) -> str:
         ans = res.choices[0].message.content.strip()
         push_mem(context_key, "assistant", ans)
 
-        log_audit("assistant_reply", {"context_key": context_key, "length": len(ans)})
+        log_audit("assistant_reply", {
+            "context_key": context_key,
+            "length": len(ans)
+        })
 
         return ans[:1900]
 
     except Exception as e:
-        log_audit("openai_error",
-                  {"context_key": context_key, "user_text": text[:300], "error": repr(e)})
-        return "Ovv 内部でエラーが発生しました。再試行してください。"
-
+        log_audit("openai_error", {"error": repr(e)})
+        return "Ovv との通信中にエラーが発生しました。"
 
 # ============================================================
-# 6. Discord Setup
+# 7. Discord setup
 # ============================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-
 def get_context_key(msg: discord.Message) -> int:
     if isinstance(msg.channel, discord.Thread):
         return msg.channel.id
     return (msg.guild.id << 32) | msg.channel.id
 
-
 # ============================================================
-# 7. on_message
+# 8. on_message
 # ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
+
     if message.author.bot:
         return
 
     try:
-        # ovv-* チャンネル以外は無視
         if isinstance(message.channel, discord.Thread):
             parent = message.channel.parent
             if not parent or not parent.name.lower().startswith("ovv-"):
@@ -266,38 +333,35 @@ async def on_message(message: discord.Message):
             if not message.channel.name.lower().startswith("ovv-"):
                 return
 
-        # commands
         if message.content.startswith("!"):
             log_audit("command", {
-                "command": message.content,
-                "author": str(message.author)
+                "command": message.content.split()[0],
+                "author": str(message.author),
+                "channel_id": message.channel.id,
             })
             await bot.process_commands(message)
             return
 
-        # user message
         ck = get_context_key(message)
         push_mem(ck, "user", message.content)
 
         log_audit("user_message", {
             "context_key": ck,
-            "author": str(message.author),
-            "length": len(message.content),
+            "length": len(message.content)
         })
 
         ans = call_ovv(ck, message.content)
         await message.channel.send(ans)
 
     except Exception as e:
-        log_audit("discord_error", {"where": "on_message", "error": repr(e)})
+        log_audit("discord_error", {"error": repr(e)})
         try:
             await message.channel.send("内部エラーが発生しました。")
         except:
             pass
 
-
 # ============================================================
-# 8. Commands（ping + test suite）
+# 9. Commands
 # ============================================================
 
 @bot.command(name="ping")
@@ -305,132 +369,23 @@ async def ping(ctx):
     await ctx.send("pong")
 
 
-# -------------------------
-# A. PG Write Test
-# -------------------------
-@bot.command(name="test_pg_write")
-async def test_pg_write(ctx):
-    log_audit("command", {"command": "!test_pg_write"})
+@bot.command(name="test_thread")
+async def test_thread(ctx):
+    ck = get_context_key(ctx.message)
 
-    try:
-        if PG_CONN is None:
-            return await ctx.send("PG connection is None")
-
-        with PG_CONN.cursor() as cur:
-            cur.execute("""
-                INSERT INTO ovv.runtime_memory (session_id, memory_json)
-                VALUES ('test-session', '[{\"role\":\"system\",\"content\":\"ok\"}]')
-                ON CONFLICT (session_id)
-                DO UPDATE SET memory_json = EXCLUDED.memory_json, updated_at = NOW();
-            """)
-
-        await ctx.send("PG write OK")
-    except Exception as e:
-        log_audit("discord_error", {"where": "test_pg_write", "error": repr(e)})
-        await ctx.send("ERROR")
-
-
-# -------------------------
-# B. PG Read Test
-# -------------------------
-@bot.command(name="test_pg_read")
-async def test_pg_read(ctx):
-    log_audit("command", {"command": "!test_pg_read"})
-
-    try:
-        if PG_CONN is None:
-            return await ctx.send("PG connection is None")
-
-        with PG_CONN.cursor() as cur:
-            cur.execute("""
-                SELECT session_id, jsonb_array_length(memory_json), updated_at
-                FROM ovv.runtime_memory
-                ORDER BY updated_at DESC
-                LIMIT 20;
-            """)
-            rows = cur.fetchall()
-
-        lines = [f"{r[0]} | {r[1]} items | {r[2]}" for r in rows]
-        await ctx.send("PG read:\n" + "\n".join(lines))
-
-    except Exception as e:
-        log_audit("discord_error", {"where": "test_pg_read", "error": repr(e)})
-        await ctx.send("ERROR")
-
-
-# -------------------------
-# C. Audit Tail Test
-# -------------------------
-@bot.command(name="test_audit_tail")
-async def test_audit_tail(ctx):
-    log_audit("command", {"command": "!test_audit_tail"})
-
-    try:
-        if PG_CONN is None:
-            return await ctx.send("PG connection is None")
-
-        with PG_CONN.cursor() as cur:
-            cur.execute("""
-                SELECT id, event_type, created_at
-                FROM ovv.audit_log
-                ORDER BY id DESC
-                LIMIT 20;
-            """)
-            rows = cur.fetchall()
-
-        lines = [f"{r[0]} | {r[1]} | {r[2]}" for r in rows]
-        await ctx.send("Audit tail:\n" + "\n".join(lines))
-
-    except Exception as e:
-        log_audit("discord_error", {"where": "test_audit_tail", "error": repr(e)})
-        await ctx.send("ERROR")
-
-
-# -------------------------
-# D. Pipeline Test
-# -------------------------
-@bot.command(name="test_pipeline")
-async def test_pipeline(ctx):
-    log_audit("command", {"command": "!test_pipeline"})
-
-    try:
-        ck = get_context_key(ctx.message)
-        ram_count = len(OVV_MEMORY.get(ck, []))
-
-        msg = (
-            "Pipeline structure:\n"
-            f"SYSTEM\n"
-            f"CORE: {len(OVV_CORE)} chars\n"
-            f"EXTERNAL: {len(OVV_EXTERNAL)} chars\n"
-            f"AUDIT_SUMMARY: (not implemented yet)\n"
-            f"PG_MEMORY: (Phase2)\n"
-            f"RAM_MEMORY: {ram_count} entries\n"
-        )
-
-        await ctx.send(msg)
-
-    except Exception as e:
-        log_audit("discord_error", {"where": "test_pipeline", "error": repr(e)})
-        await ctx.send("ERROR")
-
-
-# -------------------------
-# E. Error Test
-# -------------------------
-@bot.command(name="test_error")
-async def test_error(ctx):
-    log_audit("command", {"command": "!test_error"})
-
-    try:
-        raise RuntimeError("Intentional test error")
-
-    except Exception as e:
-        log_audit("discord_error", {"where": "test_error", "error": repr(e)})
-        await ctx.send("Error test complete (caught)")
+    summary = load_thread_brain(ck)
+    if summary is None:
+        summary = {"test": "initial", "updated": str(datetime.now().isoformat())}
+        save_thread_brain(ck, summary)
+        await ctx.send(f"[thread_brain] created: {summary}")
+    else:
+        summary["last_test"] = str(datetime.now().isoformat())
+        save_thread_brain(ck, summary)
+        await ctx.send(f"[thread_brain] updated: {summary}")
 
 
 # ============================================================
-# 9. Bootstrap PG + Run
+# 10. Bootstrap PG + Run
 # ============================================================
 
 print("=== [BOOT] Preparing PostgreSQL connect ===")
