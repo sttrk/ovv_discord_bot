@@ -1,3 +1,5 @@
+<ここからそのままコピー>
+
 import os
 import json
 import discord
@@ -134,6 +136,7 @@ def log_audit(event_type: str, details: Optional[dict] = None):
     except Exception as e:
         print("[AUDIT] write failed:", repr(e))
 
+
 # ============================================================
 # 2. Notion CRUD（不変）
 # ============================================================
@@ -224,6 +227,7 @@ async def append_logs(session_id, logs):
         )
         return False
 
+
 # ============================================================
 # 3. OVV MEMORY
 # ============================================================
@@ -236,6 +240,7 @@ def push_mem(key: int, role: str, content: str):
     OVV_MEMORY[key].append({"role": role, "content": content})
     if len(OVV_MEMORY[key]) > OVV_MEMORY_LIMIT:
         OVV_MEMORY[key] = OVV_MEMORY[key][-OVV_MEMORY_LIMIT:]
+
 
 # ============================================================
 # 4. CORE読み込み
@@ -267,15 +272,13 @@ SYSTEM_PROMPT = f"""
 
 {OVV_SOFT_CORE}
 """.strip()
+
+
 # ============================================================
 # 5. thread_brain（スレッド脳） utilities
 # ============================================================
 
 def load_thread_brain(context_key: int) -> Optional[dict]:
-    """
-    ovv.thread_brain から context_key に対応する summary(JSONB) を取得。
-    PG が使えない場合や未保存の場合は None。
-    """
     if PG_CONN is None:
         return None
 
@@ -295,18 +298,11 @@ def load_thread_brain(context_key: int) -> Optional[dict]:
             return row["summary"]
     except Exception as e:
         print("[thread_brain] load error:", repr(e))
-        log_audit(
-            "thread_brain_load_error",
-            {"context_key": context_key, "error": repr(e)},
-        )
+        log_audit("thread_brain_load_error", {"context_key": context_key, "error": repr(e)})
         return None
 
 
 def save_thread_brain(context_key: int, summary: dict) -> bool:
-    """
-    ovv.thread_brain に summary(JSONB) を UPSERT。
-    PG が使えない場合は False。
-    """
     if PG_CONN is None:
         return False
 
@@ -325,25 +321,16 @@ def save_thread_brain(context_key: int, summary: dict) -> bool:
             )
         log_audit(
             "thread_brain_saved",
-            {
-                "context_key": context_key,
-                "summary_keys": list(summary.keys()),
-            },
+            {"context_key": context_key, "summary_keys": list(summary.keys())},
         )
         return True
     except Exception as e:
         print("[thread_brain] save error:", repr(e))
-        log_audit(
-            "thread_brain_save_error",
-            {"context_key": context_key, "error": repr(e)},
-        )
+        log_audit("thread_brain_save_error", {"context_key": context_key, "error": repr(e)})
         return False
 
 
 def _build_thread_brain_prompt(context_key: int) -> str:
-    """
-    OVV_MEMORY と既存 summary を材料に、LLM 用のプロンプト本文を構築。
-    """
     mem = OVV_MEMORY.get(context_key, [])
     recent = mem[-30:] if len(mem) > 30 else mem
 
@@ -354,7 +341,6 @@ def _build_thread_brain_prompt(context_key: int) -> str:
         if not content:
             continue
         prefix = "USER" if role == "user" else "ASSISTANT"
-        # 1行あたりをある程度抑える（極端な長文は後ろを落とす）
         short = content.replace("\n", " ")
         if len(short) > 500:
             short = short[:500] + " ...[truncated]"
@@ -434,10 +420,6 @@ def _build_thread_brain_prompt(context_key: int) -> str:
 
 
 def generate_thread_brain(context_key: int) -> Optional[dict]:
-    """
-    OVV_MEMORY と（あれば）既存 summary をもとに、
-    LLM で thread_brain JSON を生成 → dict で返す。
-    """
     prompt_body = _build_thread_brain_prompt(context_key)
 
     try:
@@ -450,34 +432,24 @@ def generate_thread_brain(context_key: int) -> Optional[dict]:
                         "あなたは構造化サマリ専用 AI です。必ず JSON のみを返してください。"
                     ),
                 },
-                {
-                    "role": "user",
-                    "content": prompt_body,
-                },
+                {"role": "user", "content": prompt_body},
             ],
             temperature=0.2,
         )
         raw = res.choices[0].message.content.strip()
     except Exception as e:
         print("[thread_brain] LLM call error:", repr(e))
-        log_audit(
-            "thread_brain_llm_error",
-            {"context_key": context_key, "error": repr(e)},
-        )
+        log_audit("thread_brain_llm_error", {"context_key": context_key, "error": repr(e)})
         return None
 
-    # コードブロック除去など、JSON 抽出の簡易処理
     text = raw
     if "```" in text:
-        # ```json ... ``` or ``` ... ```
         parts = text.split("```")
-        # 一番長そうな部分を JSON とみなす
         candidates = [p for p in parts if "{" in p and "}" in p]
         if candidates:
             text = max(candidates, key=len)
 
     text = text.strip()
-    # 先頭に { が無い場合の保険
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -494,7 +466,6 @@ def generate_thread_brain(context_key: int) -> Optional[dict]:
         )
         return None
 
-    # meta 情報を最低限上書きして整える
     now_iso = datetime.now(timezone.utc).isoformat()
     meta = summary.get("meta", {}) if isinstance(summary, dict) else {}
     meta["version"] = "1.0"
@@ -514,8 +485,9 @@ def generate_thread_brain(context_key: int) -> Optional[dict]:
 
     return summary
 
+
 # ============================================================
-# 6. Ovv Call（OpenAI エラーを audit + graceful fallback）
+# 6. Ovv Call
 # ============================================================
 
 def call_ovv(context_key: int, text: str) -> str:
@@ -525,8 +497,6 @@ def call_ovv(context_key: int, text: str) -> str:
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
-    # Phase 2: まだ推論には thread_brain を使わない。
-    # （将来フェーズで、必要に応じて summary を system/assistant に注入する）
     msgs.extend(OVV_MEMORY.get(context_key, []))
     msgs.append({"role": "user", "content": text})
 
@@ -539,27 +509,18 @@ def call_ovv(context_key: int, text: str) -> str:
         ans = res.choices[0].message.content.strip()
         push_mem(context_key, "assistant", ans)
 
-        log_audit(
-            "assistant_reply",
-            {
-                "context_key": context_key,
-                "length": len(ans),
-            },
-        )
-
+        log_audit("assistant_reply", {"context_key": context_key, "length": len(ans)})
         return ans[:1900]
 
     except Exception as e:
         print("[ERROR call_ovv]", repr(e))
         log_audit(
             "openai_error",
-            {
-                "context_key": context_key,
-                "user_text": text[:500],
-                "error": repr(e),
-            },
+            {"context_key": context_key, "user_text": text[:500], "error": repr(e)},
         )
         return "Ovv との通信中にエラーが発生しました。少し時間をおいて再実行してください。"
+
+
 # ============================================================
 # 7. Discord Setup
 # ============================================================
@@ -584,7 +545,6 @@ async def on_message(message: discord.Message):
         return
 
     try:
-        # ovv-* のみ対象（thread も parent の名前で確認）
         if isinstance(message.channel, discord.Thread):
             parent = message.channel.parent
             if not parent or not parent.name.lower().startswith("ovv-"):
@@ -593,7 +553,6 @@ async def on_message(message: discord.Message):
             if not message.channel.name.lower().startswith("ovv-"):
                 return
 
-        # コマンドは専用処理へ
         if message.content.startswith("!"):
             log_audit(
                 "command",
@@ -607,7 +566,6 @@ async def on_message(message: discord.Message):
             await bot.process_commands(message)
             return
 
-        # 通常メッセージ
         ck = get_context_key(message)
         push_mem(ck, "user", message.content)
 
@@ -622,31 +580,16 @@ async def on_message(message: discord.Message):
             },
         )
 
-        # -----------------------------
-        # thread_brain の更新（毎回）
-        # -----------------------------
         new_summary = generate_thread_brain(ck)
         if new_summary:
             save_thread_brain(ck, new_summary)
 
-        # -----------------------------
-        # 通常の Ovv 応答
-        # -----------------------------
         ans = call_ovv(ck, message.content)
         await message.channel.send(ans)
 
     except Exception as e:
         print("[ERROR on_message]", repr(e))
-        log_audit(
-            "discord_error",
-            {
-                "where": "on_message",
-                "message_id": message.id,
-                "channel_id": message.channel.id,
-                "guild_id": message.guild.id if message.guild else None,
-                "error": repr(e),
-            },
-        )
+        log_audit("discord_error", {"where": "on_message", "error": repr(e)})
         try:
             await message.channel.send("内部エラーが発生しました。再度お試しください。")
         except Exception:
@@ -660,18 +603,12 @@ async def on_message(message: discord.Message):
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
     try:
-        log_audit(
-            "command",
-            {"command": "!ping", "author": str(ctx.author)},
-        )
+        log_audit("command", {"command": "!ping", "author": str(ctx.author)})
         await ctx.send("pong")
     except Exception as e:
         log_audit("discord_error", {"where": "command_ping", "error": repr(e)})
 
 
-# ------------------------------------------------------------
-# !brain_regen（thread_brain の手動再生成）
-# ------------------------------------------------------------
 @bot.command(name="brain_regen")
 async def brain_regen(ctx: commands.Context):
     try:
@@ -687,9 +624,6 @@ async def brain_regen(ctx: commands.Context):
         await ctx.send("内部エラーが発生しました。")
 
 
-# ------------------------------------------------------------
-# !brain_show（thread_brain の読み出し）
-# ------------------------------------------------------------
 @bot.command(name="brain_show")
 async def brain_show(ctx: commands.Context):
     try:
@@ -713,17 +647,10 @@ async def brain_show(ctx: commands.Context):
         await ctx.send("内部エラーが発生しました。")
 
 
-# ------------------------------------------------------------
-# !test_thread（thread_brain の動作テスト）
-# ------------------------------------------------------------
 @bot.command(name="test_thread")
 async def test_thread(ctx: commands.Context):
-    """
-    現行スレッドで thread_brain → 保存 → 再取得 の一連テスト
-    """
     try:
         ck = get_context_key(ctx.message)
-
         summary = generate_thread_brain(ck)
         if not summary:
             await ctx.send("thread_brain 生成失敗")
@@ -732,9 +659,7 @@ async def test_thread(ctx: commands.Context):
         save_thread_brain(ck, summary)
         reloaded = load_thread_brain(ck)
 
-        await ctx.send(
-            f"thread_brain test OK\nsummary keys={list(reloaded.keys())}"
-        )
+        await ctx.send(f"thread_brain test OK\nsummary keys={list(reloaded.keys())}")
 
     except Exception as e:
         log_audit("discord_error", {"where": "test_thread", "error": repr(e)})
@@ -752,3 +677,5 @@ print("=== [BOOT] Database setup finished ===")
 
 print("=== [RUN] Starting Discord bot ===")
 bot.run(DISCORD_BOT_TOKEN)
+
+<ここまで>
