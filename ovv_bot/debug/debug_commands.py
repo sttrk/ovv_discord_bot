@@ -124,37 +124,127 @@ async def dbg_load_core(message, args):
 # C. PostgreSQL Audit
 # ============================================================
 
-async def dbg_pg_connect(message, args):
-    return _msg("pg connect: TODO")
+# ============================================================
+# C. PostgreSQL Audit（実装版）
+# ============================================================
+
+async def dbg_pg_connect(message):
+    try:
+        conn = debug_context.pg_conn
+        if conn is None:
+            return "[DEBUG] PG: No connection"
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            row = cur.fetchone()
+        return f"[DEBUG] PG connect OK: {row}"
+    except Exception as e:
+        return f"[DEBUG] PG connect FAIL: {repr(e)}"
 
 
-async def dbg_pg_tables(message, args):
-    return _msg("pg tables: TODO")
+async def dbg_pg_tables(message):
+    try:
+        conn = debug_context.pg_conn
+        if conn is None:
+            return "[DEBUG] PG: No connection"
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'ovv'
+            """)
+            rows = cur.fetchall()
+
+        if not rows:
+            return "[DEBUG] PG tables: none"
+        txt = ", ".join([f"{r[0]}.{r[1]}" for r in rows])
+        return f"[DEBUG] PG tables: {txt}"
+
+    except Exception as e:
+        return f"[DEBUG] PG tables FAIL: {repr(e)}"
 
 
-async def dbg_pg_write(message, args):
-    return _msg("pg write: TODO")
+async def dbg_pg_write(message):
+    """
+    audit_log にテスト書き込み
+    """
+    try:
+        conn = debug_context.pg_conn
+        if conn is None:
+            return "[DEBUG] PG: No connection"
+
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO ovv.audit_log (event_type, details)
+                VALUES ('debug_test', '{"msg":"hello"}')
+            """)
+        return "[DEBUG] PG write OK"
+    except Exception as e:
+        return f"[DEBUG] PG write FAIL: {repr(e)}"
 
 
-async def dbg_pg_read(message, args):
-    return _msg("pg read: TODO")
+async def dbg_pg_read(message):
+    """
+    audit_log の最新 5 件を読む
+    """
+    try:
+        conn = debug_context.pg_conn
+        if conn is None:
+            return "[DEBUG] PG: No connection"
 
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, event_type, created_at
+                FROM ovv.audit_log
+                ORDER BY id DESC
+                LIMIT 5
+            """)
+            rows = cur.fetchall()
+
+        if not rows:
+            return "[DEBUG] PG read: no logs"
+
+        text = "\n".join([f"{r[0]} | {r[1]} | {r[2]}" for r in rows])
+        return f"[DEBUG] PG read:\n{text}"
+
+    except Exception as e:
+        return f"[DEBUG] PG read FAIL: {repr(e)}"
 
 # ============================================================
 # D. Notion Audit
 # ============================================================
 
-async def dbg_notion_auth(message, args):
-    return _msg("notion auth: TODO")
+# ============================================================
+# D. Notion Audit（実装版）
+# ============================================================
+
+async def dbg_notion_auth(message):
+    try:
+        notion = debug_context.notion
+        user = notion.users.list()
+        return f"[DEBUG] Notion auth OK: {len(user.get('results', []))} users"
+    except Exception as e:
+        return f"[DEBUG] Notion auth FAIL: {repr(e)}"
 
 
-async def dbg_notion_list(message, args):
-    return _msg("notion list: TODO")
+async def dbg_notion_list(message):
+    """
+    tasks DB の先頭 3 件だけ読む簡易チェック
+    """
+    try:
+        notion = debug_context.notion
+        db_id = NOTION_TASKS_DB_ID
 
-
-async def dbg_notion_create(message, args):
-    return _msg("notion create: TODO")
-
+        q = notion.databases.query(
+            **{
+                "database_id": db_id,
+                "page_size": 3
+            }
+        )
+        count = len(q.get("results", []))
+        return f"[DEBUG] Notion list OK: {count} rows"
+    except Exception as e:
+        return f"[DEBUG] Notion list FAIL: {repr(e)}"
 
 # ============================================================
 # E. Ovv Core / LLM Audit
@@ -176,21 +266,51 @@ async def dbg_ovv_llm(message, args):
 # F. Memory / Thread Brain Audit
 # ============================================================
 
-async def dbg_mem_load(message, args):
-    return _msg("memory load: TODO")
+# ============================================================
+# F. Memory / Thread Brain Audit（実装版）
+# ============================================================
+
+async def dbg_mem_load(message):
+    try:
+        key = str(message.channel.id)
+        mem = debug_context.load_mem(key)
+        return f"[DEBUG] mem_load OK: {len(mem)} records"
+    except Exception as e:
+        return f"[DEBUG] mem_load FAIL: {repr(e)}"
 
 
-async def dbg_mem_write(message, args):
-    return _msg("memory write: TODO")
+async def dbg_mem_write(message):
+    try:
+        key = str(message.channel.id)
+        debug_context.append_mem(key, "debug", "hello_memory")
+        return "[DEBUG] mem_write OK"
+    except Exception as e:
+        return f"[DEBUG] mem_write FAIL: {repr(e)}"
 
 
-async def dbg_brain_gen(message, args):
-    return _msg("brain generate: TODO")
+async def dbg_brain_gen(message):
+    try:
+        key = message.channel.id
+        mem = debug_context.load_mem(str(key))
+        br = debug_context.brain_gen(key, mem)
+        if not br:
+            return "[DEBUG] brain_gen FAIL"
+        debug_context.brain_save(key, br)
+        return "[DEBUG] brain_gen OK"
+    except Exception as e:
+        return f"[DEBUG] brain_gen EXCEPTION: {repr(e)}"
 
 
-async def dbg_brain_show(message, args):
-    return _msg("brain show: TODO")
-
+async def dbg_brain_show(message):
+    try:
+        key = message.channel.id
+        br = debug_context.brain_load(key)
+        if not br:
+            return "[DEBUG] brain_show: none"
+        short = json.dumps(br, ensure_ascii=False)[:1500]
+        return f"[DEBUG] brain_show:\n{short}"
+    except Exception as e:
+        return f"[DEBUG] brain_show FAIL: {repr(e)}"
 
 # ============================================================
 # G. Routing / Event Audit
@@ -228,27 +348,27 @@ async def run_debug_command(message, cmd: str, args: list):
     if cmd == "load_core":   return await dbg_load_core(message, args)
 
     # C. PostgreSQL
-    if cmd == "pg_connect":  return await dbg_pg_connect(message, args)
-    if cmd == "pg_tables":   return await dbg_pg_tables(message, args)
-    if cmd == "pg_write":    return await dbg_pg_write(message, args)
-    if cmd == "pg_read":     return await dbg_pg_read(message, args)
+    if cmd == "pg_connect": return await dbg_pg_connect(message)
+    if cmd == "pg_tables": return await dbg_pg_tables(message)
+    if cmd == "pg_write": return await dbg_pg_write(message)
+    if cmd == "pg_read": return await dbg_pg_read(message)
 
     # D. Notion
-    if cmd == "notion_auth":   return await dbg_notion_auth(message, args)
-    if cmd == "notion_list":   return await dbg_notion_list(message, args)
-    if cmd == "notion_create": return await dbg_notion_create(message, args)
-
+    if cmd == "notion_auth": return await dbg_notion_auth(message)
+    if cmd == "notion_list": return await dbg_notion_list(message)
+   
     # E. Ovv Core / LLM
     if cmd == "ovv_ping":    return await dbg_ovv_ping(message, args)
     if cmd == "ovv_core":    return await dbg_ovv_core(message, args)
     if cmd == "ovv_llm":     return await dbg_ovv_llm(message, args)
 
     # F. Memory / Brain
-    if cmd == "mem_load":    return await dbg_mem_load(message, args)
-    if cmd == "mem_write":   return await dbg_mem_write(message, args)
-    if cmd == "brain_gen":   return await dbg_brain_gen(message, args)
-    if cmd == "brain_show":  return await dbg_brain_show(message, args)
+    if cmd == "mem_load": return await dbg_mem_load(message)
+    if cmd == "mem_write": return await dbg_mem_write(message)
+    if cmd == "brain_gen": return await dbg_brain_gen(message)
+    if cmd == "brain_show": return await dbg_brain_show(message)
 
+    
     # G. Routing / Event
     if cmd == "route":       return await dbg_route(message, args)
     if cmd == "event":       return await dbg_event(message, args)
