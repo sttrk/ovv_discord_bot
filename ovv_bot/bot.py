@@ -1,4 +1,4 @@
-# bot.py (Ovv Discord Bot - September Stable Edition)
+# ovv_bot/bot.py
 import os
 import json
 import discord
@@ -20,7 +20,7 @@ from debug.debug_router import route_debug_message
 import database.pg as db_pg
 
 # ============================================================
-# Notion Module Import（全CRUDを外部化）
+# Notion Module Import（完全外部化）
 # ============================================================
 from notion.notion_api import (
     create_task,
@@ -28,6 +28,11 @@ from notion.notion_api import (
     end_session,
     append_logs,
 )
+
+# ============================================================
+# OVV CALL IMPORT（新設）
+# ============================================================
+from ovv.ovv_call import call_ovv   # ← ここが今回の重要変更ポイント
 
 # ============================================================
 # Environment Variables
@@ -51,14 +56,14 @@ db_pg.init_db(conn)
 log_audit = db_pg.log_audit
 
 # ============================================================
-# Runtime Memory (Proxy to db_pg)
+# Runtime Memory（PG に完全外部化）
 # ============================================================
 load_runtime_memory = db_pg.load_runtime_memory
 save_runtime_memory = db_pg.save_runtime_memory
 append_runtime_memory = db_pg.append_runtime_memory
 
 # ============================================================
-# Thread Brain（完全外部化済み）
+# Thread Brain（PG に完全外部化）
 # ============================================================
 load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
@@ -88,41 +93,6 @@ SYSTEM_PROMPT = f"""
 
 {OVV_SOFT_CORE}
 """.strip()
-
-# ============================================================
-# Ovv Call Layer
-# ============================================================
-def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
-
-    msgs = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "assistant", "content": OVV_CORE},
-        {"role": "assistant", "content": OVV_EXTERNAL},
-    ]
-
-    # 過去メモリ
-    for m in recent_mem[-20:]:
-        msgs.append({"role": m["role"], "content": m["content"]})
-
-    msgs.append({"role": "user", "content": text})
-
-    try:
-        res = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=msgs,
-            temperature=0.7,
-        )
-        ans = res.choices[0].message.content.strip()
-
-        append_runtime_memory(str(context_key), "assistant", ans)
-        log_audit("assistant_reply", {"context_key": context_key})
-
-        return ans[:1900]
-
-    except Exception as e:
-        log_audit("openai_error", {"context_key": context_key, "error": repr(e)})
-        return "Ovv との通信中にエラーが発生しました。"
-
 
 # ============================================================
 # Discord Setup
@@ -167,10 +137,11 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Memory & Thread Brain
+    # Thread Context Key
     ck = get_context_key(message)
     session_id = str(ck)
 
+    # Runtime Memory 追記
     append_runtime_memory(
         session_id,
         "user",
@@ -180,24 +151,43 @@ async def on_message(message: discord.Message):
 
     mem = load_runtime_memory(session_id)
 
+    # Thread Brain 更新（task_ 系のみ）
     if is_task_channel(message):
         summary = generate_thread_brain(ck, mem)
         if summary:
             save_thread_brain(ck, summary)
 
-    # Ovv Core Call
-    ans = call_ovv(ck, message.content, mem)
+    # ========================================================
+    # Ovv Core Call（今回の変更点：完全外部化 call_ovv を利用）
+    # ========================================================
+    ans = call_ovv(
+        openai_client=openai_client,
+        system_prompt=SYSTEM_PROMPT,
+        core=OVV_CORE,
+        external=OVV_EXTERNAL,
+        recent_mem=mem,
+        context_key=ck,
+        user_text=message.content,
+    )
+
+    if ans is None:
+        log_audit("openai_error", {"context_key": ck})
+        await message.channel.send("Ovv との通信中にエラーが発生しました。")
+        return
+
+    # メモリ保存（副作用）
+    append_runtime_memory(str(ck), "assistant", ans)
+    log_audit("assistant_reply", {"context_key": ck})
 
     await message.channel.send(ans)
 
 
 # ============================================================
-# Commands (BR / BS / Ping)
+# Commands
 # ============================================================
 @bot.command(name="ping")
 async def ping(ctx):
     await ctx.send("pong")
-
 
 @bot.command(name="br")
 async def brain_regen(ctx):
@@ -210,7 +200,6 @@ async def brain_regen(ctx):
         await ctx.send("thread_brain を再生成しました。")
     else:
         await ctx.send("生成に失敗しました。")
-
 
 @bot.command(name="bs")
 async def brain_show(ctx):
@@ -226,7 +215,6 @@ async def brain_show(ctx):
         text = text[:1900] + "\n...[truncated]"
     await ctx.send(f"```json\n{text}\n```")
 
-
 @bot.command(name="tt")
 async def test_thread(ctx):
     ck = get_context_key(ctx.message)
@@ -239,10 +227,11 @@ async def test_thread(ctx):
 
     save_thread_brain(ck, summary)
     await ctx.send("test OK: summary saved")
+
+
 # ============================================================
 # Debug Context Injection（September Stable Required）
 # ============================================================
-
 from debug.debug_context import debug_context
 
 debug_context.pg_conn = db_pg.PG_CONN
@@ -270,4 +259,3 @@ print("[BOOT] PG Connected =", bool(db_pg.PG_CONN))
 print("[BOOT] Starting Discord Bot")
 
 bot.run(DISCORD_BOT_TOKEN)
-
