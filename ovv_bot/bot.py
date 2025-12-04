@@ -13,7 +13,7 @@ import psycopg2.extras
 # [DEBUG HOOK] imports
 # ============================================================
 from debug.debug_router import route_debug_message
-# debug_commands は debug_router 内で呼ばれるため、ここでは import 不要
+# debug_commands は router 経由で呼ばれるため import 不要
 
 
 # ============================================================
@@ -130,6 +130,7 @@ def log_audit(event_type: str, details: Optional[dict] = None):
     except Exception as e:
         print("[AUDIT] write failed:", repr(e))
 
+
 # ============================================================
 # 2. Notion CRUD
 # ============================================================
@@ -194,6 +195,7 @@ async def end_session(session_id, summary):
         log_audit("notion_error", {"op": "end_session", "session_id": session_id, "error": repr(e)})
         return False
 
+
 async def append_logs(session_id, logs):
     try:
         for log in logs:
@@ -215,6 +217,7 @@ async def append_logs(session_id, logs):
             {"op": "append_logs", "session_id": session_id, "log_count": len(logs), "error": repr(e)},
         )
         return False
+
 
 # ============================================================
 # 3. Runtime Memory
@@ -344,7 +347,6 @@ def save_thread_brain(context_key: int, summary: dict) -> bool:
 
 def _build_thread_brain_prompt(context_key: int, recent_mem: List[dict]) -> str:
 
-    # short digest
     lines = []
     for m in recent_mem[-30:]:
         role = "USER" if m["role"] == "user" else "ASSISTANT"
@@ -363,18 +365,18 @@ def _build_thread_brain_prompt(context_key: int, recent_mem: List[dict]) -> str:
 必ず JSON のみを返すこと。
 
 出力フォーマット：
-{{
-  "meta": {{
+{
+  "meta": {
     "version": "1.0",
     "updated_at": "<ISO8601>",
     "context_key": {context_key},
     "total_tokens_estimate": 0
-  }},
-  "status": {{
+  },
+  "status": {
     "phase": "<idle|active|blocked|done>",
     "last_major_event": "",
     "risk": []
-  }},
+  },
   "decisions": [],
   "unresolved": [],
   "constraints": [],
@@ -383,7 +385,7 @@ def _build_thread_brain_prompt(context_key: int, recent_mem: List[dict]) -> str:
   "high_level_goal": "",
   "recent_messages": [],
   "current_position": ""
-}}
+}
 
 重要: JSON 以外の文字を返してはならない。
 
@@ -412,7 +414,6 @@ def generate_thread_brain(context_key: int, recent_mem: List[dict]) -> Optional[
         print("[thread_brain LLM error]", repr(e))
         return None
 
-    # Extract JSON
     txt = raw
     if "```" in raw:
         parts = raw.split("```")
@@ -437,6 +438,7 @@ def generate_thread_brain(context_key: int, recent_mem: List[dict]) -> Optional[
 
     return summary
 
+
 # ============================================================
 # 6. Ovv Call
 # ============================================================
@@ -448,7 +450,6 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
-    # Inject runtime memory
     for m in recent_mem[-20:]:
         msgs.append({"role": m["role"], "content": m["content"]})
 
@@ -508,7 +509,7 @@ def is_task_channel(message: discord.Message) -> bool:
 
 
 # ============================================================
-# 8. on_message（ここに DEBUG HOOK を統合）
+# 8. on_message（DEBUG HOOK added here）
 # ============================================================
 
 @bot.event
@@ -517,7 +518,7 @@ async def on_message(message: discord.Message):
         return
 
     # --------------------------------------------------------
-    # [DEBUG HOOK] debug_router を最上流に配置
+    # [DEBUG HOOK] debug routing first
     # --------------------------------------------------------
     handled = await route_debug_message(bot, message)
     if handled:
@@ -525,7 +526,6 @@ async def on_message(message: discord.Message):
     # --------------------------------------------------------
 
     try:
-        # 1. コマンド処理
         if message.content.startswith("!"):
             log_audit("command", {
                 "command": message.content.split()[0],
@@ -629,6 +629,34 @@ print("=== [BOOT] Preparing PostgreSQL connect ===")
 conn = pg_connect()
 init_db(conn)
 print("=== [BOOT] Database setup finished ===")
+
+# ============================================================
+# Debug Context Injection（★追加箇所★）
+# ============================================================
+
+from debug.debug_context import debug_context
+
+debug_context.pg_conn = PG_CONN
+debug_context.notion = notion
+debug_context.openai_client = openai_client
+
+debug_context.load_mem = load_runtime_memory
+debug_context.save_mem = save_runtime_memory
+debug_context.append_mem = append_runtime_memory
+
+debug_context.brain_gen = generate_thread_brain
+debug_context.brain_load = load_thread_brain
+debug_context.brain_save = save_thread_brain
+
+debug_context.ovv_core = OVV_CORE
+debug_context.ovv_external = OVV_EXTERNAL
+debug_context.system_prompt = SYSTEM_PROMPT
+
+print("[DEBUG] context injected OK")
+
+# ============================================================
+# Run Bot
+# ============================================================
 
 print("=== [RUN] Starting Discord bot ===")
 bot.run(DISCORD_BOT_TOKEN)
