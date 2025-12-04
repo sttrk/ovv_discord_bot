@@ -3,7 +3,6 @@ import json
 from typing import Optional
 import psycopg2
 import psycopg2.extras
-
 from config import POSTGRES_URL
 
 PG_CONN = None
@@ -13,7 +12,6 @@ AUDIT_READY = False
 def pg_connect():
     """
     PostgreSQL への接続を確立し、PG_CONN をセットする。
-    bot 起動時に 1 回呼ぶ想定。
     """
     global PG_CONN
     print("=== [PG] Connecting ===")
@@ -29,6 +27,7 @@ def pg_connect():
         PG_CONN = conn
         print("[PG] Connected OK")
         return conn
+
     except Exception as e:
         print("[PG] Connection failed:", repr(e))
         PG_CONN = None
@@ -37,10 +36,10 @@ def pg_connect():
 
 def init_db(conn):
     """
-    ovv スキーマ配下のテーブルを作成。
+    ovv スキーマの初期化。
+    スキーマが無い状態だと CREATE TABLE が必ず失敗するため
+    必ず最初に CREATE SCHEMA IF NOT EXISTS を実行する。
     """
-    from datetime import datetime  # 形式的に import（使ってはいないが将来用）
-
     global AUDIT_READY
     print("=== [PG] init_db() ===")
 
@@ -51,6 +50,10 @@ def init_db(conn):
     try:
         cur = conn.cursor()
 
+        # ★ 必須：まずスキーマを作成
+        cur.execute("CREATE SCHEMA IF NOT EXISTS ovv;")
+
+        # runtime_memory
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.runtime_memory (
                 session_id TEXT PRIMARY KEY,
@@ -59,6 +62,7 @@ def init_db(conn):
             );
         """)
 
+        # audit_log
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.audit_log (
                 id SERIAL PRIMARY KEY,
@@ -68,6 +72,7 @@ def init_db(conn):
             );
         """)
 
+        # thread_brain
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.thread_brain (
                 context_key BIGINT PRIMARY KEY,
@@ -87,8 +92,8 @@ def init_db(conn):
 
 def log_audit(event_type: str, details: Optional[dict] = None):
     """
-    全システム共通の audit_log 出力。
-    PG が使えない場合は print のみ。
+    audit_log への書き込み。
+    PG が死んでいる場合は print のみにフォールバック。
     """
     if details is None:
         details = {}
