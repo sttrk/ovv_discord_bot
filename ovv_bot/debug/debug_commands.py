@@ -3,6 +3,7 @@
 
 import os
 import importlib
+from .debug_context import debug_context
 
 
 # Utility: return simple debug text
