@@ -4,24 +4,21 @@ import discord
 from discord.ext import commands
 from openai import OpenAI
 from notion_client import Client
-from typing import List, Optional
+from typing import Dict, List, Optional
 from datetime import datetime, timezone
+import psycopg2
+import psycopg2.extras
 
-# PG / runtime_memory / thread_brain を外部モジュールから import
-from database.pg import PG_CONN, pg_connect, init_db, log_audit
-from database.runtime_memory import (
-    load_runtime_memory,
-    save_runtime_memory,
-    append_runtime_memory,
-)
-from brain.thread_brain import (
-    load_thread_brain,
-    save_thread_brain,
-    generate_thread_brain,
-)
-
-# DEBUG HOOK
+# ============================================================
+# [DEBUG HOOK] imports
+# ============================================================
 from debug.debug_router import route_debug_message
+
+# ============================================================
+# 0. PostgreSQL Module (IMPORTANT: module import only)
+# ============================================================
+# PG_CONN を from-import すると値が同期されないため、必ず module import で保持する
+import database.pg as db_pg
 
 
 # ============================================================
@@ -37,11 +34,25 @@ from config import (
     NOTION_TASKS_DB_ID,
     NOTION_SESSIONS_DB_ID,
     NOTION_LOGS_DB_ID,
-    POSTGRES_URL,  # いまは未使用だが将来のため残置
+    POSTGRES_URL,
 )
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
+
+
+# ============================================================
+# 1.5 PostgreSQL connect + init + audit_log
+# ============================================================
+
+print("=== [BOOT] Connecting PostgreSQL ===")
+conn = db_pg.pg_connect()
+db_pg.init_db(conn)
+
+
+def log_audit(event_type: str, details: Optional[dict] = None):
+    """Wrapper for db_pg.log_audit"""
+    return db_pg.log_audit(event_type, details)
 
 
 # ============================================================
@@ -64,8 +75,8 @@ async def create_task(name, goal, thread_id, channel_id):
             },
         )
         return page["id"]
+
     except Exception as e:
-        print("[ERROR create_task]", repr(e))
         log_audit("notion_error", {"op": "create_task", "error": repr(e)})
         return None
 
@@ -86,6 +97,7 @@ async def start_session(task_id, name, thread_id):
             },
         )
         return page["id"]
+
     except Exception as e:
         log_audit("notion_error", {"op": "start_session", "error": repr(e)})
         return None
@@ -104,6 +116,7 @@ async def end_session(session_id, summary):
             },
         )
         return True
+
     except Exception as e:
         log_audit("notion_error", {"op": "end_session", "error": repr(e)})
         return False
@@ -118,32 +131,37 @@ async def append_logs(session_id, logs):
                     "_ignore": {"title": [{"text": {"content": "log"}}]},
                     "session_id": {"relation": [{"id": session_id}]},
                     "author": {"rich_text": [{"text": {"content": log["author"]}}]},
-                    "content": {
-                        "rich_text": [{"text": {"content": log["content"][:2000]}}]
-                    },
-                    "created_at": {"date": {"start": log["created_at"]}},
-                    "discord_message_id": {
-                        "rich_text": [{"text": {"content": log["id"]}}]
-                    },
-                },
+                    "content": {"rich_text": [{"text": {"content": log["content"][:2000]}}]},
+                    "created_at": {"date": {"start": log["created_at"]}}},
             )
         return True
+
     except Exception as e:
         log_audit("notion_error", {"op": "append_logs", "error": repr(e)})
         return False
 
 
 # ============================================================
-# 3. Soft-Core / Core / External
+# 3. Runtime Memory
 # ============================================================
 
-def load_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+def load_runtime_memory(session_id: str) -> List[dict]:
+    return db_pg.load_runtime_memory(session_id)
 
+
+def save_runtime_memory(session_id: str, mem: List[dict]):
+    return db_pg.save_runtime_memory(session_id, mem)
+
+
+def append_runtime_memory(session_id: str, role: str, content: str, limit: int = 40):
+    return db_pg.append_runtime_memory(session_id, role, content, limit)
+
+
+# ============================================================
+# 4. Soft-Core / Core / External
+# ============================================================
 
 from ovv.core_loader import load_core, load_external
-
 OVV_CORE = load_core()
 OVV_EXTERNAL = load_external()
 
@@ -167,7 +185,23 @@ SYSTEM_PROMPT = f"""
 
 
 # ============================================================
-# 4. Ovv Call
+# 5. thread_brain utilities
+# ============================================================
+
+def load_thread_brain(context_key: int) -> Optional[dict]:
+    return db_pg.load_thread_brain(context_key)
+
+
+def save_thread_brain(context_key: int, summary: dict) -> bool:
+    return db_pg.save_thread_brain(context_key, summary)
+
+
+def generate_thread_brain(context_key: int, mem: List[dict]):
+    return db_pg.generate_thread_brain(context_key, mem)
+
+
+# ============================================================
+# 6. Ovv Call
 # ============================================================
 
 def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
@@ -189,28 +223,19 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
             temperature=0.7,
         )
         ans = res.choices[0].message.content.strip()
-        from database.runtime_memory import append_runtime_memory  # 局所参照でも可
 
         append_runtime_memory(str(context_key), "assistant", ans)
-
-        log_audit(
-            "assistant_reply",
-            {
-                "context_key": context_key,
-                "length": len(ans),
-            },
-        )
+        log_audit("assistant_reply", {"context_key": context_key})
 
         return ans[:1900]
 
     except Exception as e:
-        print("[call_ovv error]", repr(e))
         log_audit("openai_error", {"context_key": context_key, "error": repr(e)})
         return "Ovv との通信中にエラーが発生しました。"
 
 
 # ============================================================
-# 5. Discord Setup
+# 7. Discord Setup
 # ============================================================
 
 intents = discord.Intents.default()
@@ -219,26 +244,29 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
 def get_context_key(msg: discord.Message) -> int:
-    if isinstance(msg.channel, discord.Thread):
-        return msg.channel.id
+    ch = msg.channel
+    if isinstance(ch, discord.Thread):
+        return ch.id
     if msg.guild is None:
-        return msg.channel.id
-    return (msg.guild.id << 32) | msg.channel.id
+        return ch.id
+    return (msg.guild.id << 32) | ch.id
 
 
 def is_task_channel(message: discord.Message) -> bool:
-    if isinstance(message.channel, discord.Thread):
-        parent = message.channel.parent
+    ch = message.channel
+    if isinstance(ch, discord.Thread):
+        parent = ch.parent
         return parent.name.lower().startswith("task_") if parent else False
-    return message.channel.name.lower().startswith("task_")
+    return ch.name.lower().startswith("task_")
 
 
 # ============================================================
-# 6. on_message（DEBUG HOOK）
+# 8. on_message + DEBUG HOOK
 # ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
+
     if message.author.bot:
         return
 
@@ -248,14 +276,7 @@ async def on_message(message: discord.Message):
 
     try:
         if message.content.startswith("!"):
-            log_audit(
-                "command",
-                {
-                    "command": message.content.split()[0],
-                    "author": str(message.author),
-                    "channel_id": message.channel.id,
-                },
-            )
+            log_audit("command", {"cmd": message.content})
             await bot.process_commands(message)
             return
 
@@ -269,42 +290,36 @@ async def on_message(message: discord.Message):
             limit=40 if is_task_channel(message) else 12,
         )
 
-        recent_mem = load_runtime_memory(session_id)
-        task_mode = is_task_channel(message)
+        mem = load_runtime_memory(session_id)
 
-        if task_mode:
-            summary = generate_thread_brain(ck, recent_mem, openai_client)
+        if is_task_channel(message):
+            summary = generate_thread_brain(ck, mem)
             if summary:
                 save_thread_brain(ck, summary)
 
-        ans = call_ovv(ck, message.content, recent_mem)
+        ans = call_ovv(ck, message.content, mem)
         await message.channel.send(ans)
 
     except Exception as e:
         print("[on_message error]", repr(e))
-        log_audit("discord_error", {"error": repr(e)})
-        try:
-            await message.channel.send("内部エラーが発生しました。")
-        except Exception:
-            pass
+        await message.channel.send("内部エラーが発生しました。")
 
 
 # ============================================================
-# 7. Commands
+# 9. Commands
 # ============================================================
 
 @bot.command(name="ping")
-async def ping(ctx: commands.Context):
+async def ping(ctx):
     await ctx.send("pong")
 
 
 @bot.command(name="br")
-async def brain_regen(ctx: commands.Context):
+async def brain_regen(ctx):
     ck = get_context_key(ctx.message)
-    session_id = str(ck)
-    recent = load_runtime_memory(session_id)
+    mem = load_runtime_memory(str(ck))
+    summary = generate_thread_brain(ck, mem)
 
-    summary = generate_thread_brain(ck, recent, openai_client)
     if summary:
         save_thread_brain(ck, summary)
         await ctx.send("thread_brain を再生成しました。")
@@ -313,7 +328,7 @@ async def brain_regen(ctx: commands.Context):
 
 
 @bot.command(name="bs")
-async def brain_show(ctx: commands.Context):
+async def brain_show(ctx):
     ck = get_context_key(ctx.message)
     summary = load_thread_brain(ck)
 
@@ -328,12 +343,11 @@ async def brain_show(ctx: commands.Context):
 
 
 @bot.command(name="tt")
-async def test_thread(ctx: commands.Context):
+async def test_thread(ctx):
     ck = get_context_key(ctx.message)
-    session_id = str(ck)
-    mem = load_runtime_memory(session_id)
+    mem = load_runtime_memory(str(ck))
+    summary = generate_thread_brain(ck, mem)
 
-    summary = generate_thread_brain(ck, mem, openai_client)
     if not summary:
         await ctx.send("thread_brain 生成失敗")
         return
@@ -343,37 +357,10 @@ async def test_thread(ctx: commands.Context):
 
 
 # ============================================================
-# 8. PG Bootstrap + Debug Context
+# 10. Final Boot Log
 # ============================================================
 
-print("=== [BOOT] Preparing PostgreSQL connect ===")
-conn = pg_connect()
-init_db(conn)
-
-from debug.debug_context import debug_context
-
-debug_context.pg_conn = PG_CONN
-debug_context.notion = notion
-debug_context.openai_client = openai_client
-
-debug_context.load_mem = load_runtime_memory
-debug_context.save_mem = save_runtime_memory
-debug_context.append_mem = append_runtime_memory
-
-debug_context.brain_gen = lambda ck, mem: generate_thread_brain(ck, mem, openai_client)
-debug_context.brain_load = load_thread_brain
-debug_context.brain_save = save_thread_brain
-
-debug_context.ovv_core = OVV_CORE
-debug_context.ovv_external = OVV_EXTERNAL
-debug_context.system_prompt = SYSTEM_PROMPT
-
-print("[DEBUG] context injected OK")
-
-
-# ============================================================
-# Run Bot
-# ============================================================
+print("[DEBUG] Boot complete. PG connected? =", bool(db_pg.PG_CONN))
 
 print("=== [RUN] Starting Discord bot ===")
 bot.run(DISCORD_BOT_TOKEN)
