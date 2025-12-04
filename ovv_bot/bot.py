@@ -269,8 +269,9 @@ def load_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-OVV_CORE = load_text("ovv_core.txt")
-OVV_EXTERNAL = load_text("ovv_external_contract.txt")
+from ovv.core_loader import load_core, load_external
+OVV_CORE = load_core()
+OVV_EXTERNAL = load_external()
 
 OVV_SOFT_CORE = """
 [Ovv Soft-Core v1.1]
@@ -632,3 +633,4 @@ print("=== [BOOT] Database setup finished ===")
 
 print("=== [RUN] Starting Discord bot ===")
 bot.run(DISCORD_BOT_TOKEN)
+
