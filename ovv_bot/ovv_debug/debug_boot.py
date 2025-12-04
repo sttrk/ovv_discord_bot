@@ -1,1 +1,0 @@
-# boot message auto sender
