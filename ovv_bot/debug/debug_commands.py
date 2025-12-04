@@ -350,6 +350,46 @@ async def dbg_chain(message, args):
     except Exception as e:
         return _msg(f"chain FAIL: {repr(e)}")
 
+# ============================================================
+# H. All-in-one Debug
+# ============================================================
+
+async def dbg_all(message, args):
+    """
+    代表的なデバッグコマンドをまとめて実行し、1メッセージで返す。
+    Discord の 2000 文字制限を考慮してざっくり truncate する。
+    """
+    sections = []
+
+    # Boot / Env / Config
+    sections.append(await dbg_env(message, []))
+    sections.append(await dbg_cfg(message, []))
+    sections.append(await dbg_boot(message, []))
+
+    # PostgreSQL
+    sections.append(await dbg_pg_connect(message, []))
+    sections.append(await dbg_pg_tables(message, []))
+    sections.append(await dbg_pg_read(message, []))
+
+    # Notion
+    sections.append(await dbg_notion_auth(message, []))
+    sections.append(await dbg_notion_list(message, []))
+
+    # Memory / Thread Brain
+    sections.append(await dbg_mem_load(message, []))
+    sections.append(await dbg_brain_show(message, []))
+
+    # Routing / Event
+    sections.append(await dbg_route(message, []))
+
+    # まとめて結合
+    text = "\n\n".join(sections)
+
+    # Discord の 2000 文字制限をざっくり考慮
+    if len(text) > 1900:
+        text = text[:1900] + "\n...[truncated]"
+
+    return text
 
 # ============================================================
 # Dispatcher
@@ -397,4 +437,7 @@ async def run_debug_command(message, cmd: str, args: list):
     if cmd == "event":       return await dbg_event(message, args)
     if cmd == "chain":       return await dbg_chain(message, args)
 
+    # H. All-in-one
+    if cmd == "all":         return await dbg_all(message, args)
+    
     return _msg(f"Unknown debug command: {cmd}")
