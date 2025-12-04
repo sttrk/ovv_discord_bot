@@ -13,8 +13,6 @@ import psycopg2.extras
 # [DEBUG HOOK] imports
 # ============================================================
 from debug.debug_router import route_debug_message
-# debug_commands は router 経由で呼ばれるため import 不要
-
 
 # ============================================================
 # 1. Environment
@@ -35,6 +33,7 @@ from config import (
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
+
 # ============================================================
 # 1.5 PostgreSQL connect + init + audit_log
 # ============================================================
@@ -48,7 +47,7 @@ def pg_connect():
     print("=== [PG] Connecting ===")
 
     if not POSTGRES_URL:
-        print("[PG] POSTGRES_URL missing, skip.")
+        print("[PG] POSTGRES_URL missing")
         PG_CONN = None
         return None
 
@@ -74,7 +73,6 @@ def init_db(conn):
 
     try:
         cur = conn.cursor()
-
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.runtime_memory (
                 session_id TEXT PRIMARY KEY,
@@ -82,7 +80,6 @@ def init_db(conn):
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
         """)
-
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.audit_log (
                 id SERIAL PRIMARY KEY,
@@ -91,7 +88,6 @@ def init_db(conn):
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
         """)
-
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.thread_brain (
                 context_key BIGINT PRIMARY KEY,
@@ -99,11 +95,10 @@ def init_db(conn):
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
         """)
-
         cur.close()
+
         AUDIT_READY = True
         print("[PG] init_db OK")
-
     except Exception as e:
         print("[PG] init_db ERROR:", repr(e))
         AUDIT_READY = False
@@ -112,7 +107,6 @@ def init_db(conn):
 def log_audit(event_type: str, details: Optional[dict] = None):
     if details is None:
         details = {}
-
     print(f"[AUDIT] {event_type} :: {details}")
 
     if not AUDIT_READY or PG_CONN is None:
@@ -121,10 +115,8 @@ def log_audit(event_type: str, details: Optional[dict] = None):
     try:
         with PG_CONN.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO ovv.audit_log (event_type, details)
-                VALUES (%s, %s::jsonb)
-                """,
+                """INSERT INTO ovv.audit_log (event_type, details)
+                   VALUES (%s, %s::jsonb)""",
                 (event_type, json.dumps(details)),
             )
     except Exception as e:
@@ -151,9 +143,10 @@ async def create_task(name, goal, thread_id, channel_id):
             },
         )
         return page["id"]
+
     except Exception as e:
         print("[ERROR create_task]", repr(e))
-        log_audit("notion_error", {"op": "create_task", "name": name, "error": repr(e)})
+        log_audit("notion_error", {"op": "create_task", "error": repr(e)})
         return None
 
 
@@ -173,8 +166,9 @@ async def start_session(task_id, name, thread_id):
             },
         )
         return page["id"]
+
     except Exception as e:
-        log_audit("notion_error", {"op": "start_session", "task_id": task_id, "error": repr(e)})
+        log_audit("notion_error", {"op": "start_session", "error": repr(e)})
         return None
 
 
@@ -192,7 +186,7 @@ async def end_session(session_id, summary):
         )
         return True
     except Exception as e:
-        log_audit("notion_error", {"op": "end_session", "session_id": session_id, "error": repr(e)})
+        log_audit("notion_error", {"op": "end_session", "error": repr(e)})
         return False
 
 
@@ -211,13 +205,10 @@ async def append_logs(session_id, logs):
                 },
             )
         return True
-    except Exception as e:
-        log_audit(
-            "notion_error",
-            {"op": "append_logs", "session_id": session_id, "log_count": len(logs), "error": repr(e)},
-        )
-        return False
 
+    except Exception as e:
+        log_audit("notion_error", {"op": "append_logs", "error": repr(e)})
+        return False
 
 # ============================================================
 # 3. Runtime Memory
@@ -228,15 +219,9 @@ def load_runtime_memory(session_id: str) -> List[dict]:
         return []
     try:
         with PG_CONN.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT memory_json
-                FROM ovv.runtime_memory
-                WHERE session_id = %s
-            """, (session_id,))
+            cur.execute("SELECT memory_json FROM ovv.runtime_memory WHERE session_id=%s", (session_id,))
             row = cur.fetchone()
-            if not row:
-                return []
-            return row["memory_json"]
+            return row["memory_json"] if row else []
     except Exception as e:
         print("[runtime_memory load error]", repr(e))
         return []
@@ -250,10 +235,8 @@ def save_runtime_memory(session_id: str, mem: List[dict]):
             cur.execute("""
                 INSERT INTO ovv.runtime_memory (session_id, memory_json, updated_at)
                 VALUES (%s, %s::jsonb, NOW())
-                ON CONFLICT (session_id)
-                DO UPDATE SET
-                    memory_json = EXCLUDED.memory_json,
-                    updated_at  = NOW();
+                ON CONFLICT(session_id)
+                DO UPDATE SET memory_json=EXCLUDED.memory_json, updated_at=NOW();
             """, (session_id, json.dumps(mem, ensure_ascii=False)))
     except Exception as e:
         print("[runtime_memory save error]", repr(e))
@@ -261,11 +244,7 @@ def save_runtime_memory(session_id: str, mem: List[dict]):
 
 def append_runtime_memory(session_id: str, role: str, content: str, limit: int = 40):
     mem = load_runtime_memory(session_id)
-    mem.append({
-        "role": role,
-        "content": content,
-        "ts": datetime.now(timezone.utc).isoformat()
-    })
+    mem.append({"role": role, "content": content, "ts": datetime.now(timezone.utc).isoformat()})
     if len(mem) > limit:
         mem = mem[-limit:]
     save_runtime_memory(session_id, mem)
@@ -285,19 +264,18 @@ OVV_EXTERNAL = load_external()
 
 OVV_SOFT_CORE = """
 [Ovv Soft-Core v1.1]
-1. MUST keep user experience primary; MUST NOT become over-strict.
-2. MUST use Clarify only when ambiguity materially affects answer quality.
-3. MUST avoid hallucination.
-4. MUST respect scope boundaries.
-5. SHOULD decompose → reconstruct for stability.
-6. MUST NOT phase-mix.
-7. MAY trigger CDC but sparingly.
+1. MUST keep user experience primary
+2. MUST use Clarify only when needed
+3. MUST avoid hallucination
+4. MUST respect boundaries
+5. SHOULD decompose → reconstruct
+6. MUST NOT phase-mix
+7. MAY trigger CDC sparingly
 """.strip()
 
 SYSTEM_PROMPT = f"""
 あなたは Discord 上で動作するアシスタントです。
-ユーザー体験を最優先し、過剰な厳格化を避けてください。
-次の Ovv Soft-Core を常に保持します。
+次の Ovv Soft-Core を保持してください。
 
 {OVV_SOFT_CORE}
 """.strip()
@@ -312,15 +290,9 @@ def load_thread_brain(context_key: int) -> Optional[dict]:
         return None
     try:
         with PG_CONN.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT summary
-                FROM ovv.thread_brain
-                WHERE context_key = %s
-            """, (context_key,))
+            cur.execute("SELECT summary FROM ovv.thread_brain WHERE context_key=%s", (context_key,))
             row = cur.fetchone()
-            if not row:
-                return None
-            return row["summary"]
+            return row["summary"] if row else None
     except Exception as e:
         print("[thread_brain load error]", repr(e))
         return None
@@ -334,10 +306,8 @@ def save_thread_brain(context_key: int, summary: dict) -> bool:
             cur.execute("""
                 INSERT INTO ovv.thread_brain (context_key, summary, updated_at)
                 VALUES (%s, %s::jsonb, NOW())
-                ON CONFLICT (context_key)
-                DO UPDATE SET
-                    summary   = EXCLUDED.summary,
-                    updated_at = NOW();
+                ON CONFLICT(context_key)
+                DO UPDATE SET summary=EXCLUDED.summary, updated_at=NOW();
             """, (context_key, json.dumps(summary, ensure_ascii=False)))
         return True
     except Exception as e:
@@ -346,7 +316,6 @@ def save_thread_brain(context_key: int, summary: dict) -> bool:
 
 
 def _build_thread_brain_prompt(context_key: int, recent_mem: List[dict]) -> str:
-
     lines = []
     for m in recent_mem[-30:]:
         role = "USER" if m["role"] == "user" else "ASSISTANT"
@@ -356,27 +325,26 @@ def _build_thread_brain_prompt(context_key: int, recent_mem: List[dict]) -> str:
         lines.append(f"{role}: {short}")
 
     history_block = "\n".join(lines) if lines else "(no logs)"
-
     prev_summary = load_thread_brain(context_key)
     prev_summary_text = json.dumps(prev_summary, ensure_ascii=False) if prev_summary else "null"
 
     return f"""
 あなたは「thread_brain」を生成するAIです。
-必ず JSON のみを返すこと。
+必ず JSON のみで返答。
 
 出力フォーマット：
-{
-  "meta": {
+{{
+  "meta": {{
     "version": "1.0",
     "updated_at": "<ISO8601>",
     "context_key": {context_key},
     "total_tokens_estimate": 0
-  },
-  "status": {
+  }},
+  "status": {{
     "phase": "<idle|active|blocked|done>",
     "last_major_event": "",
     "risk": []
-  },
+  }},
   "decisions": [],
   "unresolved": [],
   "constraints": [],
@@ -385,14 +353,12 @@ def _build_thread_brain_prompt(context_key: int, recent_mem: List[dict]) -> str:
   "high_level_goal": "",
   "recent_messages": [],
   "current_position": ""
-}
+}}
 
-重要: JSON 以外の文字を返してはならない。
-
-[前回の summary]
+[前回 summary]
 {prev_summary_text}
 
-[直近ログ]
+[recent logs]
 {history_block}
 """.strip()
 
@@ -404,8 +370,8 @@ def generate_thread_brain(context_key: int, recent_mem: List[dict]) -> Optional[
         res = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
-                {"role": "system", "content": "必ず JSON のみを返す。"},
-                {"role": "user", "content": prompt_body}
+                {"role": "system", "content": "必ず JSON のみを返す"},
+                {"role": "user", "content": prompt_body},
             ],
             temperature=0.2,
         )
@@ -415,15 +381,14 @@ def generate_thread_brain(context_key: int, recent_mem: List[dict]) -> Optional[
         return None
 
     txt = raw
-    if "```" in raw:
-        parts = raw.split("```")
+    if "```" in txt:
+        parts = txt.split("```")
         cands = [p for p in parts if "{" in p and "}" in p]
         if cands:
             txt = max(cands, key=len)
 
     txt = txt.strip()
-    start = txt.find("{")
-    end = txt.rfind("}")
+    start, end = txt.find("{"), txt.rfind("}")
     if start == -1 or end == -1:
         return None
 
@@ -433,11 +398,9 @@ def generate_thread_brain(context_key: int, recent_mem: List[dict]) -> Optional[
         print("[thread_brain JSON error]", repr(e))
         return None
 
-    summary["meta"]["updated_at"] = datetime.now(timezone.utc).isoformat()
     summary["meta"]["context_key"] = context_key
-
+    summary["meta"]["updated_at"] = datetime.now(timezone.utc).isoformat()
     return summary
-
 
 # ============================================================
 # 6. Ovv Call
@@ -462,7 +425,6 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
             temperature=0.7,
         )
         ans = res.choices[0].message.content.strip()
-
         append_runtime_memory(str(context_key), "assistant", ans)
 
         log_audit("assistant_reply", {
@@ -471,13 +433,10 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
         })
 
         return ans[:1900]
+
     except Exception as e:
         print("[call_ovv error]", repr(e))
-        log_audit("openai_error", {
-            "context_key": context_key,
-            "user_text": text[:500],
-            "error": repr(e),
-        })
+        log_audit("openai_error", {"context_key": context_key, "error": repr(e)})
         return "Ovv との通信中にエラーが発生しました。"
 
 
@@ -501,29 +460,23 @@ def get_context_key(msg: discord.Message) -> int:
 def is_task_channel(message: discord.Message) -> bool:
     if isinstance(message.channel, discord.Thread):
         parent = message.channel.parent
-        if parent:
-            return parent.name.lower().startswith("task_")
-        return False
-    else:
-        return message.channel.name.lower().startswith("task_")
+        return parent.name.lower().startswith("task_") if parent else False
+    return message.channel.name.lower().startswith("task_")
 
 
 # ============================================================
-# 8. on_message（DEBUG HOOK added here）
+# 8. on_message（DEBUG HOOK）
 # ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
+
     if message.author.bot:
         return
 
-    # --------------------------------------------------------
-    # [DEBUG HOOK] debug routing first
-    # --------------------------------------------------------
     handled = await route_debug_message(bot, message)
     if handled:
         return
-    # --------------------------------------------------------
 
     try:
         if message.content.startswith("!"):
@@ -539,10 +492,9 @@ async def on_message(message: discord.Message):
         session_id = str(ck)
 
         append_runtime_memory(session_id, "user", message.content,
-                              limit=40 if is_task_channel(message) else 12)
+            limit=40 if is_task_channel(message) else 12)
 
         recent_mem = load_runtime_memory(session_id)
-
         task_mode = is_task_channel(message)
 
         if task_mode:
@@ -551,15 +503,11 @@ async def on_message(message: discord.Message):
                 save_thread_brain(ck, summary)
 
         ans = call_ovv(ck, message.content, recent_mem)
-
         await message.channel.send(ans)
 
     except Exception as e:
         print("[on_message error]", repr(e))
-        log_audit("discord_error", {
-            "where": "on_message",
-            "error": repr(e),
-        })
+        log_audit("discord_error", {"error": repr(e)})
         try:
             await message.channel.send("内部エラーが発生しました。")
         except:
@@ -578,8 +526,7 @@ async def ping(ctx: commands.Context):
 @bot.command(name="br")
 async def brain_regen(ctx: commands.Context):
     ck = get_context_key(ctx.message)
-    session_id = str(ck)
-    recent = load_runtime_memory(session_id)
+    recent = load_runtime_memory(str(ck))
 
     summary = generate_thread_brain(ck, recent)
     if summary:
@@ -601,15 +548,13 @@ async def brain_show(ctx: commands.Context):
     text = json.dumps(summary, ensure_ascii=False, indent=2)
     if len(text) > 1900:
         text = text[:1900] + "\n...[truncated]"
-
     await ctx.send(f"```json\n{text}\n```")
 
 
 @bot.command(name="tt")
 async def test_thread(ctx: commands.Context):
     ck = get_context_key(ctx.message)
-    session_id = str(ck)
-    mem = load_runtime_memory(session_id)
+    mem = load_runtime_memory(str(ck))
 
     summary = generate_thread_brain(ck, mem)
     if not summary:
@@ -617,22 +562,16 @@ async def test_thread(ctx: commands.Context):
         return
 
     save_thread_brain(ck, summary)
-
     await ctx.send("test OK: summary saved")
 
 
 # ============================================================
-# 10. Bootstrap PG + Run
+# 10. PG Bootstrap + Debug Context
 # ============================================================
 
 print("=== [BOOT] Preparing PostgreSQL connect ===")
 conn = pg_connect()
 init_db(conn)
-print("=== [BOOT] Database setup finished ===")
-
-# ============================================================
-# Debug Context Injection（★追加箇所★）
-# ============================================================
 
 from debug.debug_context import debug_context
 
@@ -653,6 +592,7 @@ debug_context.ovv_external = OVV_EXTERNAL
 debug_context.system_prompt = SYSTEM_PROMPT
 
 print("[DEBUG] context injected OK")
+
 
 # ============================================================
 # Run Bot
