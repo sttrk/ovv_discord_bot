@@ -309,6 +309,12 @@ async def on_message(message: discord.Message):
 # 9. Commands
 # ============================================================
 
+@bot.command(name="pg_mod")
+async def pg_mod(ctx):
+    import sys
+    mods = [m for m in sys.modules.keys() if "pg" in m]
+    await ctx.send("\n".join(mods))
+
 @bot.command(name="ping")
 async def ping(ctx):
     await ctx.send("pong")
@@ -364,3 +370,4 @@ print("[DEBUG] Boot complete. PG connected? =", bool(db_pg.PG_CONN))
 
 print("=== [RUN] Starting Discord bot ===")
 bot.run(DISCORD_BOT_TOKEN)
+
