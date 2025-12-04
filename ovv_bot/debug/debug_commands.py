@@ -1,9 +1,10 @@
 # debug/debug_commands.py
-# Debug Command Suite v1.0 - Implementation
+# Debug Command Suite v1.0 - Full Implementation (Stage 1 + Stage 2)
 
 import os
 import importlib
 import json
+import hashlib
 import discord
 
 from .debug_context import debug_context
@@ -34,7 +35,6 @@ async def dbg_ping(message, args):
 
 
 async def dbg_env(message, args):
-    # 環境変数が「設定されているかだけ」を確認（値は出さない）
     keys = [
         "DISCORD_BOT_TOKEN",
         "OPENAI_API_KEY",
@@ -49,12 +49,10 @@ async def dbg_env(message, args):
         v = os.getenv(k)
         status = "SET" if v else "MISSING"
         lines.append(f"{k}: {status}")
-    joined = "\n".join(lines)
-    return _msg("env check:\n" + joined)
+    return _msg("env check:\n" + "\n".join(lines))
 
 
 async def dbg_cfg(message, args):
-    # debug_context に依存が正しく注入されているかを確認
     checks = {
         "pg_conn": bool(debug_context.pg_conn),
         "notion": bool(debug_context.notion),
@@ -74,7 +72,6 @@ async def dbg_cfg(message, args):
 
 
 async def dbg_boot(message, args):
-    # env + cfg の要約を簡易的に返す
     env_ok = all(os.getenv(k) for k in [
         "DISCORD_BOT_TOKEN",
         "OPENAI_API_KEY",
@@ -104,21 +101,20 @@ async def dbg_boot(message, args):
 async def dbg_import(message, args):
     if not args:
         return _msg("usage: !dbg import <module>")
-    module_name = args[0]
     try:
-        importlib.import_module(module_name)
-        return _msg(f"import OK: {module_name}")
+        importlib.import_module(args[0])
+        return _msg(f"import OK: {args[0]}")
     except Exception as e:
-        return _msg(f"import FAIL: {module_name} :: {repr(e)}")
+        return _msg(f"import FAIL: {args[0]} :: {repr(e)}")
 
 
 async def dbg_file(message, args):
     if not args:
         return _msg("usage: !dbg file <path>")
-    file_path = args[0]
-    exists = os.path.exists(file_path)
-    kind = "dir" if os.path.isdir(file_path) else "file"
-    return _msg(f"{kind} exists={exists}: {file_path}")
+    path = args[0]
+    exists = os.path.exists(path)
+    kind = "dir" if os.path.isdir(path) else "file"
+    return _msg(f"{kind} exists={exists}: {path}")
 
 
 async def dbg_load_notion(message, args):
@@ -134,7 +130,7 @@ async def dbg_load_core(message, args):
 
 
 # ============================================================
-# C. PostgreSQL Audit（実装版）
+# C. PostgreSQL Audit（実装）
 # ============================================================
 
 async def dbg_pg_connect(message, args):
@@ -166,22 +162,18 @@ async def dbg_pg_tables(message, args):
 
         if not rows:
             return _msg("PG tables: none")
-        txt = ", ".join([f"{r[0]}.{r[1]}" for r in rows])
-        return _msg(f"PG tables: {txt}")
 
+        text = ", ".join([f"{r[0]}.{r[1]}" for r in rows])
+        return _msg("PG tables: " + text)
     except Exception as e:
         return _msg(f"PG tables FAIL: {repr(e)}")
 
 
 async def dbg_pg_write(message, args):
-    """
-    audit_log にテスト書き込み
-    """
     try:
         conn = debug_context.pg_conn
         if conn is None:
             return _msg("PG: No connection")
-
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO ovv.audit_log (event_type, details)
@@ -193,14 +185,10 @@ async def dbg_pg_write(message, args):
 
 
 async def dbg_pg_read(message, args):
-    """
-    audit_log の最新 5 件を読む
-    """
     try:
         conn = debug_context.pg_conn
         if conn is None:
             return _msg("PG: No connection")
-
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT id, event_type, created_at
@@ -209,19 +197,16 @@ async def dbg_pg_read(message, args):
                 LIMIT 5
             """)
             rows = cur.fetchall()
-
         if not rows:
             return _msg("PG read: no logs")
-
         text = "\n".join([f"{r[0]} | {r[1]} | {r[2]}" for r in rows])
         return _msg("PG read:\n" + text)
-
     except Exception as e:
         return _msg(f"PG read FAIL: {repr(e)}")
 
 
 # ============================================================
-# D. Notion Audit（実装版）
+# D. Notion Audit（実装）
 # ============================================================
 
 async def dbg_notion_auth(message, args):
@@ -234,16 +219,11 @@ async def dbg_notion_auth(message, args):
 
 
 async def dbg_notion_list(message, args):
-    """
-    tasks DB の先頭 3 件だけ読む簡易チェック
-    """
     try:
         notion = debug_context.notion
-        db_id = NOTION_TASKS_DB_ID
-
         q = notion.databases.query(
             **{
-                "database_id": db_id,
+                "database_id": NOTION_TASKS_DB_ID,
                 "page_size": 3
             }
         )
@@ -254,23 +234,49 @@ async def dbg_notion_list(message, args):
 
 
 # ============================================================
-# E. Ovv Core / LLM Audit（まだ骨だけ）
+# E. Ovv Core / External / LLM Audit（Stage 2 実装）
 # ============================================================
 
 async def dbg_ovv_ping(message, args):
-    return _msg("ovv ping: TODO")
+    return _msg("ovv ping")
 
 
 async def dbg_ovv_core(message, args):
-    return _msg("ovv core load: TODO")
+    core = debug_context.ovv_core
+    if not core:
+        return _msg("ovv_core: EMPTY")
+    length = len(core)
+    h = hashlib.sha256(core.encode()).hexdigest()[:16]
+    head = "\n".join(core.split("\n")[:5])
+    return _msg(f"ovv_core loaded\nlen={length}\nhash={h}\nhead:\n{head}")
+
+
+async def dbg_ovv_external(message, args):
+    ext = debug_context.ovv_external
+    if not ext:
+        return _msg("ovv_external: EMPTY")
+    length = len(ext)
+    h = hashlib.sha256(ext.encode()).hexdigest()[:16]
+    head = "\n".join(ext.split("\n")[:5])
+    return _msg(f"ovv_external loaded\nlen={length}\nhash={h}\nhead:\n{head}")
 
 
 async def dbg_ovv_llm(message, args):
-    return _msg("ovv llm test: TODO")
+    try:
+        client = debug_context.openai_client
+        res = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[{"role": "user", "content": "2+2=?"}],
+            temperature=0
+        )
+        ans = res.choices[0].message.content.strip()
+        return _msg(f"LLM OK: {ans}")
+    except Exception as e:
+        return _msg(f"LLM FAIL: {repr(e)}")
 
 
 # ============================================================
-# F. Memory / Thread Brain Audit（実装版）
+# F. Memory / Thread Brain Audit（実装）
 # ============================================================
 
 async def dbg_mem_load(message, args):
@@ -317,7 +323,7 @@ async def dbg_brain_show(message, args):
 
 
 # ============================================================
-# G. Routing / Event Audit
+# G. Routing / Event / Chain Audit（Stage 2 strong）
 # ============================================================
 
 async def dbg_route(message, args):
@@ -329,7 +335,20 @@ async def dbg_event(message, args):
 
 
 async def dbg_chain(message, args):
-    return _msg("chain test: TODO")
+    try:
+        client = debug_context.openai_client
+        res = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": "test"},
+                {"role": "user", "content": "チェーンテスト"},
+            ],
+            temperature=0.2,
+        )
+        ans = res.choices[0].message.content.strip()
+        return _msg(f"chain OK: reply_len={len(ans)}")
+    except Exception as e:
+        return _msg(f"chain FAIL: {repr(e)}")
 
 
 # ============================================================
@@ -338,41 +357,42 @@ async def dbg_chain(message, args):
 
 async def run_debug_command(message, cmd: str, args: list):
 
-    # A. Boot / Env / Config
+    # A
     if cmd == "ping":        return await dbg_ping(message, args)
     if cmd == "env":         return await dbg_env(message, args)
     if cmd == "cfg":         return await dbg_cfg(message, args)
     if cmd == "boot":        return await dbg_boot(message, args)
 
-    # B. Import / Module / Dependency
+    # B
     if cmd == "import":      return await dbg_import(message, args)
     if cmd == "file":        return await dbg_file(message, args)
     if cmd == "load_notion": return await dbg_load_notion(message, args)
     if cmd == "load_pg":     return await dbg_load_pg(message, args)
     if cmd == "load_core":   return await dbg_load_core(message, args)
 
-    # C. PostgreSQL
+    # C
     if cmd == "pg_connect":  return await dbg_pg_connect(message, args)
     if cmd == "pg_tables":   return await dbg_pg_tables(message, args)
     if cmd == "pg_write":    return await dbg_pg_write(message, args)
     if cmd == "pg_read":     return await dbg_pg_read(message, args)
 
-    # D. Notion
+    # D
     if cmd == "notion_auth": return await dbg_notion_auth(message, args)
     if cmd == "notion_list": return await dbg_notion_list(message, args)
 
-    # E. Ovv Core / LLM
-    if cmd == "ovv_ping":    return await dbg_ovv_ping(message, args)
-    if cmd == "ovv_core":    return await dbg_ovv_core(message, args)
-    if cmd == "ovv_llm":     return await dbg_ovv_llm(message, args)
+    # E
+    if cmd == "ovv_ping":     return await dbg_ovv_ping(message, args)
+    if cmd == "ovv_core":     return await dbg_ovv_core(message, args)
+    if cmd == "ovv_external": return await dbg_ovv_external(message, args)
+    if cmd == "ovv_llm":      return await dbg_ovv_llm(message, args)
 
-    # F. Memory / Brain
+    # F
     if cmd == "mem_load":    return await dbg_mem_load(message, args)
     if cmd == "mem_write":   return await dbg_mem_write(message, args)
     if cmd == "brain_gen":   return await dbg_brain_gen(message, args)
     if cmd == "brain_show":  return await dbg_brain_show(message, args)
 
-    # G. Routing / Event
+    # G
     if cmd == "route":       return await dbg_route(message, args)
     if cmd == "event":       return await dbg_event(message, args)
     if cmd == "chain":       return await dbg_chain(message, args)
