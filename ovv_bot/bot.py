@@ -10,6 +10,13 @@ import psycopg2
 import psycopg2.extras
 
 # ============================================================
+# [DEBUG HOOK] imports
+# ============================================================
+from debug.debug_router import route_debug_message
+# debug_commands は debug_router 内で呼ばれるため、ここでは import 不要
+
+
+# ============================================================
 # 1. Environment
 # ============================================================
 
@@ -210,7 +217,7 @@ async def append_logs(session_id, logs):
         return False
 
 # ============================================================
-# 3. Runtime Memory (PostgreSQL 永続メモリ)
+# 3. Runtime Memory
 # ============================================================
 
 def load_runtime_memory(session_id: str) -> List[dict]:
@@ -336,6 +343,7 @@ def save_thread_brain(context_key: int, summary: dict) -> bool:
 
 
 def _build_thread_brain_prompt(context_key: int, recent_mem: List[dict]) -> str:
+
     # short digest
     lines = []
     for m in recent_mem[-30:]:
@@ -430,7 +438,7 @@ def generate_thread_brain(context_key: int, recent_mem: List[dict]) -> Optional[
     return summary
 
 # ============================================================
-# 6. Ovv Call（OpenAI 応答生成）
+# 6. Ovv Call
 # ============================================================
 
 def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
@@ -440,8 +448,8 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
-    # runtime_memory を会話に注入
-    for m in recent_mem[-20:]:  # token負荷軽減
+    # Inject runtime memory
+    for m in recent_mem[-20:]:
         msgs.append({"role": m["role"], "content": m["content"]})
 
     msgs.append({"role": "user", "content": text})
@@ -461,7 +469,7 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
             "length": len(ans),
         })
 
-        return ans[:1900]  # Discord制限
+        return ans[:1900]
     except Exception as e:
         print("[call_ovv error]", repr(e))
         log_audit("openai_error", {
@@ -485,14 +493,12 @@ def get_context_key(msg: discord.Message) -> int:
     if isinstance(msg.channel, discord.Thread):
         return msg.channel.id
     if msg.guild is None:
-        return msg.channel.id  # DM
+        return msg.channel.id
     return (msg.guild.id << 32) | msg.channel.id
 
 
-# task_ チャンネルかどうか判定する
 def is_task_channel(message: discord.Message) -> bool:
     if isinstance(message.channel, discord.Thread):
-        # スレッドの場合は親チャンネル名で判断
         parent = message.channel.parent
         if parent:
             return parent.name.lower().startswith("task_")
@@ -502,13 +508,21 @@ def is_task_channel(message: discord.Message) -> bool:
 
 
 # ============================================================
-# 8. on_message（task_mode / spot_mode 切り替え）
+# 8. on_message（ここに DEBUG HOOK を統合）
 # ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    # --------------------------------------------------------
+    # [DEBUG HOOK] debug_router を最上流に配置
+    # --------------------------------------------------------
+    handled = await route_debug_message(bot, message)
+    if handled:
+        return
+    # --------------------------------------------------------
 
     try:
         # 1. コマンド処理
@@ -524,22 +538,18 @@ async def on_message(message: discord.Message):
         ck = get_context_key(message)
         session_id = str(ck)
 
-        # runtime_memory: 保存（task/spot 共通）
         append_runtime_memory(session_id, "user", message.content,
                               limit=40 if is_task_channel(message) else 12)
 
         recent_mem = load_runtime_memory(session_id)
 
-        # 2. task/spot モードの決定
         task_mode = is_task_channel(message)
 
-        # 3. task_mode のみ thread_brain を生成・保存
         if task_mode:
             summary = generate_thread_brain(ck, recent_mem)
             if summary:
                 save_thread_brain(ck, summary)
 
-        # 4. Ovv 応答生成
         ans = call_ovv(ck, message.content, recent_mem)
 
         await message.channel.send(ans)
@@ -565,10 +575,6 @@ async def ping(ctx: commands.Context):
     await ctx.send("pong")
 
 
-# ------------------------------------------------------------
-# !brain_regen
-# ------------------------------------------------------------
-
 @bot.command(name="br")
 async def brain_regen(ctx: commands.Context):
     ck = get_context_key(ctx.message)
@@ -582,10 +588,6 @@ async def brain_regen(ctx: commands.Context):
     else:
         await ctx.send("生成に失敗しました。")
 
-
-# ------------------------------------------------------------
-# !brain_show
-# ------------------------------------------------------------
 
 @bot.command(name="bs")
 async def brain_show(ctx: commands.Context):
@@ -603,10 +605,6 @@ async def brain_show(ctx: commands.Context):
     await ctx.send(f"```json\n{text}\n```")
 
 
-# ------------------------------------------------------------
-# !test_thread
-# ------------------------------------------------------------
-
 @bot.command(name="tt")
 async def test_thread(ctx: commands.Context):
     ck = get_context_key(ctx.message)
@@ -622,6 +620,7 @@ async def test_thread(ctx: commands.Context):
 
     await ctx.send("test OK: summary saved")
 
+
 # ============================================================
 # 10. Bootstrap PG + Run
 # ============================================================
@@ -633,4 +632,3 @@ print("=== [BOOT] Database setup finished ===")
 
 print("=== [RUN] Starting Discord bot ===")
 bot.run(DISCORD_BOT_TOKEN)
-
