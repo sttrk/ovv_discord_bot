@@ -1,4 +1,4 @@
-# boot # debug/debug_boot.py
+# debug/debug_boot.py
 
 """
 Bot 起動時に boot_log チャンネルへステータスを投稿する処理。
@@ -18,10 +18,7 @@ from notion import notion_api
 
 
 async def _get_pg_status() -> str:
-    """
-    非破壊な PG の簡易ヘルスチェック。
-    例外は握りつぶして "NG" を返す。
-    """
+    """非破壊な PG の簡易ヘルスチェック。例外は握りつぶして NG を返す。"""
     try:
         conn = db_pg.PG_CONN or db_pg.pg_connect()
         if conn is None:
@@ -35,22 +32,16 @@ async def _get_pg_status() -> str:
 
 
 async def _get_notion_status() -> str:
-    """
-    Notion の簡易ヘルスチェック。
-    例外は握りつぶして "NG" を返す。
-    """
+    """Notion の簡易ヘルスチェック。例外は握りつぶして NG を返す。"""
     try:
-        # かなり軽い操作として、自分のワークスペース情報を読む（実装に応じて変更可）
-        notion_api.client  # 存在チェック用（client を公開している想定）
+        notion_api.client  # 存在チェック（軽い操作）
         return "OK"
     except Exception as e:
         return f"NG ({type(e).__name__})"
 
 
 async def _ensure_boot_static_message(channel: discord.TextChannel):
-    """
-    boot_log チャンネルに、未ピン留めなら固定メッセージを 1 回だけ送る。
-    """
+    """boot_log に固定メッセージを 1 回だけピン留めする。"""
     static = DEBUG_STATIC_MESSAGES.get("boot_log")
     if not static:
         return
@@ -59,10 +50,8 @@ async def _ensure_boot_static_message(channel: discord.TextChannel):
         pins = await channel.pins()
         for msg in pins:
             if msg.author.bot and "boot_log" in msg.content:
-                # 既にそれっぽいものがピン留めされていれば何もしない
                 return
     except Exception:
-        # pins() に失敗しても致命的ではないので無視
         pass
 
     try:
@@ -77,8 +66,8 @@ async def _ensure_boot_static_message(channel: discord.TextChannel):
 
 async def send_boot_message(bot: discord.Client):
     """
-    bot.py の on_ready から呼び出すことを想定。
-    全 guild の boot_log チャンネルを探し、起動メッセージを投稿する。
+    bot.py の on_ready から呼び出す想定。
+    全 guild の boot_log チャンネルを探し、起動メッセージを送る。
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -90,7 +79,7 @@ async def send_boot_message(bot: discord.Client):
         if ch is None:
             continue
 
-        # 固定メッセージ（説明）のピン留め
+        # 固定メッセージのピン留め
         await _ensure_boot_static_message(ch)
 
         text = (
@@ -104,5 +93,5 @@ async def send_boot_message(bot: discord.Client):
         try:
             await ch.send(text)
         except Exception:
-            # boot_log がなくても致命ではないので握りつぶす
-            continuemessage auto sender
+            # 送信失敗は致命ではないため握りつぶす
+            pass
