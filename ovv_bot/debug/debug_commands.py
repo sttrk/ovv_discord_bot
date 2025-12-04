@@ -1,118 +1,177 @@
 # debug/debug_commands.py
+# Debug Command Suite v1.0 - Skeleton Implementation
 
-"""
-Ovv Debug Commands
-
-- !sql  : 簡易 SELECT 専用 psql
-- !diag : 現在の context_key / mode / runtime_memory 長などを確認
-"""
-
-from typing import List
-
-from discord.ext import commands
-
-from database import pg as db_pg
-from database.runtime_memory import load_runtime_memory
-from brain.thread_brain import load_thread_brain
-from ovv.mode import is_task_channel  # あなたが mode.py に実装した前提
-from util.logger import log_info, log_error  # なければ print に差し替え可
+import os
+import importlib
 
 
-def _get_context_key_from_ctx(ctx: commands.Context) -> int:
-    """
-    bot.py にある get_context_key と同じロジックをここにコピーする。
-    divergence を避けるため、本体の実装と揃えておくこと。
-    """
-    msg = ctx.message
-    ch = msg.channel
-    if hasattr(ch, "parent") and getattr(ch, "parent", None) is not None and getattr(ch, "id", None):
-        # Thread の場合
-        if getattr(ch, "type", None).name == "public_thread":
-            return ch.id
-    if msg.guild is None:
-        return msg.channel.id
-    return (msg.guild.id << 32) | msg.channel.id
+# Utility: return simple debug text
+def _msg(text: str) -> str:
+    return f"[DEBUG] {text}"
 
 
-def setup_debug_commands(bot: commands.Bot):
-    """
-    bot.py 側から呼び出して、全 debug コマンドを登録するためのエントリポイント。
-    """
+# ============================================================
+# A. Boot / Env / Config
+# ============================================================
 
-    @bot.command(name="sql")
-    async def sql(ctx: commands.Context, *, query: str):
-        """
-        簡易 psql：SELECT 文のみ許可。
-        例: !sql SELECT id, event_type, created_at FROM ovv.audit_log ORDER BY id DESC LIMIT 10;
-        """
-        # 安全のため SELECT 以外は禁止
-        q_strip = query.strip().lower()
-        if not q_strip.startswith("select"):
-            await ctx.send("現在は安全のため SELECT 文のみ許可しています。")
-            return
+async def dbg_ping(message):
+    return _msg("pong")
 
-        conn = db_pg.PG_CONN or db_pg.pg_connect()
-        if conn is None:
-            await ctx.send("PostgreSQL への接続がありません。")
-            return
+async def dbg_env(message):
+    return _msg("env check: TODO")
 
-        try:
-            with conn.cursor() as cur:
-                cur.execute(query)
-                rows = cur.fetchall()
+async def dbg_cfg(message):
+    return _msg("config check: TODO")
 
-            # 行数が多すぎる場合はカット
-            max_rows = 20
-            out_rows = rows[:max_rows]
+async def dbg_boot(message):
+    return _msg("boot re-init: TODO")
 
-            lines = []
-            for r in out_rows:
-                lines.append(" | ".join(str(x) for x in r))
 
-            if len(rows) > max_rows:
-                lines.append(f"... ({len(rows) - max_rows} rows truncated)")
+# ============================================================
+# B. Import / Module / Dependency
+# ============================================================
 
-            if not lines:
-                await ctx.send("結果は 0 行でした。")
-                return
+async def dbg_import(message, module_name: str):
+    try:
+        importlib.import_module(module_name)
+        return _msg(f"import OK: {module_name}")
+    except Exception as e:
+        return _msg(f"import FAIL: {module_name} :: {repr(e)}")
 
-            text = "```text\n" + "\n".join(lines)[:1900] + "\n```"
-            await ctx.send(text)
+async def dbg_file(message, file_path: str):
+    exists = os.path.exists(file_path)
+    return _msg(f"file exists={exists}: {file_path}")
 
-        except Exception as e:
-            log_error(f"[debug.sql] error: {repr(e)}")
-            await ctx.send(f"SQL 実行中にエラーが発生しました: {type(e).__name__}")
+async def dbg_load_notion(message):
+    return _msg("load notion: TODO")
 
-    @bot.command(name="diag")
-    async def diag(ctx: commands.Context):
-        """
-        現在スレッド／チャンネルの診断用。
-        - context_key
-        - mode (task / spot)
-        - runtime_memory length
-        - thread_brain の有無
-        """
-        ck = _get_context_key_from_ctx(ctx)
-        session_id = str(ck)
+async def dbg_load_pg(message):
+    return _msg("load pg: TODO")
 
-        # モード判定（あなたの mode.py のロジックに依存）
-        mode = "task" if is_task_channel(ctx.message) else "spot"
+async def dbg_load_core(message):
+    return _msg("load core: TODO")
 
-        mem = load_runtime_memory(session_id)
-        mem_len = len(mem)
 
-        summary = load_thread_brain(ck)
-        has_brain = summary is not None
+# ============================================================
+# C. PostgreSQL Audit
+# ============================================================
 
-        text = (
-            "【diag】\n"
-            f"- context_key: {ck}\n"
-            f"- mode:        {mode}\n"
-            f"- runtime_mem: {mem_len} entries\n"
-            f"- thread_brain:{'YES' if has_brain else 'NO'}\n"
-        )
+async def dbg_pg_connect(message):
+    return _msg("pg connect: TODO")
 
-        await ctx.send(f"```text\n{text}\n```")
+async def dbg_pg_tables(message):
+    return _msg("pg tables: TODO")
 
-    # ここに今後 !logs, !brain_raw などを追加していける
-    log_info("[debug] debug commands registered")
+async def dbg_pg_write(message):
+    return _msg("pg write: TODO")
+
+async def dbg_pg_read(message):
+    return _msg("pg read: TODO")
+
+
+# ============================================================
+# D. Notion Audit
+# ============================================================
+
+async def dbg_notion_auth(message):
+    return _msg("notion auth: TODO")
+
+async def dbg_notion_list(message):
+    return _msg("notion list: TODO")
+
+async def dbg_notion_create(message):
+    return _msg("notion create: TODO")
+
+
+# ============================================================
+# E. Ovv Core / LLM Audit
+# ============================================================
+
+async def dbg_ovv_ping(message):
+    return _msg("ovv ping: TODO")
+
+async def dbg_ovv_core(message):
+    return _msg("ovv core load: TODO")
+
+async def dbg_ovv_llm(message):
+    return _msg("ovv llm test: TODO")
+
+
+# ============================================================
+# F. Memory / Thread Brain Audit
+# ============================================================
+
+async def dbg_mem_load(message):
+    return _msg("memory load: TODO")
+
+async def dbg_mem_write(message):
+    return _msg("memory write: TODO")
+
+async def dbg_brain_gen(message):
+    return _msg("brain generate: TODO")
+
+async def dbg_brain_show(message):
+    return _msg("brain show: TODO")
+
+
+# ============================================================
+# G. Routing / Event Audit
+# ============================================================
+
+async def dbg_route(message):
+    return _msg("route OK")
+
+async def dbg_event(message):
+    return _msg("event OK (passed through on_message)")
+
+async def dbg_chain(message):
+    return _msg("chain test: TODO")
+
+
+# ============================================================
+# Dispatcher
+# ============================================================
+
+async def run_debug_command(message, cmd: str, args: list):
+
+    # A. Boot / Env / Config
+    if cmd == "ping": return await dbg_ping(message)
+    if cmd == "env": return await dbg_env(message)
+    if cmd == "cfg": return await dbg_cfg(message)
+    if cmd == "boot": return await dbg_boot(message)
+
+    # B. Import / Module / Dependency
+    if cmd == "import" and args: return await dbg_import(message, args[0])
+    if cmd == "file" and args: return await dbg_file(message, args[0])
+    if cmd == "load_notion": return await dbg_load_notion(message)
+    if cmd == "load_pg": return await dbg_load_pg(message)
+    if cmd == "load_core": return await dbg_load_core(message)
+
+    # C. PostgreSQL
+    if cmd == "pg_connect": return await dbg_pg_connect(message)
+    if cmd == "pg_tables": return await dbg_pg_tables(message)
+    if cmd == "pg_write": return await dbg_pg_write(message)
+    if cmd == "pg_read": return await dbg_pg_read(message)
+
+    # D. Notion
+    if cmd == "notion_auth": return await dbg_notion_auth(message)
+    if cmd == "notion_list": return await dbg_notion_list(message)
+    if cmd == "notion_create": return await dbg_notion_create(message)
+
+    # E. Ovv Core / LLM
+    if cmd == "ovv_ping": return await dbg_ovv_ping(message)
+    if cmd == "ovv_core": return await dbg_ovv_core(message)
+    if cmd == "ovv_llm": return await dbg_ovv_llm(message)
+
+    # F. Memory / Brain
+    if cmd == "mem_load": return await dbg_mem_load(message)
+    if cmd == "mem_write": return await dbg_mem_write(message)
+    if cmd == "brain_gen": return await dbg_brain_gen(message)
+    if cmd == "brain_show": return await dbg_brain_show(message)
+
+    # G. Routing / Event
+    if cmd == "route": return await dbg_route(message)
+    if cmd == "event": return await dbg_event(message)
+    if cmd == "chain": return await dbg_chain(message)
+
+    return _msg(f"Unknown debug command: {cmd}")
