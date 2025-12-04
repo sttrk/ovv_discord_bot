@@ -92,6 +92,7 @@ async def send_boot_message(bot: discord.Client):
 
         try:
             await ch.send(text)
+
         except Exception:
-            # 送信失敗は致命ではないため握りつぶす
+            # boot_log がなくても致命ではないので握りつぶす
             pass
