@@ -216,3 +216,102 @@ def save_thread_brain(context_key: int, summary: dict) -> bool:
     except Exception as e:
         print("[thread_brain save error]", repr(e))
         return False
+
+# ============================================================
+# Thread Brain Generator (migrated from bot.py)
+# ============================================================
+from openai import OpenAI
+client = OpenAI()  # APIキーは env から自動読込
+
+def _build_thread_brain_prompt(context_key: int, recent_mem: list) -> str:
+    import json
+    lines = []
+    for m in recent_mem[-30:]:
+        role = "USER" if m["role"] == "user" else "ASSISTANT"
+        short = m["content"].replace("\n", " ")
+        if len(short) > 500:
+            short = short[:500] + " ...[truncated]"
+        lines.append(f"{role}: {short}")
+
+    history_block = "\n".join(lines) if lines else "(no logs)"
+    prev = load_thread_brain(context_key)
+    prev_text = json.dumps(prev, ensure_ascii=False) if prev else "null"
+
+    return f"""
+あなたは「thread_brain」を生成するAIです。
+必ず JSON のみで返答。
+
+出力フォーマット：
+{{
+  "meta": {{
+    "version": "1.0",
+    "updated_at": "<ISO8601>",
+    "context_key": {context_key},
+    "total_tokens_estimate": 0
+  }},
+  "status": {{
+    "phase": "<idle|active|blocked|done>",
+    "last_major_event": "",
+    "risk": []
+  }},
+  "decisions": [],
+  "unresolved": [],
+  "constraints": [],
+  "next_actions": [],
+  "history_digest": "",
+  "high_level_goal": "",
+  "recent_messages": [],
+  "current_position": ""
+}}
+
+[前回 summary]
+{prev_text}
+
+[recent logs]
+{history_block}
+""".strip()
+
+
+def generate_thread_brain(context_key: int, recent_mem: list):
+    import json
+    from datetime import datetime, timezone
+
+    prompt = _build_thread_brain_prompt(context_key, recent_mem)
+
+    try:
+        res = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": "必ず JSON のみを返す"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        raw = res.choices[0].message.content.strip()
+    except Exception as e:
+        print("[thread_brain LLM error]", repr(e))
+        return None
+
+    # JSON 抽出
+    txt = raw
+    if "```" in txt:
+        parts = txt.split("```")
+        cands = [p for p in parts if "{" in p and "}" in p]
+        if cands:
+            txt = max(cands, key=len)
+
+    txt = txt.strip()
+    start, end = txt.find("{"), txt.rfind("}")
+    if start == -1 or end == -1:
+        return None
+
+    try:
+        summary = json.loads(txt[start:end+1])
+    except Exception as e:
+        print("[thread_brain JSON error]", repr(e))
+        return None
+
+    summary["meta"]["context_key"] = context_key
+    summary["meta"]["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return summary
+    
