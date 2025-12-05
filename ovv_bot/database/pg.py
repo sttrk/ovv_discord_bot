@@ -31,17 +31,6 @@ from notion.notion_api import (
 )
 
 # ============================================================
-# Ovv Core / Call Layer
-# ============================================================
-from ovv.ovv_call import (
-    call_ovv,
-    OVV_CORE,
-    OVV_EXTERNAL,
-    SYSTEM_PROMPT,
-    openai_client,
-)
-
-# ============================================================
 # Environment
 # ============================================================
 from config import (
@@ -291,3 +280,4 @@ print("[DEBUG] context injection complete.")
 print("[BOOT] PG Connected =", bool(db_pg.PG_CONN))
 print("[BOOT] Starting Discord Bot (JST boot_log)")
 bot.run(DISCORD_BOT_TOKEN)
+
