@@ -1,5 +1,5 @@
 # debug/debug_commands.py
-# Debug Command Suite v1.0 - Full Implementation (Stage 1 + Stage 2 + RAW Inspector)
+# Debug Command Suite v1.0 - Full Implementation (Stage 1 + Stage 2 + raw Ovv call)
 
 import os
 import importlib
@@ -9,6 +9,9 @@ import discord
 
 from .debug_context import debug_context
 from config import NOTION_TASKS_DB_ID
+
+# Ovv 直叩き用
+from ovv.ovv_call import call_ovv
 
 
 # Utility: return simple debug text
@@ -66,7 +69,6 @@ async def dbg_cfg(message, args):
         "ovv_core": bool(debug_context.ovv_core),
         "ovv_external": bool(debug_context.ovv_external),
         "system_prompt": bool(debug_context.system_prompt),
-        "ovv_call": bool(getattr(debug_context, "ovv_call", None)),
     }
     lines = [f"{k}: {'OK' if v else 'NONE'}" for k, v in checks.items()]
     return _msg("config check:\n" + "\n".join(lines))
@@ -131,7 +133,7 @@ async def dbg_load_core(message, args):
 
 
 # ============================================================
-# C. PostgreSQL Audit
+# C. PostgreSQL Audit（実装）
 # ============================================================
 
 async def dbg_pg_connect(message, args):
@@ -207,7 +209,7 @@ async def dbg_pg_read(message, args):
 
 
 # ============================================================
-# D. Notion Audit
+# D. Notion Audit（実装）
 # ============================================================
 
 async def dbg_notion_auth(message, args):
@@ -235,7 +237,7 @@ async def dbg_notion_list(message, args):
 
 
 # ============================================================
-# E. Ovv Core / External / LLM Audit
+# E. Ovv Core / External / LLM Audit（Stage 2 実装）
 # ============================================================
 
 async def dbg_ovv_ping(message, args):
@@ -277,7 +279,47 @@ async def dbg_ovv_llm(message, args):
 
 
 # ============================================================
-# F. Memory / Thread Brain Audit
+# E-2. Ovv Raw Call（BIS バイパス用）
+# ============================================================
+
+async def dbg_raw(message, args):
+    """
+    !dbg raw <text>
+    Boundary_Gate / Interface_Box / Stabilizer をバイパスし、
+    ovv_call.call_ovv を直接叩く。
+    - ThreadBrain / runtime_memory は PG から読み出して渡す
+    - 戻り値は Ovv の生出力（[FINAL] を含む）をそのまま返す
+    """
+    if not args:
+        return _msg("usage: !dbg raw <text>")
+
+    user_text = " ".join(args).strip()
+    ctx_key = _get_context_key(message)
+
+    # recent_mem を取得（あれば）
+    mem = []
+    try:
+        if debug_context.load_mem:
+            mem = debug_context.load_mem(str(ctx_key)) or []
+    except Exception as e:
+        return _msg(f"raw: mem_load FAIL: {repr(e)}")
+
+    # Ovv 直叩き
+    try:
+        raw = call_ovv(ctx_key, user_text, mem)
+    except Exception as e:
+        return _msg(f"raw: call_ovv FAIL: {repr(e)}")
+
+    # Discord 制限を考慮してざっくり truncate
+    if len(raw) > 1900:
+        raw = raw[:1900] + "\n...[truncated]"
+
+    # ここだけは [DEBUG] を付けずに生返しする（Ovv 出力をそのまま見るため）
+    return raw
+
+
+# ============================================================
+# F. Memory / Thread Brain Audit（実装）
 # ============================================================
 
 async def dbg_mem_load(message, args):
@@ -324,7 +366,7 @@ async def dbg_brain_show(message, args):
 
 
 # ============================================================
-# G. Routing / Event / Chain Audit
+# G. Routing / Event / Chain Audit（Stage 2 strong）
 # ============================================================
 
 async def dbg_route(message, args):
@@ -353,67 +395,41 @@ async def dbg_chain(message, args):
 
 
 # ============================================================
-# X. RAW Ovv Call Debugger（新規追加）
-# ============================================================
-
-async def dbg_raw(message, args):
-    """
-    Ovv の raw 出力をそのまま確認するデバッグ関数。
-    Stabilizer が壊れているか、FINAL が空なのかを切り分けられる。
-    使用例:
-        !dbg raw こんにちは
-    """
-    if not args:
-        return _msg("usage: !dbg raw <text>")
-
-    user_text = " ".join(args)
-
-    ck = _get_context_key(message)
-    mem = debug_context.load_mem(str(ck))
-
-    call_fn = getattr(debug_context, "ovv_call", None)
-    if not call_fn:
-        return _msg("ovv_call not injected")
-
-    try:
-        raw = call_fn(ck, user_text, mem)
-    except Exception as e:
-        return _msg(f"raw_call error: {repr(e)}")
-
-    if not raw:
-        return _msg("raw output is EMPTY")
-
-    txt = raw
-    if len(txt) > 1800:
-        txt = txt[:1800] + "...[truncated]"
-
-    return _msg(f"RAW OUTPUT:\n{txt}")
-
-
-# ============================================================
 # H. All-in-one Debug
 # ============================================================
 
 async def dbg_all(message, args):
+    """
+    代表的なデバッグコマンドをまとめて実行し、1メッセージで返す。
+    Discord の 2000 文字制限を考慮してざっくり truncate する。
+    """
     sections = []
 
+    # Boot / Env / Config
     sections.append(await dbg_env(message, []))
     sections.append(await dbg_cfg(message, []))
     sections.append(await dbg_boot(message, []))
 
+    # PostgreSQL
     sections.append(await dbg_pg_connect(message, []))
     sections.append(await dbg_pg_tables(message, []))
     sections.append(await dbg_pg_read(message, []))
 
+    # Notion
     sections.append(await dbg_notion_auth(message, []))
     sections.append(await dbg_notion_list(message, []))
 
+    # Memory / Thread Brain
     sections.append(await dbg_mem_load(message, []))
     sections.append(await dbg_brain_show(message, []))
 
+    # Routing / Event
     sections.append(await dbg_route(message, []))
 
+    # まとめて結合
     text = "\n\n".join(sections)
+
+    # Discord の 2000 文字制限をざっくり考慮
     if len(text) > 1900:
         text = text[:1900] + "\n...[truncated]"
 
@@ -454,6 +470,7 @@ async def run_debug_command(message, cmd: str, args: list):
     if cmd == "ovv_core":     return await dbg_ovv_core(message, args)
     if cmd == "ovv_external": return await dbg_ovv_external(message, args)
     if cmd == "ovv_llm":      return await dbg_ovv_llm(message, args)
+    if cmd == "raw":          return await dbg_raw(message, args)
 
     # F
     if cmd == "mem_load":    return await dbg_mem_load(message, args)
@@ -466,10 +483,7 @@ async def run_debug_command(message, cmd: str, args: list):
     if cmd == "event":       return await dbg_event(message, args)
     if cmd == "chain":       return await dbg_chain(message, args)
 
-    # X (RAW Inspector)
-    if cmd == "raw":         return await dbg_raw(message, args)
-
-    # H
+    # H. All-in-one
     if cmd == "all":         return await dbg_all(message, args)
 
     return _msg(f"Unknown debug command: {cmd}")
