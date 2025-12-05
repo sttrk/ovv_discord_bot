@@ -1,5 +1,5 @@
 # database/pg.py
-# PostgreSQL Integration Layer - Final Stable Edition (A-3)
+# PostgreSQL Integration Layer - Final Stable Edition (A-3, patched)
 
 import json
 from typing import Optional, List, Dict
@@ -51,6 +51,7 @@ def init_db(conn):
 
     try:
         cur = conn.cursor()
+
         # runtime memory
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.runtime_memory (
@@ -161,6 +162,7 @@ def load_thread_brain(context_key: int) -> Optional[dict]:
         print("[thread_brain load error]", repr(e))
         return None
 
+
 def save_thread_brain(context_key: int, summary: dict) -> bool:
     if PG_CONN is None:
         return False
@@ -178,7 +180,7 @@ def save_thread_brain(context_key: int, summary: dict) -> bool:
         return False
 
 # ============================================================
-# BUILD BRAIN PROMPT
+# BUILD THREAD BRAIN PROMPT
 # ============================================================
 def _build_thread_brain_prompt(context_key: int, recent_mem: List[dict]) -> str:
     lines = []
@@ -205,7 +207,7 @@ def _build_thread_brain_prompt(context_key: int, recent_mem: List[dict]) -> str:
 """.strip()
 
 # ============================================================
-# GENERATE BRAIN SUMMARY
+# GENERATE THREAD BRAIN (patched)
 # ============================================================
 from openai import OpenAI
 from config import OPENAI_API_KEY
@@ -246,6 +248,14 @@ def generate_thread_brain(context_key: int, recent_mem: List[dict]) -> Optional[
         print("[thread_brain JSON error]", repr(e))
         return None
 
+    # ============================================================
+    # PATCH: 必ず meta を補完する（KeyError 防止）
+    # ============================================================
+    if "meta" not in summary or not isinstance(summary["meta"], dict):
+        summary["meta"] = {}
+
+    summary["meta"].setdefault("version", "1.0")
     summary["meta"]["context_key"] = context_key
     summary["meta"]["updated_at"] = datetime.now(timezone.utc).isoformat()
+
     return summary
