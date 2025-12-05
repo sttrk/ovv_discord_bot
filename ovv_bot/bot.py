@@ -1,4 +1,4 @@
-# ovv_bot/bot.py
+# ovv_bot/bot.py  (September Stable Edition – Phase 2-A)
 import os
 import json
 import discord
@@ -15,12 +15,12 @@ from notion_client import Client
 from debug.debug_router import route_debug_message
 
 # ============================================================
-# PostgreSQL MODULE IMPORT（絶対に from-import しない）
+# PostgreSQL MODULE IMPORT（絶対 from-import しない）
 # ============================================================
 import database.pg as db_pg
 
 # ============================================================
-# Notion Module Import（完全外部化）
+# Notion CRUD 外部化
 # ============================================================
 from notion.notion_api import (
     create_task,
@@ -30,12 +30,7 @@ from notion.notion_api import (
 )
 
 # ============================================================
-# OVV CALL IMPORT（新設）
-# ============================================================
-from ovv.ovv_call import call_ovv   # ← ここが今回の重要変更ポイント
-
-# ============================================================
-# Environment Variables
+# Environment
 # ============================================================
 from config import (
     DISCORD_BOT_TOKEN,
@@ -55,16 +50,12 @@ db_pg.init_db(conn)
 
 log_audit = db_pg.log_audit
 
-# ============================================================
-# Runtime Memory（PG に完全外部化）
-# ============================================================
+# Runtime Memory proxy
 load_runtime_memory = db_pg.load_runtime_memory
 save_runtime_memory = db_pg.save_runtime_memory
 append_runtime_memory = db_pg.append_runtime_memory
 
-# ============================================================
-# Thread Brain（PG に完全外部化）
-# ============================================================
+# Thread Brain proxy
 load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
@@ -73,6 +64,8 @@ generate_thread_brain = db_pg.generate_thread_brain
 # Ovv Core Loader
 # ============================================================
 from ovv.core_loader import load_core, load_external
+from ovv.ovv_call import call_ovv   # ← 新 ovv_call を正式使用
+
 OVV_CORE = load_core()
 OVV_EXTERNAL = load_external()
 
@@ -116,9 +109,8 @@ def is_task_channel(message: discord.Message) -> bool:
         return parent.name.lower().startswith("task_") if parent else False
     return ch.name.lower().startswith("task_")
 
-
 # ============================================================
-# on_message（DEBUG HOOK → Ovv ルーティング）
+# on_message（DEBUG HOOK → Memory → Ovv）
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
@@ -137,11 +129,10 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Thread Context Key
+    # ===== Memory update =====
     ck = get_context_key(message)
     session_id = str(ck)
 
-    # Runtime Memory 追記
     append_runtime_memory(
         session_id,
         "user",
@@ -151,36 +142,26 @@ async def on_message(message: discord.Message):
 
     mem = load_runtime_memory(session_id)
 
-    # Thread Brain 更新（task_ 系のみ）
+    # ===== Thread Brain update =====
     if is_task_channel(message):
         summary = generate_thread_brain(ck, mem)
         if summary:
             save_thread_brain(ck, summary)
 
-    # ========================================================
-    # Ovv Core Call（今回の変更点：完全外部化 call_ovv を利用）
-    # ========================================================
+    # ===== Ovv Core Call (完全外部化版) =====
     ans = call_ovv(
         openai_client=openai_client,
         system_prompt=SYSTEM_PROMPT,
-        core=OVV_CORE,
-        external=OVV_EXTERNAL,
-        recent_mem=mem,
+        core_text=OVV_CORE,
+        external_text=OVV_EXTERNAL,
         context_key=ck,
-        user_text=message.content,
+        text=message.content,
+        recent_mem=mem,
+        append_runtime_memory=append_runtime_memory,
+        log_audit=log_audit,
     )
 
-    if ans is None:
-        log_audit("openai_error", {"context_key": ck})
-        await message.channel.send("Ovv との通信中にエラーが発生しました。")
-        return
-
-    # メモリ保存（副作用）
-    append_runtime_memory(str(ck), "assistant", ans)
-    log_audit("assistant_reply", {"context_key": ck})
-
     await message.channel.send(ans)
-
 
 # ============================================================
 # Commands
@@ -227,30 +208,6 @@ async def test_thread(ctx):
 
     save_thread_brain(ck, summary)
     await ctx.send("test OK: summary saved")
-
-
-# ============================================================
-# Debug Context Injection（September Stable Required）
-# ============================================================
-from debug.debug_context import debug_context
-
-debug_context.pg_conn = db_pg.PG_CONN
-debug_context.notion = notion
-debug_context.openai_client = openai_client
-
-debug_context.load_mem = load_runtime_memory
-debug_context.save_mem = save_runtime_memory
-debug_context.append_mem = append_runtime_memory
-
-debug_context.brain_gen = generate_thread_brain
-debug_context.brain_load = load_thread_brain
-debug_context.brain_save = save_thread_brain
-
-debug_context.ovv_core = OVV_CORE
-debug_context.ovv_external = OVV_EXTERNAL
-debug_context.system_prompt = SYSTEM_PROMPT
-
-print("[DEBUG] context injection complete.")
 
 # ============================================================
 # Boot Complete
