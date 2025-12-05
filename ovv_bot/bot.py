@@ -27,10 +27,6 @@ notion = Client(auth=NOTION_API_KEY)
 # ============================================================
 import database.pg as db_pg
 
-
-# ============================================================
-# PostgreSQL Init
-# ============================================================
 print("=== [BOOT] Connecting PostgreSQL ===")
 conn = db_pg.pg_connect()
 db_pg.init_db(conn)
@@ -47,18 +43,43 @@ load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
 
+# ============================================================
+# Ovv Core 呼び出しレイヤ（PG 初期化後に読み込む）
+# ============================================================
+from ovv.ovv_call import (
+    call_ovv,
+    OVV_CORE,
+    OVV_EXTERNAL,
+    SYSTEM_PROMPT,
+)
 
 # ============================================================
-# Ovv Core 呼び出しレイヤ（これは PG 初期化後に読み込む）
+# Debug Context Injection（必須：debug_commands の cfg 用）
 # ============================================================
-from ovv.ovv_call import call_ovv
+from debug.debug_context import debug_context
 
+debug_context.pg_conn = db_pg.PG_CONN
+debug_context.notion = notion
+debug_context.openai_client = openai_client
+
+debug_context.load_mem = load_runtime_memory
+debug_context.save_mem = save_runtime_memory
+debug_context.append_mem = append_runtime_memory
+
+debug_context.brain_gen = generate_thread_brain
+debug_context.brain_load = load_thread_brain
+debug_context.brain_save = save_thread_brain
+
+debug_context.ovv_core = OVV_CORE
+debug_context.ovv_external = OVV_EXTERNAL
+debug_context.system_prompt = SYSTEM_PROMPT
+
+print("[DEBUG] debug_context injection complete.")
 
 # ============================================================
-# Debug Router（※必ず Ovv / PG / Notion 初期化後にロード）
+# Debug Router（※必ず context injection 後にロード）
 # ============================================================
 from debug.debug_router import route_debug_message
-
 
 # ============================================================
 # Notion CRUD（循環依存なし）
@@ -70,51 +91,10 @@ from notion.notion_api import (
     append_logs,
 )
 
-
 # ============================================================
-# Boot Log
+# Boot Log（debug_boot に一本化）
 # ============================================================
-BOOT_CHANNEL_ID = 1446060807044468756
-
-async def send_boot_log(bot: commands.Bot):
-    ch = bot.get_channel(BOOT_CHANNEL_ID)
-    ts = datetime.now(timezone.utc).isoformat()
-
-    ENV_OK = True
-    PG_OK = bool(db_pg.PG_CONN)
-    NOTION_OK = notion is not None
-    OPENAI_OK = openai_client is not None
-
-    CTX_OK = all([
-        load_runtime_memory,
-        save_runtime_memory,
-        append_runtime_memory,
-        load_thread_brain,
-        save_thread_brain,
-        generate_thread_brain,
-    ])
-
-    text = (
-        "Ovv Boot Summary\n\n"
-        "起動ログを報告します。\n\n"
-        "**ENV**\n"
-        f"{ENV_OK}\n\n"
-        "**PostgreSQL**\n"
-        f"{PG_OK}\n\n"
-        "**Notion**\n"
-        f"{NOTION_OK}\n\n"
-        "**OpenAI**\n"
-        f"{OPENAI_OK}\n\n"
-        "**Context Ready**\n"
-        f"{CTX_OK}\n\n"
-        f"`timestamp: {ts}`"
-    )
-
-    if ch:
-        await ch.send(text)
-    else:
-        print("[BOOT_LOG] Channel not found. Skip.")
-
+from debug.debug_boot import send_boot_message
 
 # ============================================================
 # Discord Setup
@@ -125,12 +105,11 @@ intents.message_content = True
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
-    help_command=None
+    help_command=None,
 )
 
-
 # ============================================================
-# Context Key
+# Context Key utilities
 # ============================================================
 def get_context_key(msg: discord.Message) -> int:
     ch = msg.channel
@@ -141,7 +120,6 @@ def get_context_key(msg: discord.Message) -> int:
     return (msg.guild.id << 32) | ch.id
 
 
-# Task channel?
 def is_task_channel(msg: discord.Message) -> bool:
     ch = msg.channel
     if isinstance(ch, discord.Thread):
@@ -151,35 +129,41 @@ def is_task_channel(msg: discord.Message) -> bool:
 
 
 # ============================================================
-# Event: on_ready
+# Event: on_ready（boot_log 送信）
 # ============================================================
 @bot.event
 async def on_ready():
     print("[READY] Bot connected as", bot.user)
-    await send_boot_log(bot)
+    # boot_log 送信は debug_boot 側に委譲
+    await send_boot_message(bot)
 
 
 # ============================================================
-# Event: on_message（Final Only 対応 Call → Filter）
+# Event: on_message（Final Only & system message filter）
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
 
+    # Bot 自身・他の Bot には反応しない
     if message.author.bot:
         return
 
-    # Debug Router
+    # スレッド作成通知など「通常メッセージ以外」には反応しない
+    if message.type is not discord.MessageType.default:
+        return
+
+    # ① Debug Router
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
-    # Command
+    # ② コマンド（! で始まるもの）
     if message.content.startswith("!"):
         log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # 通常メッセージ
+    # ③ 通常メッセージ → Ovv 推論
     ck = get_context_key(message)
     session_id = str(ck)
 
@@ -187,21 +171,21 @@ async def on_message(message: discord.Message):
         session_id,
         "user",
         message.content,
-        limit=40 if is_task_channel(message) else 12
+        limit=40 if is_task_channel(message) else 12,
     )
 
     mem = load_runtime_memory(session_id)
 
-    # Thread Brain 更新
+    # Task チャンネルでは thread_brain を更新
     if is_task_channel(message):
         summary = generate_thread_brain(ck, mem)
         if summary:
             save_thread_brain(ck, summary)
 
-    # Ovv Core 呼び出し（Final only）
+    # Ovv Core 呼び出し
     raw_ans = call_ovv(ck, message.content, mem)
 
-    # Final Only フィルタリング
+    # FINAL 以外を切り落とすフィルタ
     final_ans = raw_ans
     if "[FINAL]" in raw_ans:
         final_ans = raw_ans.split("[FINAL]", 1)[1].strip()
