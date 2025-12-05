@@ -1,11 +1,13 @@
 # ovv/ovv_call.py
-# Ovv Call Layer - September Stable Edition (FINAL-only)
+# Ovv Core Call Layer - Thread Brain Injection 対応版（A-2 完成）
 
 from typing import List
 from openai import OpenAI
-
 from config import OPENAI_API_KEY
+
 from ovv.core_loader import load_core, load_external
+from ovv.threadbrain_adapter import build_tb_prompt
+from database.pg import load_thread_brain
 
 # ============================================================
 # Load Core / External
@@ -42,49 +44,32 @@ SYSTEM_PROMPT = f"""
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-
 # ============================================================
-# Helper: FINAL 部だけを抽出
-# ============================================================
-
-def _extract_final(text: str) -> str:
-    """
-    Ovv Core が [FINAL] や【FINAL】を含む場合、
-    FINAL セクションのみを返す。
-    なければ text 全体を返す（後方互換）。
-    """
-    if not text:
-        return text
-
-    markers = ["[FINAL]", "【FINAL】", "[ Final ]", "[FINAL OUTPUT]"]
-    idx = -1
-    for m in markers:
-        pos = text.find(m)
-        if pos != -1:
-            idx = pos + len(m)
-            break
-
-    if idx == -1:
-        return text.strip()
-
-    return text[idx:].strip()
-
-
-# ============================================================
-# call_ovv: Ovv Main Logic (DB には一切依存しない)
+# call_ovv: Ovv Core 推論
 # ============================================================
 
 def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
-    """
-    - PG や Notion には一切触れない「純粋な推論レイヤ」
-    - メモリ・監査は呼び出し側（bot.py）が責務を持つ
-    """
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "assistant", "content": OVV_CORE},
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
+    # --------------------------------------------------------
+    # A-2: Thread Brain summary を推論に注入
+    # --------------------------------------------------------
+    tb_summary = load_thread_brain(context_key)
+    tb_prompt = build_tb_prompt(tb_summary)
+
+    if tb_prompt:
+        msgs.append({
+            "role": "assistant",
+            "content": f"[Thread Brain]\n{tb_prompt}"
+        })
+
+    # --------------------------------------------------------
+    # Recent Memory 注入
+    # --------------------------------------------------------
     for m in recent_mem[-20:]:
         msgs.append({"role": m["role"], "content": m["content"]})
 
@@ -96,9 +81,7 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
             messages=msgs,
             temperature=0.7,
         )
-        raw = res.choices[0].message.content.strip()
-        final = _extract_final(raw)
-        return final[:1900]
+        return res.choices[0].message.content.strip()[:1900]
 
     except Exception as e:
         print("[call_ovv error]", repr(e))
