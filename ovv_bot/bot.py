@@ -101,6 +101,29 @@ async def send_boot_log(bot: commands.Bot):
         print("[BOOT] boot_log channel not found")
 
 # ============================================================
+# Debug Context Injection（重要）
+# ============================================================
+from debug.debug_context import debug_context
+
+debug_context.pg_conn = db_pg.PG_CONN
+debug_context.notion = notion
+debug_context.openai_client = openai_client
+
+debug_context.load_mem = load_runtime_memory
+debug_context.save_mem = save_runtime_memory
+debug_context.append_mem = append_runtime_memory
+
+debug_context.brain_gen = generate_thread_brain
+debug_context.brain_load = load_thread_brain
+debug_context.brain_save = save_thread_brain
+
+debug_context.ovv_core = None  # A-3では未使用
+debug_context.ovv_external = None
+debug_context.system_prompt = None
+
+print("[DEBUG] context injection complete.")
+
+# ============================================================
 # Discord Setup
 # ============================================================
 intents = discord.Intents.default()
@@ -218,3 +241,4 @@ async def test_thread(ctx):
 # ============================================================
 print("[BOOT] Starting Discord Bot")
 bot.run(DISCORD_BOT_TOKEN)
+
