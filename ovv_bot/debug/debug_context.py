@@ -1,23 +1,20 @@
+# debug/debug_context.py
+
 class DebugContext:
-    def __init__(self):
-        self.pg_conn = None
-        self.notion = None
-        self.openai_client = None
+    pg_conn = None
+    notion = None
+    openai_client = None
 
-        # memory functions
-        self.load_mem = None
-        self.save_mem = None
-        self.append_mem = None
+    load_mem = None
+    save_mem = None
+    append_mem = None
 
-        # brain functions
-        self.brain_gen = None
-        self.brain_load = None
-        self.brain_save = None
+    brain_gen = None
+    brain_load = None
+    brain_save = None
 
-        # core / llm system
-        self.ovv_core = None
-        self.ovv_external = None
-        self.system_prompt = None
-
+    ovv_core = None
+    ovv_external = None
+    system_prompt = None
 
 debug_context = DebugContext()
