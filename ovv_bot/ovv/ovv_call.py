@@ -1,60 +1,70 @@
-# ovv_call/call_ovv.py
+# ovv/ovv_call.py
 import json
 from typing import List
+from datetime import datetime, timezone
 
+def call_ovv(
+    *,
+    openai_client,
+    system_prompt: str,
+    core_text: str,
+    external_text: str,
+    context_key: int,
+    text: str,
+    recent_mem: List[dict],
+    append_runtime_memory,
+    log_audit,
+):
+    """
+    Ovv 呼び出しの純粋関数化バージョン。
+    bot.py から依存を全て注入して使う。
 
-def build_messages(system_prompt: str, core: str, external: str, recent_mem: List[dict], user_text: str):
+    - openai_client : OpenAI client instance
+    - system_prompt : SYSTEM_PROMPT (Soft-Core入り)
+    - core_text     : OVV_CORE の文字列
+    - external_text : OVV_EXTERNAL の文字列
+    - context_key   : thread / channel ごとの ID
+    - text          : ユーザーからのメッセージ
+    - recent_mem    : 過去20件のメモリ
+    - append_runtime_memory : メモリ保存関数
+    - log_audit     : 監査ログ関数
     """
-    Ovv のメッセージ構造を生成する純関数。
-    副作用なし。
-    """
+
     msgs = [
         {"role": "system", "content": system_prompt},
-        {"role": "assistant", "content": core},
-        {"role": "assistant", "content": external},
+        {"role": "assistant", "content": core_text},
+        {"role": "assistant", "content": external_text},
     ]
 
-    # 過去メモリ（最大20）
+    # 過去ログを Ovv に注入
     for m in recent_mem[-20:]:
         msgs.append({"role": m["role"], "content": m["content"]})
 
-    msgs.append({"role": "user", "content": user_text})
-
-    return msgs
-
-
-def call_ovv(
-    openai_client,
-    system_prompt: str,
-    core: str,
-    external: str,
-    recent_mem: List[dict],
-    context_key: int,
-    user_text: str,
-    temperature: float = 0.7,
-):
-    """
-    Ovv の LLM 呼び出しロジック。
-    副作用（メモリ保存・audit_log）は発生させない。
-    返すのは「アシスタントの返答文字列」だけ。
-    """
-
-    msgs = build_messages(system_prompt, core, external, recent_mem, user_text)
+    msgs.append({"role": "user", "content": text})
 
     try:
         res = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=msgs,
-            temperature=temperature,
+            temperature=0.7,
         )
 
         ans = res.choices[0].message.content.strip()
 
-        # Discord の最大長にトリム
+        append_runtime_memory(str(context_key), "assistant", ans)
+
+        log_audit("assistant_reply", {
+            "context_key": context_key,
+            "length": len(ans)
+        })
+
         return ans[:1900]
 
     except Exception as e:
-        # 呼び出し元で audit_log を書けるように例外を返す
-        return None, e
 
-    return ans
+        log_audit("openai_error", {
+            "context_key": context_key,
+            "error": repr(e)
+        })
+
+        return "Ovv との通信中にエラーが発生しました。"
