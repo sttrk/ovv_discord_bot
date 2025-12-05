@@ -1,150 +1,159 @@
 # notion/notion_api.py
-import json
+# Notion CRUD Layer - Cycle-Free Stable Edition
+
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from notion_client import Client
-from config import (
-    NOTION_API_KEY,
-    NOTION_TASKS_DB_ID,
-    NOTION_SESSIONS_DB_ID,
-    NOTION_LOGS_DB_ID,
-)
 
-# Audit 用
-from database.pg import log_audit
+# ============================================================
+# Audit Injection（bot.py から注入される想定）
+# ============================================================
+log_audit = None  # bot.py 側で notion_api.log_audit = db_pg.log_audit する
 
-# Notion Client（モジュール単位で保持）
-notion = Client(auth=NOTION_API_KEY)
+# ============================================================
+# Notion Client（bot.py から注入）
+# ============================================================
+notion: Optional[Client] = None
+client: Optional[Client] = None  # 互換用（debug_boot が参照する可能性あり）
+
+
+def inject_notion_client(notion_client: Client):
+    """
+    bot.py から呼び出して Notion クライアントを注入する。
+    """
+    global notion, client
+    notion = notion_client
+    client = notion_client
 
 
 # ============================================================
-# 1. Create Task
+# create_task
 # ============================================================
+def create_task(db_id: str, name: str, goal: str, thread_id: int, channel_id: int):
+    """
+    Tasks DB にタスクページを 1 件作成する。
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-async def create_task(name: str, goal: str, thread_id: int, channel_id: int) -> Optional[str]:
-    now = datetime.now(timezone.utc).isoformat()
     try:
         page = notion.pages.create(
-            parent={"database_id": NOTION_TASKS_DB_ID},
+            parent={"database_id": db_id},
             properties={
                 "name": {"title": [{"text": {"content": name}}]},
                 "goal": {"rich_text": [{"text": {"content": goal}}]},
                 "status": {"select": {"name": "active"}},
                 "thread_id": {"rich_text": [{"text": {"content": str(thread_id)}}]},
                 "channel_id": {"rich_text": [{"text": {"content": str(channel_id)}}]},
-                "created_at": {"date": {"start": now}},
-                "updated_at": {"date": {"start": now}},
+                "created_at": {"date": {"start": now_iso}},
+                "updated_at": {"date": {"start": now_iso}},
             },
         )
         return page["id"]
 
     except Exception as e:
-        log_audit("notion_error", {
-            "op": "create_task",
-            "error": repr(e),
-            "name": name,
-            "goal": goal,
-        })
+        if log_audit:
+            log_audit("notion_error", {
+                "op": "create_task",
+                "name": name,
+                "error": repr(e),
+            })
         return None
 
 
 # ============================================================
-# 2. Start Session
+# start_session
 # ============================================================
+def start_session(db_id: str, task_id: str, name: str, thread_id: int):
+    """
+    Sessions DB にセッションページを 1 件作成する。
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-async def start_session(task_id: str, name: str, thread_id: int) -> Optional[str]:
-    now = datetime.now(timezone.utc)
     try:
         page = notion.pages.create(
-            parent={"database_id": NOTION_SESSIONS_DB_ID},
+            parent={"database_id": db_id},
             properties={
                 "name": {"title": [{"text": {"content": name}}]},
                 "task_id": {"relation": [{"id": task_id}]},
                 "status": {"select": {"name": "active"}},
                 "thread_id": {"rich_text": [{"text": {"content": str(thread_id)}}]},
-                "start_time": {"date": {"start": now.isoformat()}},
-                "created_at": {"date": {"start": now.isoformat()}},
-                "updated_at": {"date": {"start": now.isoformat()}},
+                "start_time": {"date": {"start": now_iso}},
+                "created_at": {"date": {"start": now_iso}},
+                "updated_at": {"date": {"start": now_iso}},
             },
         )
         return page["id"]
 
     except Exception as e:
-        log_audit("notion_error", {
-            "op": "start_session",
-            "task_id": task_id,
-            "error": repr(e),
-        })
+        if log_audit:
+            log_audit("notion_error", {
+                "op": "start_session",
+                "task_id": task_id,
+                "error": repr(e),
+            })
         return None
 
 
 # ============================================================
-# 3. End Session
+# end_session
 # ============================================================
-
-async def end_session(session_id: str, summary: str) -> bool:
-    now = datetime.now(timezone.utc).isoformat()
+def end_session(page_id: str, summary: str):
+    """
+    セッション終了時に status / end_time / summary を更新する。
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     try:
         notion.pages.update(
-            page_id=session_id,
+            page_id=page_id,
             properties={
                 "status": {"select": {"name": "completed"}},
-                "end_time": {"date": {"start": now}},
+                "end_time": {"date": {"start": now_iso}},
                 "summary": {"rich_text": [{"text": {"content": summary[:2000]}}]},
-                "updated_at": {"date": {"start": now}},
+                "updated_at": {"date": {"start": now_iso}},
             },
         )
         return True
 
     except Exception as e:
-        log_audit("notion_error", {
-            "op": "end_session",
-            "session_id": session_id,
-            "error": repr(e),
-        })
+        if log_audit:
+            log_audit("notion_error", {
+                "op": "end_session",
+                "page_id": page_id,
+                "error": repr(e),
+            })
         return False
 
 
 # ============================================================
-# 4. Append Logs
+# append_logs
 # ============================================================
-
-async def append_logs(session_id: str, logs: List[dict]) -> bool:
+def append_logs(db_id: str, session_id: str, logs: List[Dict]):
+    """
+    Logs DB にログページを複数行追加する。
+    logs: {author, content, created_at} のリスト
+    """
     try:
         for log in logs:
             notion.pages.create(
-                parent={"database_id": NOTION_LOGS_DB_ID},
+                parent={"database_id": db_id},
                 properties={
                     "_ignore": {"title": [{"text": {"content": "log"}}]},
                     "session_id": {"relation": [{"id": session_id}]},
                     "author": {"rich_text": [{"text": {"content": log["author"]}}]},
                     "content": {"rich_text": [{"text": {"content": log["content"][:2000]}}]},
                     "created_at": {"date": {"start": log["created_at"]}},
-                    "discord_message_id": {"rich_text": [{"text": {"content": log["id"]}}]},
                 },
             )
         return True
 
     except Exception as e:
-        log_audit("notion_error", {
-            "op": "append_logs",
-            "session_id": session_id,
-            "count": len(logs),
-            "error": repr(e),
-        })
+        if log_audit:
+            log_audit("notion_error", {
+                "op": "append_logs",
+                "session_id": session_id,
+                "log_count": len(logs),
+                "error": repr(e),
+            })
         return False
-
-
-# ============================================================
-# 5. Debug Helpers
-# ============================================================
-
-def notion_health() -> str:
-    """デバッグ用：Notion API が生きているか軽くチェック"""
-    try:
-        users = notion.users.list()
-        return f"OK ({len(users.get('results', []))} users)"
-    except Exception as e:
-        return f"FAIL ({repr(e)})"
