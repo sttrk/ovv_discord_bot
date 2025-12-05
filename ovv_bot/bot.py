@@ -1,4 +1,4 @@
-# bot.py - Ovv Discord Bot (Stable Full Edition A4-R3 + Interface_Box v1.0)
+# bot.py - Ovv Discord Bot (Stable Full Edition A4-R3 + BIS A5-Minimal)
 
 import os
 import json
@@ -57,6 +57,11 @@ from ovv.ovv_call import (
 # Interface Box（BIS: B → I → Ovv → S）
 # ============================================================
 from ovv.interface_box import build_input_packet
+
+# ============================================================
+# Stabilizer（BIS: 最終出力安定化）
+# ============================================================
+from ovv.stabilizer import stabilize_output
 
 # ============================================================
 # Debug Context Injection（必須：debug_commands の cfg 用）
@@ -144,7 +149,7 @@ async def on_ready():
 
 
 # ============================================================
-# Event: on_message（Final Only & system message filter）
+# Event: on_message（B → I → Ovv → S）
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
@@ -168,11 +173,11 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # ③ 通常メッセージ → B (Boundary_Gate) → I (Interface_Box) → Ovv → S (Stabilizer 相当)
+    # ③ 通常メッセージ → B (Boundary_Gate) → I (Interface_Box) → Ovv → S (Stabilizer)
     ck = get_context_key(message)
     session_id = str(ck)
 
-    # Runtime memory へ user メッセージを追加
+    # B: Runtime memory へ user メッセージを追加
     append_runtime_memory(
         session_id,
         "user",
@@ -189,7 +194,7 @@ async def on_message(message: discord.Message):
         if summary:
             save_thread_brain(ck, summary)
 
-    # Interface_Box: InputPacket を構築（ここが「I」）
+    # I: Interface_Box で InputPacket を構築
     packet = build_input_packet(
         context_key=ck,
         user_text=message.content,
@@ -197,7 +202,7 @@ async def on_message(message: discord.Message):
         task_mode=task_mode,
     )
 
-    # Ovv Core 呼び出し（state_hint を渡す）
+    # Ovv: コア呼び出し（state_hint を渡す）
     raw_ans = call_ovv(
         ck,
         packet["user_text"],
@@ -205,10 +210,8 @@ async def on_message(message: discord.Message):
         state_hint=packet.get("state_hint"),
     )
 
-    # FINAL 以外を切り落とすフィルタ（簡易 Stabilizer）
-    final_ans = raw_ans
-    if "[FINAL]" in raw_ans:
-        final_ans = raw_ans.split("[FINAL]", 1)[1].strip()
+    # S: Stabilizer で [FINAL] 抽出＋truncate
+    final_ans = stabilize_output(raw_ans)
 
     await message.channel.send(final_ans)
 
