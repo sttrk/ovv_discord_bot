@@ -1,17 +1,17 @@
-# bot.py - Ovv Discord Bot (BIS Applied / Stable Full Edition A5-Entry)
+# bot.py - Ovv Discord Bot (Stable Full Edition A4-R3 + Interface_Box v1.0)
 
 import os
 import json
+import discord
+from discord.ext import commands
 from datetime import datetime, timezone
 from typing import List
 
-import discord
-from discord.ext import commands
 from openai import OpenAI
 from notion_client import Client
 
 # ============================================================
-# 0. Environment / Config
+# Environment Variables
 # ============================================================
 from config import (
     DISCORD_BOT_TOKEN,
@@ -23,7 +23,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
-# 1. PostgreSQL Layer（絶対に from-import しない）
+# PostgreSQL Module（絶対に from-import しない）
 # ============================================================
 import database.pg as db_pg
 
@@ -38,13 +38,13 @@ load_runtime_memory = db_pg.load_runtime_memory
 save_runtime_memory = db_pg.save_runtime_memory
 append_runtime_memory = db_pg.append_runtime_memory
 
-# Thread Brain proxy
+# Thread Brain
 load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
 
 # ============================================================
-# 2. Ovv Core Call Layer
+# Ovv Core 呼び出しレイヤ（PG 初期化後に読み込む）
 # ============================================================
 from ovv.ovv_call import (
     call_ovv,
@@ -54,7 +54,12 @@ from ovv.ovv_call import (
 )
 
 # ============================================================
-# 3. Debug Context Injection（debug_commands 用）
+# Interface Box（BIS: B → I → Ovv → S）
+# ============================================================
+from ovv.interface_box import build_input_packet
+
+# ============================================================
+# Debug Context Injection（必須：debug_commands の cfg 用）
 # ============================================================
 from debug.debug_context import debug_context
 
@@ -74,18 +79,15 @@ debug_context.ovv_core = OVV_CORE
 debug_context.ovv_external = OVV_EXTERNAL
 debug_context.system_prompt = SYSTEM_PROMPT
 
-# dbg_raw などから直接 Ovv を叩くため
-debug_context.ovv_call = call_ovv
-
 print("[DEBUG] debug_context injection complete.")
 
 # ============================================================
-# 4. Debug Router（必ず context injection 後にロード）
+# Debug Router（※必ず context injection 後にロード）
 # ============================================================
 from debug.debug_router import route_debug_message
 
 # ============================================================
-# 5. Notion CRUD（循環依存なし）
+# Notion CRUD（循環依存なし）
 # ============================================================
 from notion.notion_api import (
     create_task,
@@ -95,12 +97,12 @@ from notion.notion_api import (
 )
 
 # ============================================================
-# 6. Boot Log（起動時ステータス）
+# Boot Log（debug_boot に一本化）
 # ============================================================
 from debug.debug_boot import send_boot_message
 
 # ============================================================
-# 7. Discord Bot Setup
+# Discord Setup
 # ============================================================
 intents = discord.Intents.default()
 intents.message_content = True
@@ -112,14 +114,9 @@ bot = commands.Bot(
 )
 
 # ============================================================
-# 8. BIS: Boundary Gate Utilities
+# Context Key utilities
 # ============================================================
 def get_context_key(msg: discord.Message) -> int:
-    """
-    チャンネル or スレッド単位の一意キー。
-    DM はチャンネル ID をそのまま使用。
-    Guild 内テキストは (guild_id << 32) | channel_id。
-    """
     ch = msg.channel
     if isinstance(ch, discord.Thread):
         return ch.id
@@ -129,156 +126,96 @@ def get_context_key(msg: discord.Message) -> int:
 
 
 def is_task_channel(msg: discord.Message) -> bool:
-    """
-    task_ プレフィックス付きチャンネル / スレッドをタスクチャネルとみなす。
-    """
     ch = msg.channel
     if isinstance(ch, discord.Thread):
         parent = ch.parent
-        return bool(parent and parent.name.lower().startswith("task_"))
+        return parent and parent.name.lower().startswith("task_")
     return ch.name.lower().startswith("task_")
 
 
 # ============================================================
-# 9. BIS: Interface Box（Discord → Ovv 入力整形）
+# Event: on_ready（boot_log 送信）
 # ============================================================
-def build_ovv_input(message: discord.Message):
-    """
-    Discord メッセージから Ovv 呼び出しに必要な情報をまとめる。
-    - runtime_memory の更新
-    - task_ch なら thread_brain の更新
-    戻り値: (context_key, user_text, recent_mem)
-    """
-    ck = get_context_key(message)
-    session_id = str(ck)
-    user_text = message.content
-
-    # Runtime memory に user 発話を追記
-    append_runtime_memory(
-        session_id,
-        "user",
-        user_text,
-        limit=40 if is_task_channel(message) else 12,
-    )
-
-    # 直近メモリを取得
-    mem = load_runtime_memory(session_id)
-
-    # Task チャンネルでは Thread Brain を更新（要約）
-    if is_task_channel(message):
-        try:
-            summary = generate_thread_brain(ck, mem)
-            if summary:
-                save_thread_brain(ck, summary)
-        except Exception as e:
-            print("[InterfaceBox] thread_brain update error:", repr(e))
-
-    return ck, user_text, mem
-
-
-# ============================================================
-# 10. BIS: Stabilizer（Ovv 出力 → Discord 返信用整形）
-# ============================================================
-def stabilize_output(raw: str) -> str:
-    """
-    Ovv からの生テキストを Discord に安全に返せる形に整形。
-    ルール:
-      - [FINAL] があればその後ろだけを返す
-      - 無ければ全文を返す
-      - 空になった場合はフォールバックメッセージ
-      - 2000 文字制限を考慮して 1900 文字付近で truncate
-    """
-    if raw is None:
-        return "Ovv コア処理中にエラーが発生しました。少し時間をおいて再度お試しください。"
-
-    text = raw.strip()
-    if "[FINAL]" in text:
-        # 最初の [FINAL] 以降だけ採用
-        text = text.split("[FINAL]", 1)[1].strip()
-
-    if not text:
-        # Thread Brain 上は動いているのに空になるケースの安全弁
-        return "了解しました。続きがあれば、もう一度具体的に指示をください。"
-
-    if len(text) > 1900:
-        text = text[:1900] + "\n...[truncated]"
-
-    return text
-
-
-# ============================================================
-# 11. Events
-# ============================================================
-
 @bot.event
 async def on_ready():
     print("[READY] Bot connected as", bot.user)
-    # 起動時ステータスを boot_log チャンネルへ
+    # boot_log 送信は debug_boot 側に委譲
     await send_boot_message(bot)
 
 
+# ============================================================
+# Event: on_message（Final Only & system message filter）
+# ============================================================
 @bot.event
 async def on_message(message: discord.Message):
 
-    # --------------------------------------------------------
-    # Boundary Gate: 入口フィルタ
-    # --------------------------------------------------------
-    # Bot 自身・他 Bot には反応しない
+    # Bot 自身・他の Bot には反応しない
     if message.author.bot:
         return
 
-    # スレッド作成通知などのシステムメッセージには反応しない
+    # スレッド作成通知など「通常メッセージ以外」には反応しない
     if message.type is not discord.MessageType.default:
         return
 
-    # --------------------------------------------------------
-    # Debug Router
-    # --------------------------------------------------------
+    # ① Debug Router
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
-    # --------------------------------------------------------
-    # Commands（! で始まるもの）
-    # --------------------------------------------------------
+    # ② コマンド（! で始まるもの）
     if message.content.startswith("!"):
         log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # --------------------------------------------------------
-    # 通常メッセージ → BIS: I → Ovv → S
-    # --------------------------------------------------------
-    try:
-        # I: Interface Box
-        ck, user_text, recent_mem = build_ovv_input(message)
+    # ③ 通常メッセージ → B (Boundary_Gate) → I (Interface_Box) → Ovv → S (Stabilizer 相当)
+    ck = get_context_key(message)
+    session_id = str(ck)
 
-        # Ovv Core 呼び出し
-        raw_ans = call_ovv(ck, user_text, recent_mem)
+    # Runtime memory へ user メッセージを追加
+    append_runtime_memory(
+        session_id,
+        "user",
+        message.content,
+        limit=40 if is_task_channel(message) else 12,
+    )
 
-        # S: Stabilizer
-        final_ans = stabilize_output(raw_ans)
+    mem = load_runtime_memory(session_id)
 
-        await message.channel.send(final_ans)
+    # Task チャンネルでは thread_brain を更新
+    task_mode = is_task_channel(message)
+    if task_mode:
+        summary = generate_thread_brain(ck, mem)
+        if summary:
+            save_thread_brain(ck, summary)
 
-    except Exception as e:
-        print("[on_message error]", repr(e))
-        try:
-            log_audit("on_message_error", {
-                "error": repr(e),
-                "content": message.content[:500],
-            })
-        except Exception:
-            pass
-        await message.channel.send(
-            "Ovv 処理中に予期しないエラーが発生しました。少し時間をおいて再度お試しください。"
-        )
+    # Interface_Box: InputPacket を構築（ここが「I」）
+    packet = build_input_packet(
+        context_key=ck,
+        user_text=message.content,
+        recent_mem=mem,
+        task_mode=task_mode,
+    )
+
+    # Ovv Core 呼び出し（state_hint を渡す）
+    raw_ans = call_ovv(
+        ck,
+        packet["user_text"],
+        packet["recent_mem"],
+        state_hint=packet.get("state_hint"),
+    )
+
+    # FINAL 以外を切り落とすフィルタ（簡易 Stabilizer）
+    final_ans = raw_ans
+    if "[FINAL]" in raw_ans:
+        final_ans = raw_ans.split("[FINAL]", 1)[1].strip()
+
+    await message.channel.send(final_ans)
 
 
 # ============================================================
-# 12. Commands
+# Commands
 # ============================================================
-
 @bot.command(name="ping")
 async def ping(ctx):
     await ctx.send("pong")
@@ -286,9 +223,6 @@ async def ping(ctx):
 
 @bot.command(name="br")
 async def brain_regen(ctx):
-    """
-    現在コンテキストの runtime_memory から thread_brain を再生成。
-    """
     ck = get_context_key(ctx.message)
     mem = load_runtime_memory(str(ck))
     summary = generate_thread_brain(ck, mem)
@@ -302,9 +236,6 @@ async def brain_regen(ctx):
 
 @bot.command(name="bs")
 async def brain_show(ctx):
-    """
-    現在コンテキストの thread_brain を JSON で表示。
-    """
     ck = get_context_key(ctx.message)
     summary = load_thread_brain(ck)
 
@@ -321,9 +252,6 @@ async def brain_show(ctx):
 
 @bot.command(name="tt")
 async def test_thread(ctx):
-    """
-    runtime_memory → thread_brain → 保存までをテスト。
-    """
     ck = get_context_key(ctx.message)
     mem = load_runtime_memory(str(ck))
     summary = generate_thread_brain(ck, mem)
@@ -337,7 +265,7 @@ async def test_thread(ctx):
 
 
 # ============================================================
-# 13. Run
+# Run
 # ============================================================
 print("[BOOT] Starting Discord Bot")
 bot.run(DISCORD_BOT_TOKEN)
