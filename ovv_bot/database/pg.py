@@ -1,258 +1,293 @@
-# ==============================================
-# database/pg.py - JST対応版（Ovv Official）
-# ==============================================
+# bot.py - Ovv Discord Bot (September Stable + JST Boot Log)
 
+import os
 import json
-from typing import Optional, List
-import psycopg2
-import psycopg2.extras
-from config import POSTGRES_URL
-
-# ----------------------------------------------
-# JST 時刻生成
-# ----------------------------------------------
 from datetime import datetime, timedelta, timezone
+from typing import List
+
+import discord
+from discord.ext import commands
+from notion_client import Client
+
+# ============================================================
+# DEBUG HOOK
+# ============================================================
+from debug.debug_router import route_debug_message
+from debug.debug_context import debug_context
+
+# ============================================================
+# PostgreSQL MODULE（必ず module import）
+# ============================================================
+import database.pg as db_pg
+
+# ============================================================
+# Notion API（CRUD は外部モジュール）
+# ============================================================
+from notion.notion_api import (
+    create_task,
+    start_session,
+    end_session,
+    append_logs,
+)
+
+# ============================================================
+# Ovv Core / Call Layer
+# ============================================================
+from ovv.ovv_call import (
+    call_ovv,
+    OVV_CORE,
+    OVV_EXTERNAL,
+    SYSTEM_PROMPT,
+    openai_client,
+)
+
+# ============================================================
+# Environment
+# ============================================================
+from config import (
+    DISCORD_BOT_TOKEN,
+    NOTION_API_KEY,
+)
+
+print("=== [BOOT] Loading environment variables ===")
+
+# Notion クライアント（Debug 用に保持）
+notion = Client(auth=NOTION_API_KEY)
+
+# ============================================================
+# PostgreSQL Connect + Init
+# ============================================================
+print("=== [BOOT] Connecting PostgreSQL ===")
+conn = db_pg.pg_connect()
+db_pg.init_db(conn)
+
+# ============================================================
+# JST Helper
+# ============================================================
 JST = timezone(timedelta(hours=9))
-def now_jst():
+
+
+def now_jst() -> datetime:
     return datetime.now(JST)
 
-# ----------------------------------------------
-# Globals
-# ----------------------------------------------
-PG_CONN = None
-AUDIT_READY = False
+
+# ============================================================
+# Discord Setup
+# ============================================================
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+BOOT_LOG_CHANNEL_ID = 1446060807044468756  # #boot_log
+
+
+def get_context_key(msg: discord.Message) -> int:
+    ch = msg.channel
+    if isinstance(ch, discord.Thread):
+        return ch.id
+    if msg.guild is None:
+        return ch.id
+    return (msg.guild.id << 32) | ch.id
+
+
+def is_task_channel(message: discord.Message) -> bool:
+    ch = message.channel
+    if isinstance(ch, discord.Thread):
+        parent = ch.parent
+        return parent.name.lower().startswith("task_") if parent else False
+    return ch.name.lower().startswith("task_")
 
 
 # ============================================================
-# pg_connect
+# Boot Log（JST 対応 / 埋め込み形式）
 # ============================================================
-def pg_connect():
-    """
-    PostgreSQL への接続を確立し、PG_CONN をセットする。
-    """
-    global PG_CONN
-    print("=== [PG] Connecting ===")
-
-    if not POSTGRES_URL:
-        print("[PG] POSTGRES_URL missing")
-        PG_CONN = None
-        return None
-
-    try:
-        conn = psycopg2.connect(POSTGRES_URL)
-        conn.autocommit = True
-        PG_CONN = conn
-        print("[PG] Connected OK")
-        return conn
-    except Exception as e:
-        print("[PG] Connection failed:", repr(e))
-        PG_CONN = None
-        return None
-
-
-# ============================================================
-# init_db（JST版）
-# ============================================================
-def init_db(conn):
-    global AUDIT_READY
-    print("=== [PG] init_db() ===")
-
-    if conn is None:
-        AUDIT_READY = False
+async def send_boot_log_embed(bot_client: discord.Client):
+    channel = bot_client.get_channel(BOOT_LOG_CHANNEL_ID)
+    if channel is None:
+        # Render 側で確認できるログ
+        print(f"[BOOT] boot_log channel not found (id={BOOT_LOG_CHANNEL_ID})")
         return
 
+    # ENV チェック
+    env_keys = [
+        "DISCORD_BOT_TOKEN",
+        "OPENAI_API_KEY",
+        "NOTION_API_KEY",
+        "NOTION_TASKS_DB_ID",
+        "NOTION_SESSIONS_DB_ID",
+        "NOTION_LOGS_DB_ID",
+        "POSTGRES_URL",
+    ]
+    env_ok = all(os.getenv(k) for k in env_keys)
+
+    pg_ok = bool(db_pg.PG_CONN)
+    notion_ok = notion is not None
+    openai_ok = openai_client is not None
+    context_ready = env_ok and pg_ok and notion_ok and openai_ok
+
+    embed = discord.Embed(
+        title="Ovv Boot Summary",
+        description="起動ログを報告します。",
+    )
+
+    embed.add_field(name="ENV", value=str(env_ok), inline=False)
+    embed.add_field(name="PostgreSQL", value=str(pg_ok), inline=False)
+    embed.add_field(name="Notion", value=str(notion_ok), inline=False)
+    embed.add_field(name="OpenAI", value=str(openai_ok), inline=False)
+    embed.add_field(name="Context Ready", value=str(context_ready), inline=False)
+
+    # 表示上は変えず、内部の timestamp だけ JST にする
+    embed.timestamp = now_jst()
+
     try:
-        cur = conn.cursor()
-
-        # JST を使うため DEFAULT NOW() は撤廃
-        cur.execute("""
-            CREATE SCHEMA IF NOT EXISTS ovv;
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS ovv.runtime_memory (
-                session_id TEXT PRIMARY KEY,
-                memory_json JSONB NOT NULL,
-                updated_at TIMESTAMP WITH TIME ZONE NOT NULL
-            );
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS ovv.audit_log (
-                id SERIAL PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                details JSONB,
-                created_at TIMESTAMP WITH TIME ZONE NOT NULL
-            );
-        """)
-
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS ovv.thread_brain (
-                context_key BIGINT PRIMARY KEY,
-                summary JSONB NOT NULL,
-                updated_at TIMESTAMP WITH TIME ZONE NOT NULL
-            );
-        """)
-
-        cur.close()
-        AUDIT_READY = True
-        print("[PG] init_db OK")
-
+        await channel.send(embed=embed)
     except Exception as e:
-        print("[PG] init_db ERROR:", repr(e))
-        AUDIT_READY = False
+        print("[BOOT] failed to send boot_log embed:", repr(e))
+
+
+@bot.event
+async def on_ready():
+    print(f"[BOOT] Logged in as {bot.user} (id={bot.user.id})")
+    # Boot Log を 1 回だけ送信
+    try:
+        await send_boot_log_embed(bot)
+    except Exception as e:
+        print("[BOOT] boot_log send error:", repr(e))
 
 
 # ============================================================
-# audit_log（JST版）
+# Runtime Memory / Thread Brain (db_pg Proxy)
 # ============================================================
-def log_audit(event_type: str, details: Optional[dict] = None):
-    if details is None:
-        details = {}
+load_runtime_memory = db_pg.load_runtime_memory
+save_runtime_memory = db_pg.save_runtime_memory
+append_runtime_memory = db_pg.append_runtime_memory
 
-    print(f"[AUDIT] {event_type} :: {details}")
+load_thread_brain = db_pg.load_thread_brain
+save_thread_brain = db_pg.save_thread_brain
+generate_thread_brain = db_pg.generate_thread_brain
 
-    if not AUDIT_READY or PG_CONN is None:
+
+# ============================================================
+# on_message（DEBUG → Commands → Ovv）
+# ============================================================
+@bot.event
+async def on_message(message: discord.Message):
+
+    # Bot 自身 / 他 Bot は無視
+    if message.author.bot:
         return
 
-    try:
-        with PG_CONN.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO ovv.audit_log (event_type, details, created_at)
-                VALUES (%s, %s::jsonb, %s)
-                """,
-                (event_type, json.dumps(details), now_jst()),
-            )
-    except Exception as e:
-        print("[AUDIT] write failed:", repr(e))
+    # スレッド作成通知など "通常メッセージ以外" は無視
+    if message.type is not discord.MessageType.default:
+        return
 
+    # 1. Debug Routing
+    handled = await route_debug_message(bot, message)
+    if handled:
+        return
 
-# ============================================================
-# Runtime Memory CRUD（JST版）
-# ============================================================
-def load_runtime_memory(session_id: str) -> List[dict]:
-    if PG_CONN is None:
-        return []
+    # 2. Commands
+    if message.content.startswith("!"):
+        db_pg.log_audit("command", {"cmd": message.content})
+        await bot.process_commands(message)
+        return
 
-    try:
-        with PG_CONN.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(
-                "SELECT memory_json FROM ovv.runtime_memory WHERE session_id = %s",
-                (session_id,),
-            )
-            row = cur.fetchone()
-            if row:
-                return row["memory_json"]
-            return []
-    except Exception as e:
-        print("[PG] load_runtime_memory ERROR:", repr(e))
-        return []
+    # 3. Normal message → Memory → Thread Brain → Ovv
+    ck = get_context_key(message)
+    session_id = str(ck)
 
+    append_runtime_memory(
+        session_id,
+        "user",
+        message.content,
+        limit=40 if is_task_channel(message) else 12,
+    )
 
-def save_runtime_memory(session_id: str, mem: List[dict]):
-    if PG_CONN is None:
-        return False
-
-    try:
-        with PG_CONN.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO ovv.runtime_memory (session_id, memory_json, updated_at)
-                VALUES (%s, %s::jsonb, %s)
-                ON CONFLICT (session_id)
-                DO UPDATE SET memory_json = EXCLUDED.memory_json,
-                              updated_at = EXCLUDED.updated_at
-                """,
-                (session_id, json.dumps(mem), now_jst()),
-            )
-        return True
-    except Exception as e:
-        print("[PG] save_runtime_memory ERROR:", repr(e))
-        return False
-
-
-def append_runtime_memory(session_id: str, role: str, content: str, limit: int = 40):
     mem = load_runtime_memory(session_id)
-    mem.append({
-        "role": role,
-        "content": content,
-        "created_at": now_jst().isoformat(),
-    })
 
-    # 古いものを削除
-    if len(mem) > limit:
-        mem = mem[-limit:]
+    if is_task_channel(message):
+        summary = generate_thread_brain(ck, mem)
+        if summary:
+            save_thread_brain(ck, summary)
 
-    save_runtime_memory(session_id, mem)
+    ans = call_ovv(ck, message.content, mem)
+    await message.channel.send(ans)
 
 
 # ============================================================
-# Thread Brain CRUD（JST）
+# Commands
 # ============================================================
-def load_thread_brain(context_key: int):
-    if PG_CONN is None:
-        return None
-
-    try:
-        with PG_CONN.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute(
-                "SELECT summary FROM ovv.thread_brain WHERE context_key = %s",
-                (context_key,),
-            )
-            row = cur.fetchone()
-            if row:
-                return row["summary"]
-            return None
-    except Exception as e:
-        print("[PG] load_thread_brain ERROR:", repr(e))
-        return None
+@bot.command(name="ping")
+async def ping(ctx):
+    await ctx.send("pong")
 
 
-def save_thread_brain(context_key: int, summary: dict) -> bool:
-    if PG_CONN is None:
-        return False
+@bot.command(name="br")
+async def brain_regen(ctx):
+    ck = get_context_key(ctx.message)
+    mem = load_runtime_memory(str(ck))
+    summary = generate_thread_brain(ck, mem)
 
-    try:
-        with PG_CONN.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO ovv.thread_brain (context_key, summary, updated_at)
-                VALUES (%s, %s::jsonb, %s)
-                ON CONFLICT (context_key)
-                DO UPDATE SET summary = EXCLUDED.summary,
-                              updated_at = EXCLUDED.updated_at
-                """,
-                (context_key, json.dumps(summary), now_jst()),
-            )
-        return True
-    except Exception as e:
-        print("[PG] save_thread_brain ERROR:", repr(e))
-        return False
+    if summary:
+        save_thread_brain(ck, summary)
+        await ctx.send("thread_brain を再生成しました。")
+    else:
+        await ctx.send("生成に失敗しました。")
+
+
+@bot.command(name="bs")
+async def brain_show(ctx):
+    ck = get_context_key(ctx.message)
+    summary = load_thread_brain(ck)
+
+    if not summary:
+        await ctx.send("thread_brain はまだありません。")
+        return
+
+    text = json.dumps(summary, ensure_ascii=False, indent=2)
+    if len(text) > 1900:
+        text = text[:1900] + "\n...[truncated]"
+    await ctx.send(f"```json\n{text}\n```")
+
+
+@bot.command(name="tt")
+async def test_thread(ctx):
+    ck = get_context_key(ctx.message)
+    mem = load_runtime_memory(str(ck))
+    summary = generate_thread_brain(ck, mem)
+
+    if not summary:
+        await ctx.send("thread_brain 生成失敗")
+        return
+
+    save_thread_brain(ck, summary)
+    await ctx.send("test OK: summary saved")
 
 
 # ============================================================
-# generate_thread_brain（JST版：meta.updated_at を JST に書き換え）
+# Debug Context Injection
 # ============================================================
-def generate_thread_brain(context_key: int, mem: List[dict]):
-    """
-    ここでは簡易 summary を作成し、meta.updated_at を JST にする。
-    """
-    summary = {
-        "meta": {
-            "version": "1.0",
-            "updated_at": now_jst().isoformat(),
-            "context_key": context_key,
-            "total_tokens_estimate": len(mem),
-        },
-        "status": {"risk": [], "phase": "idle", "last_major_event": ""},
-        "decisions": [],
-        "unresolved": [],
-        "constraints": [],
-        "next_actions": [],
-        "history_digest": "",
-        "high_level_goal": "",
-        "recent_messages": mem[-5:],
-        "current_position": "",
-    }
-    return summary
+debug_context.pg_conn = db_pg.PG_CONN
+debug_context.notion = notion
+debug_context.openai_client = openai_client
+
+debug_context.load_mem = load_runtime_memory
+debug_context.save_mem = save_runtime_memory
+debug_context.append_mem = append_runtime_memory
+
+debug_context.brain_gen = generate_thread_brain
+debug_context.brain_load = load_thread_brain
+debug_context.brain_save = save_thread_brain
+
+debug_context.ovv_core = OVV_CORE
+debug_context.ovv_external = OVV_EXTERNAL
+debug_context.system_prompt = SYSTEM_PROMPT
+
+print("[DEBUG] context injection complete.")
+
+# ============================================================
+# Run
+# ============================================================
+print("[BOOT] PG Connected =", bool(db_pg.PG_CONN))
+print("[BOOT] Starting Discord Bot (JST boot_log)")
+bot.run(DISCORD_BOT_TOKEN)
