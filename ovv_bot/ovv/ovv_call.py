@@ -1,9 +1,7 @@
 # ovv/ovv_call.py
-# Ovv Call Layer - September Stable Edition + State Manager v1 対応
+# Ovv Call Layer - September Stable Edition
 
-from typing import List, Optional, Dict
-import json
-
+from typing import List
 from openai import OpenAI
 from config import OPENAI_API_KEY
 
@@ -43,42 +41,35 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ============================================================
-# call_ovv: Ovv Main Logic
-#   - state_hint を受け取り、プロンプトに埋め込む
+# FINAL 抽出フィルタ
 # ============================================================
-def call_ovv(
-    context_key: int,
-    text: str,
-    recent_mem: List[dict],
-    state_hint: Optional[Dict] = None,
-) -> str:
+def _extract_final(text: str) -> str:
     """
-    context_key / recent_mem / state_hint を元に Ovv コアを呼び出す。
-    state_hint があれば、SYSTEM レベルで LLM に共有する。
+    Ovv コアから返ってきたテキストから [FINAL] 以降だけを取り出す。
+    マーカーが無い場合はそのまま返す（後方互換性のため）。
     """
+    marker = "[FINAL]"
+    idx = text.rfind(marker)
+    if idx == -1:
+        return text
 
-    msgs: List[Dict] = []
+    tail = text[idx + len(marker):].strip()
+    return tail if tail else text
 
-    # Soft-Core を含むメイン SYSTEM
-    msgs.append({"role": "system", "content": SYSTEM_PROMPT})
 
-    # State hint（あれば JSON で渡す）
-    if state_hint:
-        hint_json = json.dumps(state_hint, ensure_ascii=False)
-        msgs.append({
-            "role": "system",
-            "content": f"[STATE_HINT] {hint_json}"
-        })
+# ============================================================
+# call_ovv: Ovv Main Logic
+# ============================================================
+def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
+    msgs = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "assistant", "content": OVV_CORE},
+        {"role": "assistant", "content": OVV_EXTERNAL},
+    ]
 
-    # Ovv Core / External
-    msgs.append({"role": "assistant", "content": OVV_CORE})
-    msgs.append({"role": "assistant", "content": OVV_EXTERNAL})
-
-    # 過去メモリ
     for m in recent_mem[-20:]:
         msgs.append({"role": m["role"], "content": m["content"]})
 
-    # 現在のユーザ入力
     msgs.append({"role": "user", "content": text})
 
     try:
@@ -87,7 +78,9 @@ def call_ovv(
             messages=msgs,
             temperature=0.7,
         )
-        return res.choices[0].message.content.strip()[:1900]
+        raw = res.choices[0].message.content.strip()
+        final_text = _extract_final(raw)
+        return final_text[:1900]
 
     except Exception as e:
         print("[call_ovv error]", repr(e))
