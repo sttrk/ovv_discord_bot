@@ -1,5 +1,5 @@
 # ovv/ovv_call.py
-# Ovv Core Call Layer - Thread Brain Injection 対応版（A-2 完成）
+# A-2 + A-3 完全統合版（Thread Brain + Scoring Layer）
 
 from typing import List
 from openai import OpenAI
@@ -7,18 +7,11 @@ from config import OPENAI_API_KEY
 
 from ovv.core_loader import load_core, load_external
 from ovv.threadbrain_adapter import build_tb_prompt
+from ovv.tb_scoring import build_scoring_prompt
 from database.pg import load_thread_brain
-
-# ============================================================
-# Load Core / External
-# ============================================================
 
 OVV_CORE = load_core()
 OVV_EXTERNAL = load_external()
-
-# ============================================================
-# Soft-Core
-# ============================================================
 
 OVV_SOFT_CORE = """
 [Ovv Soft-Core v1.1]
@@ -38,38 +31,32 @@ SYSTEM_PROMPT = f"""
 {OVV_SOFT_CORE}
 """.strip()
 
-# ============================================================
-# OpenAI Client
-# ============================================================
-
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ============================================================
-# call_ovv: Ovv Core 推論
-# ============================================================
 
 def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
+
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "assistant", "content": OVV_CORE},
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
-    # --------------------------------------------------------
-    # A-2: Thread Brain summary を推論に注入
-    # --------------------------------------------------------
+    # ======================================================
+    # A-2: Thread Brain Injection
+    # ======================================================
     tb_summary = load_thread_brain(context_key)
     tb_prompt = build_tb_prompt(tb_summary)
-
     if tb_prompt:
-        msgs.append({
-            "role": "assistant",
-            "content": f"[Thread Brain]\n{tb_prompt}"
-        })
+        msgs.append({"role": "assistant", "content": f"[Thread Brain]\n{tb_prompt}"})
 
-    # --------------------------------------------------------
-    # Recent Memory 注入
-    # --------------------------------------------------------
+    # ======================================================
+    # A-3: Scoring Layer Injection（最優先ルール）
+    # ======================================================
+    scoring = build_scoring_prompt(tb_summary)
+    msgs.append({"role": "assistant", "content": scoring})
+
+    # Memory
     for m in recent_mem[-20:]:
         msgs.append({"role": m["role"], "content": m["content"]})
 
