@@ -1,6 +1,8 @@
 # debug/debug_router.py
 
 from .debug_commands import run_debug_command
+from debug.debug_context import debug_context
+
 
 # ============================================================
 # Utility: find text channel by name
