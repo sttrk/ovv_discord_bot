@@ -1,5 +1,5 @@
 # debug/debug_commands.py
-# Debug Command Suite v1.0 - Full Implementation (Stage 1 + Stage 2 + raw Ovv call)
+# Debug Command Suite v1.1 - raw 出力対応
 
 import os
 import importlib
@@ -9,9 +9,6 @@ import discord
 
 from .debug_context import debug_context
 from config import NOTION_TASKS_DB_ID
-
-# Ovv 直叩き用
-from ovv.ovv_call import call_ovv
 
 
 # Utility: return simple debug text
@@ -237,7 +234,7 @@ async def dbg_notion_list(message, args):
 
 
 # ============================================================
-# E. Ovv Core / External / LLM Audit（Stage 2 実装）
+# E. Ovv Core / External / LLM Audit
 # ============================================================
 
 async def dbg_ovv_ping(message, args):
@@ -279,47 +276,7 @@ async def dbg_ovv_llm(message, args):
 
 
 # ============================================================
-# E-2. Ovv Raw Call（BIS バイパス用）
-# ============================================================
-
-async def dbg_raw(message, args):
-    """
-    !dbg raw <text>
-    Boundary_Gate / Interface_Box / Stabilizer をバイパスし、
-    ovv_call.call_ovv を直接叩く。
-    - ThreadBrain / runtime_memory は PG から読み出して渡す
-    - 戻り値は Ovv の生出力（[FINAL] を含む）をそのまま返す
-    """
-    if not args:
-        return _msg("usage: !dbg raw <text>")
-
-    user_text = " ".join(args).strip()
-    ctx_key = _get_context_key(message)
-
-    # recent_mem を取得（あれば）
-    mem = []
-    try:
-        if debug_context.load_mem:
-            mem = debug_context.load_mem(str(ctx_key)) or []
-    except Exception as e:
-        return _msg(f"raw: mem_load FAIL: {repr(e)}")
-
-    # Ovv 直叩き
-    try:
-        raw = call_ovv(ctx_key, user_text, mem)
-    except Exception as e:
-        return _msg(f"raw: call_ovv FAIL: {repr(e)}")
-
-    # Discord 制限を考慮してざっくり truncate
-    if len(raw) > 1900:
-        raw = raw[:1900] + "\n...[truncated]"
-
-    # ここだけは [DEBUG] を付けずに生返しする（Ovv 出力をそのまま見るため）
-    return raw
-
-
-# ============================================================
-# F. Memory / Thread Brain Audit（実装）
+# F. Memory / Thread Brain Audit
 # ============================================================
 
 async def dbg_mem_load(message, args):
@@ -366,7 +323,44 @@ async def dbg_brain_show(message, args):
 
 
 # ============================================================
-# G. Routing / Event / Chain Audit（Stage 2 strong）
+# F-2. Raw Ovv Output（最新アシスタント発話の生データ）
+# ============================================================
+
+async def dbg_raw(message, args):
+    """
+    現在の context_key の runtime_memory から、
+    直近の assistant メッセージをそのまま表示する。
+
+    - PROPOSAL / AUDIT / FINAL を含む raw 文字列を見るためのコマンド。
+    - 2000 文字制限対策として 1500 文字で truncate。
+    """
+    try:
+        key = str(_get_context_key(message))
+        mem = debug_context.load_mem(key)
+        if not mem:
+            return _msg("raw: no memory")
+
+        # 後ろから assistant の最後の発話を探す
+        last_assistant = None
+        for m in reversed(mem):
+            if m.get("role") == "assistant":
+                last_assistant = m
+                break
+
+        if not last_assistant:
+            return _msg("raw: no assistant message")
+
+        content = str(last_assistant.get("content", ""))
+        if len(content) > 1500:
+            content = content[:1500] + "\n...[truncated]"
+
+        return _msg("raw assistant message:\n" + content)
+    except Exception as e:
+        return _msg(f"raw FAIL: {repr(e)}")
+
+
+# ============================================================
+# G. Routing / Event / Chain Audit
 # ============================================================
 
 async def dbg_route(message, args):
@@ -470,13 +464,13 @@ async def run_debug_command(message, cmd: str, args: list):
     if cmd == "ovv_core":     return await dbg_ovv_core(message, args)
     if cmd == "ovv_external": return await dbg_ovv_external(message, args)
     if cmd == "ovv_llm":      return await dbg_ovv_llm(message, args)
-    if cmd == "raw":          return await dbg_raw(message, args)
 
     # F
     if cmd == "mem_load":    return await dbg_mem_load(message, args)
     if cmd == "mem_write":   return await dbg_mem_write(message, args)
     if cmd == "brain_gen":   return await dbg_brain_gen(message, args)
     if cmd == "brain_show":  return await dbg_brain_show(message, args)
+    if cmd == "raw":         return await dbg_raw(message, args)
 
     # G
     if cmd == "route":       return await dbg_route(message, args)
@@ -485,5 +479,5 @@ async def run_debug_command(message, cmd: str, args: list):
 
     # H. All-in-one
     if cmd == "all":         return await dbg_all(message, args)
-
+    
     return _msg(f"Unknown debug command: {cmd}")
