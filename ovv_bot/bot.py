@@ -1,5 +1,4 @@
-# ovv_bot/bot.py
-# Ovv Discord Bot - September Stable Edition + State Manager v1 Integrated
+# ovv_bot/bot.py  — FINAL-only reply + ignore system messages
 
 import os
 import json
@@ -12,83 +11,113 @@ from openai import OpenAI
 from notion_client import Client
 
 # ============================================================
-# [DEBUG HOOK]
+# Debug Router
 # ============================================================
 from debug.debug_router import route_debug_message
 
 # ============================================================
-# PostgreSQL MODULE IMPORT（絶対に from-import しない）
+# PG / Notion / ENV
 # ============================================================
 import database.pg as db_pg
-
-# ============================================================
-# Notion Module Import（完全分離済み）
-# ============================================================
-from notion.notion_api import (
-    create_task,
-    start_session,
-    end_session,
-    append_logs,
-)
-
-# ============================================================
-# Environment Variables
-# ============================================================
-from config import (
-    DISCORD_BOT_TOKEN,
-    OPENAI_API_KEY,
-    NOTION_API_KEY,
-)
+from notion.notion_api import create_task, start_session, end_session, append_logs
+from config import DISCORD_BOT_TOKEN, OPENAI_API_KEY, NOTION_API_KEY
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
+BOOT_LOG_CHANNEL_ID = 1446060807044468756
+
 # ============================================================
-# PostgreSQL Init
+# BootLog Formatter（C-style）
+# ============================================================
+def format_boot_log(env_ok, pg_ok, notion_ok, openai_ok, ctx_ok):
+    ts = datetime.now(timezone.utc).isoformat()
+    def _b(v): return "OK" if v else "NG"
+
+    box = [
+        "╔══════════════════════════════╗",
+        "║        Ovv Boot Summary       ║",
+        "║      起動ログを報告します      ║",
+        "╠══════════════════════════════╣",
+        f"║ ENV: {_b(env_ok):<24}║",
+        f"║ PostgreSQL: {_b(pg_ok):<16}║",
+        f"║ Notion: {_b(notion_ok):<20}║",
+        f"║ OpenAI: {_b(openai_ok):<21}║",
+        f"║ Context Ready: {_b(ctx_ok):<13}║",
+        "╠══════════════════════════════╣",
+        f"║ timestamp: {ts[:19]:<13}║",
+        "╚══════════════════════════════╝",
+    ]
+    return "```\n" + "\n".join(box) + "\n```"
+
+
+async def send_boot_log(bot):
+    await bot.wait_until_ready()
+
+    # ENV checks
+    env_ok = all([DISCORD_BOT_TOKEN, OPENAI_API_KEY, NOTION_API_KEY])
+
+    # PG
+    pg_ok = bool(db_pg.PG_CONN)
+
+    # Notion
+    try:
+        notion.users.list()
+        notion_ok = True
+    except:
+        notion_ok = False
+
+    # OpenAI
+    try:
+        openai_client.models.list()
+        openai_ok = True
+    except:
+        openai_ok = False
+
+    ctx_ok = all([openai_client, notion, db_pg.PG_CONN])
+
+    text = format_boot_log(env_ok, pg_ok, notion_ok, openai_ok, ctx_ok)
+
+    ch = bot.get_channel(BOOT_LOG_CHANNEL_ID)
+    if ch:
+        await ch.send(text)
+    else:
+        print("[BOOT_LOG] Channel Not Found")
+        print(text)
+
+
+# ============================================================
+# PG Init
 # ============================================================
 print("=== [BOOT] Connecting PostgreSQL ===")
 conn = db_pg.pg_connect()
 db_pg.init_db(conn)
-
 log_audit = db_pg.log_audit
 
-# ============================================================
-# Runtime Memory (Proxy)
-# ============================================================
+# Runtime Memory
 load_runtime_memory = db_pg.load_runtime_memory
 save_runtime_memory = db_pg.save_runtime_memory
 append_runtime_memory = db_pg.append_runtime_memory
 
-# ============================================================
 # Thread Brain
-# ============================================================
 load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
 
 # ============================================================
-# Ovv Core / External / Call
+# Ovv Call Layer
 # ============================================================
-from ovv.ovv_call import (
-    call_ovv,
-    OVV_CORE,
-    OVV_EXTERNAL,
-    SYSTEM_PROMPT,
-)
-
-# ============================================================
-# State Manager（軽量ステートマシン）
-# ============================================================
-from ovv.state_manager import decide_state
+from ovv.ovv_call import call_ovv
 
 # ============================================================
 # Discord Setup
 # ============================================================
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
+
+# Context Key
 def get_context_key(msg: discord.Message) -> int:
     ch = msg.channel
     if isinstance(ch, discord.Thread):
@@ -97,75 +126,43 @@ def get_context_key(msg: discord.Message) -> int:
         return ch.id
     return (msg.guild.id << 32) | ch.id
 
+
 def is_task_channel(message: discord.Message) -> bool:
     ch = message.channel
     if isinstance(ch, discord.Thread):
         parent = ch.parent
-        return parent.name.lower().startswith("task_") if parent else False
+        return parent and parent.name.lower().startswith("task_")
     return ch.name.lower().startswith("task_")
 
 
 # ============================================================
-# Boot Log Sender（手動トリガー方式）
-# ============================================================
-
-BOOT_LOG_CHANNEL_ID = 1446060807044468756  # ←指定されたチャンネル
-
-async def send_boot_log(bot: discord.Client):
-    now = datetime.now(timezone.utc).isoformat()
-    pg_ok = bool(db_pg.PG_CONN)
-
-    msg = (
-        "【Ovv Bot boot_log】\n"
-        f"- time: {now}\n"
-        f"- PG: {'OK' if pg_ok else 'NG'}\n"
-        f"- Notion: {'OK' if notion is not None else 'NG'}\n"
-    )
-
-    ch = bot.get_channel(BOOT_LOG_CHANNEL_ID)
-
-    if ch is None:
-        print("[BOOT] boot_log channel not found")
-        return
-
-    try:
-        await ch.send(msg)
-    except Exception as e:
-        print("[BOOT] Failed to send boot_log:", repr(e))
-
-
-# ============================================================
-# on_ready（boot_log 出力）
-# ============================================================
-@bot.event
-async def on_ready():
-    print("[BOOT] Discord Connected. Sending boot_log...")
-    await send_boot_log(bot)
-
-
-# ============================================================
-# on_message（DEBUG → MEMORY → STATE → Ovv）
+# on_message — FINAL reply only, ignore system messages
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
 
+    # ① BOT・Webhook・System はすべて拒否
     if message.author.bot:
         return
+    if message.webhook_id:
+        return
 
-    # Debug Layer
+    # ② システムメッセージは無視（スレッド作成・ピン留めなど）
+    if message.type != discord.MessageType.default:
+        return
+
+    # Debug Router
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
-    # Command Layer
+    # Commands
     if message.content.startswith("!"):
         log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # ======================================================
     # Memory
-    # ======================================================
     ck = get_context_key(message)
     session_id = str(ck)
 
@@ -177,37 +174,16 @@ async def on_message(message: discord.Message):
     )
 
     mem = load_runtime_memory(session_id)
-    task_mode = is_task_channel(message)
 
-    # ======================================================
-    # Thread Brain（task_ チャンネルでのみ作動）
-    # ======================================================
-    if task_mode:
+    if is_task_channel(message):
         summary = generate_thread_brain(ck, mem)
         if summary:
             save_thread_brain(ck, summary)
 
-    # ======================================================
-    # State Manager（数字カウントなど軽量ステート）
-    # ======================================================
-    state_hint = decide_state(
-        context_key=ck,
-        user_text=message.content,
-        recent_mem=mem,
-        task_mode=task_mode,
-    )
-
-    # ======================================================
-    # Ovv Core
-    # ======================================================
-    ans = call_ovv(
-        context_key=ck,
-        text=message.content,
-        recent_mem=mem,
-        state_hint=state_hint,
-    )
-
+    # FINAL 返答のみ
+    ans = call_ovv(ck, message.content, mem)
     await message.channel.send(ans)
+    return
 
 
 # ============================================================
@@ -216,6 +192,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="ping")
 async def ping(ctx):
     await ctx.send("pong")
+
 
 @bot.command(name="br")
 async def brain_regen(ctx):
@@ -228,6 +205,7 @@ async def brain_regen(ctx):
         await ctx.send("thread_brain を再生成しました。")
     else:
         await ctx.send("生成に失敗しました。")
+
 
 @bot.command(name="bs")
 async def brain_show(ctx):
@@ -243,12 +221,13 @@ async def brain_show(ctx):
         text = text[:1900] + "\n...[truncated]"
     await ctx.send(f"```json\n{text}\n```")
 
+
 @bot.command(name="tt")
 async def test_thread(ctx):
     ck = get_context_key(ctx.message)
     mem = load_runtime_memory(str(ck))
-
     summary = generate_thread_brain(ck, mem)
+
     if not summary:
         await ctx.send("thread_brain 生成失敗")
         return
@@ -258,9 +237,15 @@ async def test_thread(ctx):
 
 
 # ============================================================
-# Boot Complete
+# BootLog Dispatch
 # ============================================================
-print("[BOOT] PG Connected =", bool(db_pg.PG_CONN))
-print("[BOOT] Starting Discord Bot")
+@bot.event
+async def on_ready():
+    await send_boot_log(bot)
 
+
+# ============================================================
+# Run Bot
+# ============================================================
+print("[BOOT] Starting Discord Bot")
 bot.run(DISCORD_BOT_TOKEN)
