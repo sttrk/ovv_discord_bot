@@ -1,42 +1,55 @@
 # ovv/ovv_call.py
-import json
+# Ovv Call Layer - September Stable Edition
+
 from typing import List
-from datetime import datetime, timezone
+from openai import OpenAI
+from config import OPENAI_API_KEY
 
-def call_ovv(
-    *,
-    openai_client,
-    system_prompt: str,
-    core_text: str,
-    external_text: str,
-    context_key: int,
-    text: str,
-    recent_mem: List[dict],
-    append_runtime_memory,
-    log_audit,
-):
-    """
-    Ovv 呼び出しの純粋関数化バージョン。
-    bot.py から依存を全て注入して使う。
+# ============================================================
+# Load Core / External
+# ============================================================
+from ovv.core_loader import load_core, load_external
 
-    - openai_client : OpenAI client instance
-    - system_prompt : SYSTEM_PROMPT (Soft-Core入り)
-    - core_text     : OVV_CORE の文字列
-    - external_text : OVV_EXTERNAL の文字列
-    - context_key   : thread / channel ごとの ID
-    - text          : ユーザーからのメッセージ
-    - recent_mem    : 過去20件のメモリ
-    - append_runtime_memory : メモリ保存関数
-    - log_audit     : 監査ログ関数
-    """
+OVV_CORE = load_core()
+OVV_EXTERNAL = load_external()
 
+# ============================================================
+# Soft-Core
+# ============================================================
+OVV_SOFT_CORE = """
+[Ovv Soft-Core v1.1]
+1. MUST keep user experience primary
+2. MUST use Clarify only when needed
+3. MUST avoid hallucination
+4. MUST respect boundaries
+5. SHOULD decompose → reconstruct
+6. MUST NOT phase-mix
+7. MAY trigger CDC sparingly
+""".strip()
+
+SYSTEM_PROMPT = f"""
+あなたは Discord 上の Ovv です。
+次の Ovv Soft-Core を保持してください。
+
+{OVV_SOFT_CORE}
+""".strip()
+
+# ============================================================
+# OpenAI Client
+# ============================================================
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# ============================================================
+# call_ovv: Ovv Main Logic
+# ============================================================
+def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
     msgs = [
-        {"role": "system", "content": system_prompt},
-        {"role": "assistant", "content": core_text},
-        {"role": "assistant", "content": external_text},
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "assistant", "content": OVV_CORE},
+        {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
-    # 過去ログを Ovv に注入
     for m in recent_mem[-20:]:
         msgs.append({"role": m["role"], "content": m["content"]})
 
@@ -48,23 +61,8 @@ def call_ovv(
             messages=msgs,
             temperature=0.7,
         )
-
-        ans = res.choices[0].message.content.strip()
-
-        append_runtime_memory(str(context_key), "assistant", ans)
-
-        log_audit("assistant_reply", {
-            "context_key": context_key,
-            "length": len(ans)
-        })
-
-        return ans[:1900]
+        return res.choices[0].message.content.strip()[:1900]
 
     except Exception as e:
-
-        log_audit("openai_error", {
-            "context_key": context_key,
-            "error": repr(e)
-        })
-
-        return "Ovv との通信中にエラーが発生しました。"
+        print("[call_ovv error]", repr(e))
+        return "Ovv コア処理中にエラーが発生しました。"
