@@ -1,5 +1,4 @@
-# ovv_bot/bot.py  — FINAL-only reply + ignore system messages
-
+# ovv_bot/bot.py
 import os
 import json
 import discord
@@ -7,91 +6,53 @@ from discord.ext import commands
 from datetime import datetime, timezone
 from typing import Optional, List
 
+# ============================================================
+# ENV
+# ============================================================
+from config import (
+    DISCORD_BOT_TOKEN,
+    OPENAI_API_KEY,
+    NOTION_API_KEY,
+)
+
+# ============================================================
+# External Modules
+# ============================================================
 from openai import OpenAI
 from notion_client import Client
 
-# ============================================================
 # Debug Router
-# ============================================================
 from debug.debug_router import route_debug_message
+from debug.debug_context import debug_context
 
-# ============================================================
-# PG / Notion / ENV
-# ============================================================
+# PostgreSQL Module (絶対に from-import しない)
 import database.pg as db_pg
-from notion.notion_api import create_task, start_session, end_session, append_logs
-from config import DISCORD_BOT_TOKEN, OPENAI_API_KEY, NOTION_API_KEY
 
+# Notion CRUD (分離版)
+from notion.notion_api import (
+    create_task,
+    start_session,
+    end_session,
+    append_logs,
+)
+
+# Ovv Call Layer
+from ovv.ovv_call import call_ovv, OVV_CORE, OVV_EXTERNAL, SYSTEM_PROMPT
+
+# ============================================================
+# Client Init
+# ============================================================
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
-BOOT_LOG_CHANNEL_ID = 1446060807044468756
-
 # ============================================================
-# BootLog Formatter（C-style）
-# ============================================================
-def format_boot_log(env_ok, pg_ok, notion_ok, openai_ok, ctx_ok):
-    ts = datetime.now(timezone.utc).isoformat()
-    def _b(v): return "OK" if v else "NG"
-
-    box = [
-        "╔══════════════════════════════╗",
-        "║        Ovv Boot Summary       ║",
-        "║      起動ログを報告します      ║",
-        "╠══════════════════════════════╣",
-        f"║ ENV: {_b(env_ok):<24}║",
-        f"║ PostgreSQL: {_b(pg_ok):<16}║",
-        f"║ Notion: {_b(notion_ok):<20}║",
-        f"║ OpenAI: {_b(openai_ok):<21}║",
-        f"║ Context Ready: {_b(ctx_ok):<13}║",
-        "╠══════════════════════════════╣",
-        f"║ timestamp: {ts[:19]:<13}║",
-        "╚══════════════════════════════╝",
-    ]
-    return "```\n" + "\n".join(box) + "\n```"
-
-
-async def send_boot_log(bot):
-    await bot.wait_until_ready()
-
-    # ENV checks
-    env_ok = all([DISCORD_BOT_TOKEN, OPENAI_API_KEY, NOTION_API_KEY])
-
-    # PG
-    pg_ok = bool(db_pg.PG_CONN)
-
-    # Notion
-    try:
-        notion.users.list()
-        notion_ok = True
-    except:
-        notion_ok = False
-
-    # OpenAI
-    try:
-        openai_client.models.list()
-        openai_ok = True
-    except:
-        openai_ok = False
-
-    ctx_ok = all([openai_client, notion, db_pg.PG_CONN])
-
-    text = format_boot_log(env_ok, pg_ok, notion_ok, openai_ok, ctx_ok)
-
-    ch = bot.get_channel(BOOT_LOG_CHANNEL_ID)
-    if ch:
-        await ch.send(text)
-    else:
-        print("[BOOT_LOG] Channel Not Found")
-        print(text)
-
-
-# ============================================================
-# PG Init
+# PostgreSQL Boot
 # ============================================================
 print("=== [BOOT] Connecting PostgreSQL ===")
+
 conn = db_pg.pg_connect()
 db_pg.init_db(conn)
+
 log_audit = db_pg.log_audit
 
 # Runtime Memory
@@ -99,25 +60,45 @@ load_runtime_memory = db_pg.load_runtime_memory
 save_runtime_memory = db_pg.save_runtime_memory
 append_runtime_memory = db_pg.append_runtime_memory
 
-# Thread Brain
+# Thread-brain
 load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
 
 # ============================================================
-# Ovv Call Layer
+# Inject Debug Context
 # ============================================================
-from ovv.ovv_call import call_ovv
+debug_context.pg_conn = db_pg.PG_CONN
+debug_context.notion = notion
+debug_context.openai_client = openai_client
+
+debug_context.load_mem = load_runtime_memory
+debug_context.save_mem = save_runtime_memory
+debug_context.append_mem = append_runtime_memory
+
+debug_context.brain_gen = generate_thread_brain
+debug_context.brain_load = load_thread_brain
+debug_context.brain_save = save_thread_brain
+
+debug_context.ovv_core = OVV_CORE
+debug_context.ovv_external = OVV_EXTERNAL
+debug_context.system_prompt = SYSTEM_PROMPT
+
+print("[DEBUG] context injection complete.")
+
 
 # ============================================================
 # Discord Setup
 # ============================================================
 intents = discord.Intents.default()
 intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
-# Context Key
+# ============================================================
+# ContextKey / Task-Channel 判定
+# ============================================================
 def get_context_key(msg: discord.Message) -> int:
     ch = msg.channel
     if isinstance(ch, discord.Thread):
@@ -131,27 +112,83 @@ def is_task_channel(message: discord.Message) -> bool:
     ch = message.channel
     if isinstance(ch, discord.Thread):
         parent = ch.parent
-        return parent and parent.name.lower().startswith("task_")
+        return parent.name.lower().startswith("task_") if parent else False
     return ch.name.lower().startswith("task_")
 
 
 # ============================================================
-# on_message — FINAL reply only, ignore system messages
+# IGNORE BOT-UNRELATED EVENTS
+# ============================================================
+IGNORED_MESSAGE_TYPES = {
+    discord.MessageType.thread_created,
+    discord.MessageType.thread_starter_message,
+    discord.MessageType.recipient_add,
+    discord.MessageType.recipient_remove,
+    discord.MessageType.call,
+    discord.MessageType.channel_name_change,
+    discord.MessageType.channel_icon_change,
+    discord.MessageType.pins_add,
+}
+
+
+def should_ignore_message(msg: discord.Message) -> bool:
+    if msg.type in IGNORED_MESSAGE_TYPES:
+        return True
+    return False
+
+
+# ============================================================
+# on_ready → BootLog (Cフォーマット)
+# ============================================================
+BOOT_LOG_CHANNEL_ID = 1446060807044468756
+
+@bot.event
+async def on_ready():
+    print("[STATUS] on_ready triggered")
+
+    status = {
+        "env": True,
+        "pg": bool(db_pg.PG_CONN),
+        "notion": True,
+        "openai": True,
+        "context": all([
+            debug_context.pg_conn,
+            debug_context.notion,
+            debug_context.openai_client,
+            debug_context.ovv_core,
+            debug_context.ovv_external,
+            debug_context.system_prompt
+        ])
+    }
+
+    msg = (
+        "【Ovv Bot boot_log】\n"
+        f"- time: {datetime.now(timezone.utc).isoformat()}\n"
+        f"- PG: {'OK' if status['pg'] else 'NG'}\n"
+        f"- Notion: {'OK' if status['notion'] else 'NG'}"
+    )
+
+    ch = bot.get_channel(BOOT_LOG_CHANNEL_ID)
+    if ch:
+        await ch.send(msg)
+    else:
+        print(f"[BOOT_LOG] Channel Not Found: {BOOT_LOG_CHANNEL_ID}")
+
+
+# ============================================================
+# on_message
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
 
-    # ① BOT・Webhook・System はすべて拒否
     if message.author.bot:
         return
-    if message.webhook_id:
+
+    # thread 作成通知などを無視
+    if should_ignore_message(message):
         return
 
-    # ② システムメッセージは無視（スレッド作成・ピン留めなど）
-    if message.type != discord.MessageType.default:
-        return
-
-    # Debug Router
+    # Debug layer
     handled = await route_debug_message(bot, message)
     if handled:
         return
@@ -162,7 +199,7 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Memory
+    # Normal Ovv Message Flow
     ck = get_context_key(message)
     session_id = str(ck)
 
@@ -180,14 +217,13 @@ async def on_message(message: discord.Message):
         if summary:
             save_thread_brain(ck, summary)
 
-    # FINAL 返答のみ
     ans = call_ovv(ck, message.content, mem)
+
     await message.channel.send(ans)
-    return
 
 
 # ============================================================
-# Commands
+# Commands (Ping / BR / BS / TT)
 # ============================================================
 @bot.command(name="ping")
 async def ping(ctx):
@@ -237,15 +273,7 @@ async def test_thread(ctx):
 
 
 # ============================================================
-# BootLog Dispatch
-# ============================================================
-@bot.event
-async def on_ready():
-    await send_boot_log(bot)
-
-
-# ============================================================
-# Run Bot
+# Run
 # ============================================================
 print("[BOOT] Starting Discord Bot")
 bot.run(DISCORD_BOT_TOKEN)
