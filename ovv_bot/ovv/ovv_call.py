@@ -1,27 +1,19 @@
 # ovv/ovv_call.py
-# Ovv Call Layer - September Stable Edition (Context-Aware)
+# Ovv Call Layer - September Stable Edition + State Manager v1 対応
 
-from typing import List, Dict, Optional
+from typing import List, Optional, Dict
+import json
 
 from openai import OpenAI
 from config import OPENAI_API_KEY
 
-# Core / External
-from ovv.core_loader import load_core, load_external
-
-# コンテキスト整形（Bモード）
-from ovv.ovv_context_manager import build_ovv_context_block
-
-# PG: thread_brain / runtime_memory / audit 用
-import database.pg as db_pg
-
-
 # ============================================================
 # Load Core / External
 # ============================================================
+from ovv.core_loader import load_core, load_external
+
 OVV_CORE = load_core()
 OVV_EXTERNAL = load_external()
-
 
 # ============================================================
 # Soft-Core
@@ -44,7 +36,6 @@ SYSTEM_PROMPT = f"""
 {OVV_SOFT_CORE}
 """.strip()
 
-
 # ============================================================
 # OpenAI Client
 # ============================================================
@@ -52,39 +43,42 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ============================================================
-# call_ovv: Ovv Main Logic (Bモード: thread_brain + mem 利用)
+# call_ovv: Ovv Main Logic
+#   - state_hint を受け取り、プロンプトに埋め込む
 # ============================================================
-def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
+def call_ovv(
+    context_key: int,
+    text: str,
+    recent_mem: List[dict],
+    state_hint: Optional[Dict] = None,
+) -> str:
     """
-    - PG に保存された thread_brain を取得
-    - runtime_memory と合わせて自然文コンテキストを組み立てる
-    - それを Ovv への前置きコンテキストとして渡す
+    context_key / recent_mem / state_hint を元に Ovv コアを呼び出す。
+    state_hint があれば、SYSTEM レベルで LLM に共有する。
     """
 
-    # 1) thread_brain を PG から取得
-    tb_summary: Optional[Dict] = db_pg.load_thread_brain(context_key)
+    msgs: List[Dict] = []
 
-    # 2) 自然文のコンテキストブロックを生成
-    ctx_block: str = build_ovv_context_block(
-        context_key=context_key,
-        thread_brain_summary=tb_summary,
-        recent_mem=recent_mem,
-    )
+    # Soft-Core を含むメイン SYSTEM
+    msgs.append({"role": "system", "content": SYSTEM_PROMPT})
 
-    # 3) LLM へのメッセージ構成
-    msgs: List[Dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "assistant", "content": OVV_CORE},
-        {"role": "assistant", "content": OVV_EXTERNAL},
-        # ★ Bモード追加: thread_brain + recent_mem の自然文ダイジェスト
-        {"role": "assistant", "content": ctx_block},
-    ]
+    # State hint（あれば JSON で渡す）
+    if state_hint:
+        hint_json = json.dumps(state_hint, ensure_ascii=False)
+        msgs.append({
+            "role": "system",
+            "content": f"[STATE_HINT] {hint_json}"
+        })
 
-    # 直近の「生ログ」を少しだけそのまま付ける（最大 10 件）
-    for m in recent_mem[-10:]:
+    # Ovv Core / External
+    msgs.append({"role": "assistant", "content": OVV_CORE})
+    msgs.append({"role": "assistant", "content": OVV_EXTERNAL})
+
+    # 過去メモリ
+    for m in recent_mem[-20:]:
         msgs.append({"role": m["role"], "content": m["content"]})
 
-    # 最後に今回のユーザー発話
+    # 現在のユーザ入力
     msgs.append({"role": "user", "content": text})
 
     try:
@@ -93,23 +87,8 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
             messages=msgs,
             temperature=0.7,
         )
-        ans = res.choices[0].message.content.strip()
-
-        # runtime_memory にアシスタント応答を追記
-        db_pg.append_runtime_memory(str(context_key), "assistant", ans)
-
-        # 監査ログ
-        db_pg.log_audit("assistant_reply", {
-            "context_key": context_key,
-            "length": len(ans),
-        })
-
-        return ans[:1900]
+        return res.choices[0].message.content.strip()[:1900]
 
     except Exception as e:
-        db_pg.log_audit("openai_error", {
-            "context_key": context_key,
-            "user_text": text[:500],
-            "error": repr(e),
-        })
+        print("[call_ovv error]", repr(e))
         return "Ovv コア処理中にエラーが発生しました。"
