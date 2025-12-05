@@ -1,107 +1,71 @@
-# bot.py - Ovv Discord Bot (September Stable Edition - Cycle Free)
+# bot.py - Ovv Discord Bot (September Stable + JST Boot Log + FINAL-only)
 
 import os
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 import discord
 from discord.ext import commands
-from openai import OpenAI
-from notion_client import Client
+
+from notion_client import Client  # for type hints only
 
 # ============================================================
-# DEBUG ROUTER
+# DEBUG HOOK
 # ============================================================
 from debug.debug_router import route_debug_message
-
-# Boot Log 用
-from debug.debug_boot import send_boot_message
+from debug.debug_context import debug_context
 
 # ============================================================
-# PostgreSQL MODULE（絶対に from-import しない）
+# PostgreSQL MODULE（必ず module import）
 # ============================================================
 import database.pg as db_pg
 
 # ============================================================
-# Notion API（循環依存なし版）
+# Notion API（CRUD は外部モジュール）
 # ============================================================
-import notion.notion_api as notion_api
-
-# ============================================================
-# Environment Variables
-# ============================================================
-from config import (
-    DISCORD_BOT_TOKEN,
-    OPENAI_API_KEY,
-    NOTION_API_KEY,
-    NOTION_TASKS_DB_ID,
-    NOTION_SESSIONS_DB_ID,
-    NOTION_LOGS_DB_ID,
+from notion.notion_api import (
+    create_task,
+    start_session,
+    end_session,
+    append_logs,
+    notion_client,
 )
 
 # ============================================================
-# OpenAI / Notion Client
+# Ovv Core / Call Layer（推論専用）
 # ============================================================
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-notion_client = Client(auth=NOTION_API_KEY)
-
-# Notion API にクライアントを注入
-notion_api.inject_notion_client(notion_client)
+from ovv.ovv_call import (
+    call_ovv,
+    OVV_CORE,
+    OVV_EXTERNAL,
+    SYSTEM_PROMPT,
+    openai_client,
+)
 
 # ============================================================
-# PostgreSQL Init
+# Environment
+# ============================================================
+from config import DISCORD_BOT_TOKEN
+
+print("=== [BOOT] Loading environment variables ===")
+
+# ============================================================
+# PostgreSQL Connect + Init
 # ============================================================
 print("=== [BOOT] Connecting PostgreSQL ===")
 conn = db_pg.pg_connect()
 db_pg.init_db(conn)
 
-log_audit = db_pg.log_audit
-
-# Notion API に log_audit を注入
-notion_api.log_audit = log_audit
-
 # ============================================================
-# Runtime Memory（PG Proxy）
+# JST Helper
 # ============================================================
-load_runtime_memory = db_pg.load_runtime_memory
-save_runtime_memory = db_pg.save_runtime_memory
-append_runtime_memory = db_pg.append_runtime_memory
+JST = timezone(timedelta(hours=9))
 
-# ============================================================
-# Thread Brain（PG Proxy）
-# ============================================================
-load_thread_brain = db_pg.load_thread_brain
-save_thread_brain = db_pg.save_thread_brain
-generate_thread_brain = db_pg.generate_thread_brain
 
-# ============================================================
-# Ovv Call Layer
-# ============================================================
-from ovv.ovv_call import call_ovv, OVV_CORE, OVV_EXTERNAL, SYSTEM_PROMPT
+def now_jst() -> datetime:
+    return datetime.now(JST)
 
-# ============================================================
-# Debug Context Injection
-# ============================================================
-from debug.debug_context import debug_context
-
-debug_context.pg_conn = db_pg.PG_CONN
-debug_context.notion = notion_client
-debug_context.openai_client = openai_client
-
-debug_context.load_mem = load_runtime_memory
-debug_context.save_mem = save_runtime_memory
-debug_context.append_mem = append_runtime_memory
-
-debug_context.brain_gen = generate_thread_brain
-debug_context.brain_load = load_thread_brain
-debug_context.brain_save = save_thread_brain
-
-debug_context.ovv_core = OVV_CORE
-debug_context.ovv_external = OVV_EXTERNAL
-debug_context.system_prompt = SYSTEM_PROMPT
-
-print("[DEBUG] debug_context injection complete.")
 
 # ============================================================
 # Discord Setup
@@ -109,6 +73,8 @@ print("[DEBUG] debug_context injection complete.")
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+BOOT_LOG_CHANNEL_ID = 1446060807044468756  # #boot_log
 
 
 def get_context_key(msg: discord.Message) -> int:
@@ -124,46 +90,103 @@ def is_task_channel(message: discord.Message) -> bool:
     ch = message.channel
     if isinstance(ch, discord.Thread):
         parent = ch.parent
-        return parent and parent.name.lower().startswith("task_")
+        return parent.name.lower().startswith("task_") if parent else False
     return ch.name.lower().startswith("task_")
 
 
 # ============================================================
-# on_ready（Boot Log）
+# Boot Log（JST 対応 / Embed）
 # ============================================================
+async def send_boot_log_embed(bot_client: discord.Client):
+    channel = bot_client.get_channel(BOOT_LOG_CHANNEL_ID)
+    if channel is None:
+        print(f"[BOOT] boot_log channel not found (id={BOOT_LOG_CHANNEL_ID})")
+        return
+
+    env_keys = [
+        "DISCORD_BOT_TOKEN",
+        "OPENAI_API_KEY",
+        "NOTION_API_KEY",
+        "NOTION_TASKS_DB_ID",
+        "NOTION_SESSIONS_DB_ID",
+        "NOTION_LOGS_DB_ID",
+        "POSTGRES_URL",
+    ]
+    env_ok = all(os.getenv(k) for k in env_keys)
+
+    pg_ok = bool(db_pg.PG_CONN)
+    notion_ok = notion_client is not None
+    openai_ok = openai_client is not None
+    context_ready = env_ok and pg_ok and notion_ok and openai_ok
+
+    embed = discord.Embed(
+        title="Ovv Boot Summary",
+        description="起動ログを報告します。",
+    )
+    embed.add_field(name="ENV", value=str(env_ok), inline=False)
+    embed.add_field(name="PostgreSQL", value=str(pg_ok), inline=False)
+    embed.add_field(name="Notion", value=str(notion_ok), inline=False)
+    embed.add_field(name="OpenAI", value=str(openai_ok), inline=False)
+    embed.add_field(name="Context Ready", value=str(context_ready), inline=False)
+    embed.timestamp = now_jst()
+
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        print("[BOOT] failed to send boot_log embed:", repr(e))
+
+
 @bot.event
 async def on_ready():
-    print(f"[BOT] Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"[BOOT] Logged in as {bot.user} (id={bot.user.id})")
     try:
-        await send_boot_message(bot)
+        await send_boot_log_embed(bot)
     except Exception as e:
-        print("[BOOT] send_boot_message failed:", repr(e))
+        print("[BOOT] boot_log send error:", repr(e))
 
 
 # ============================================================
-# on_message（DEBUG → Command → Ovv）
+# Runtime Memory / Thread Brain (db_pg Proxy)
+# ============================================================
+load_runtime_memory = db_pg.load_runtime_memory
+save_runtime_memory = db_pg.save_runtime_memory
+append_runtime_memory = db_pg.append_runtime_memory
+
+load_thread_brain = db_pg.load_thread_brain
+save_thread_brain = db_pg.save_thread_brain
+generate_thread_brain = db_pg.generate_thread_brain
+
+
+# ============================================================
+# on_message（DEBUG → Commands → Ovv）
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
 
+    # Bot 自身 / 他 Bot は無視
     if message.author.bot:
         return
 
-    # Debug Layer
+    # スレッド作成通知など "通常メッセージ以外" は無視
+    if message.type is not discord.MessageType.default:
+        return
+
+    # 1. Debug Routing
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
-    # Command Layer
+    # 2. Commands
     if message.content.startswith("!"):
-        log_audit("command", {"cmd": message.content})
+        db_pg.log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # Ovv Layer
+    # 3. Normal message → Memory → Thread Brain → Ovv
     ck = get_context_key(message)
     session_id = str(ck)
 
+    # User メモリ
     append_runtime_memory(
         session_id,
         "user",
@@ -178,7 +201,18 @@ async def on_message(message: discord.Message):
         if summary:
             save_thread_brain(ck, summary)
 
+    # 推論
     ans = call_ovv(ck, message.content, mem)
+
+    # Assistant メモリ
+    append_runtime_memory(
+        session_id,
+        "assistant",
+        ans,
+        limit=40 if is_task_channel(message) else 12,
+    )
+
+    db_pg.log_audit("assistant_reply", {"context_key": ck, "length": len(ans)})
 
     await message.channel.send(ans)
 
@@ -234,9 +268,29 @@ async def test_thread(ctx):
 
 
 # ============================================================
-# Boot Complete
+# Debug Context Injection
+# ============================================================
+debug_context.pg_conn = db_pg.PG_CONN
+debug_context.notion = notion_client
+debug_context.openai_client = openai_client
+
+debug_context.load_mem = load_runtime_memory
+debug_context.save_mem = save_runtime_memory
+debug_context.append_mem = append_runtime_memory
+
+debug_context.brain_gen = generate_thread_brain
+debug_context.brain_load = load_thread_brain
+debug_context.brain_save = save_thread_brain
+
+debug_context.ovv_core = OVV_CORE
+debug_context.ovv_external = OVV_EXTERNAL
+debug_context.system_prompt = SYSTEM_PROMPT
+
+print("[DEBUG] context injection complete.")
+
+# ============================================================
+# Run
 # ============================================================
 print("[BOOT] PG Connected =", bool(db_pg.PG_CONN))
-print("[BOOT] Starting Discord Bot")
-
+print("[BOOT] Starting Discord Bot (JST boot_log)")
 bot.run(DISCORD_BOT_TOKEN)
