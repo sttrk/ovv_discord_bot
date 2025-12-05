@@ -1,16 +1,20 @@
 # ovv/ovv_call.py
-# Ovv Call Layer - A5 Reasoning Upgrade v2（BIS 対応）
+# Ovv Call Layer - A5 Reasoning Upgrade v1 (with Interface_Box v0.3)
 
-from typing import List, Dict
-import json
+from typing import List
 
 from openai import OpenAI
 from config import OPENAI_API_KEY
 
+# Core / External ローダ
 from ovv.core_loader import load_core, load_external
-from ovv.interface_box import build_ovv_input
 
+# Thread Brain / Memory 参照用（循環依存なし）
 import database.pg as db_pg
+
+# Interface_Box（BIS: I 層）
+from ovv.interface_box import build_messages
+
 
 # ============================================================
 # Core / External / Soft-Core
@@ -28,6 +32,7 @@ OVV_SOFT_CORE = """
 6. MUST NOT phase-mix (設計・推論・出力を混ぜない)。
 7. MAY trigger CDC (自己監査) but sparingly and構造化して扱う。
 """.strip()
+
 
 # ============================================================
 # SYSTEM_PROMPT（A5: Final Only / Thread-Brain 対応）
@@ -58,82 +63,43 @@ Ovv Soft-Core:
 - 実装コードに関する回答では、なるべく具体的な関数名・ファイル名・責務境界を明示する。
 """.strip()
 
+
 # ============================================================
 # OpenAI Client
 # ============================================================
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+
 # ============================================================
-# call_ovv: A5 + BIS 対応版
+# call_ovv: A5 強化版（Interface_Box 統合）
 # ============================================================
-def call_ovv(
-    context_key: int,
-    text: str,
-    recent_mem: List[dict],
-    task_mode: bool = False,
-) -> str:
+def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
     """
-    A5: Ovv 推論呼び出し（BIS 対応版）
-    - Interface_Box で構築した input packet を元に messages を構成する。
-    - 返却値は LLM の生テキスト（[FINAL] を含む）。最終抽出は Stabilizer が担当。
+    A5: Ovv 推論呼び出し
+    - Soft-Core / Core / External / Thread Brain / Runtime Memory を統合して LLM に渡す。
+    - messages 構築は Interface_Box(build_messages) に一元化。
+    - 返却値は生テキストだが、[FINAL] 付きで返すことを期待。
     """
 
-    # 1) Interface_Box で前処理
-    pkt = build_ovv_input(
+    # 1) Thread Brain 読み出し（あれば）
+    try:
+        tb = db_pg.load_thread_brain(context_key)
+    except Exception as e:
+        print("[call_ovv] thread_brain load error:", repr(e))
+        tb = None
+
+    # 2) Interface_Box で messages 構築
+    messages = build_messages(
         context_key=context_key,
         user_text=text,
         recent_mem=recent_mem,
-        task_mode=task_mode,
+        system_prompt=SYSTEM_PROMPT,
+        ovv_core=OVV_CORE,
+        ovv_external=OVV_EXTERNAL,
+        thread_brain=tb,
     )
 
-    trimmed_mem = pkt.get("trimmed_mem", [])
-    tb_prompt = pkt.get("tb_prompt") or ""
-    tb_scoring = pkt.get("tb_scoring") or ""
-    state_hint = pkt.get("state_hint")
-
-    messages: List[Dict[str, str]] = []
-
-    # 2) System + Core / External
-    messages.append({"role": "system", "content": SYSTEM_PROMPT})
-    messages.append({"role": "assistant", "content": OVV_CORE})
-    messages.append({"role": "assistant", "content": OVV_EXTERNAL})
-
-    # 3) Thread Brain & Scoring
-    if tb_prompt:
-        messages.append({
-            "role": "system",
-            "content": f"[ThreadBrain]\n{tb_prompt}",
-        })
-
-    if tb_scoring:
-        messages.append({
-            "role": "system",
-            "content": tb_scoring,
-        })
-
-    # 4) State Hint
-    if state_hint:
-        try:
-            hint_text = json.dumps(state_hint, ensure_ascii=False)
-        except Exception:
-            hint_text = str(state_hint)
-        messages.append({
-            "role": "system",
-            "content": f"[StateHint]\n{hint_text}",
-        })
-
-    # 5) 直近メモリ（PG runtime_memory）から 20 件まで
-    for m in trimmed_mem:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if not content:
-            continue
-        messages.append({"role": role, "content": content})
-
-    # 6) 今回ユーザー入力
-    messages.append({"role": "user", "content": text})
-
-    # 7) OpenAI 呼び出し
+    # 3) OpenAI 呼び出し
     try:
         res = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -142,7 +108,7 @@ def call_ovv(
         )
         raw = res.choices[0].message.content.strip()
 
-        # runtime_memory に assistant 発話を保存
+        # 4) runtime_memory に assistant 発話を保存
         try:
             db_pg.append_runtime_memory(
                 str(context_key),
@@ -153,17 +119,20 @@ def call_ovv(
         except Exception as e:
             print("[call_ovv] append_runtime_memory error:", repr(e))
 
-        # 生のまま返却（[FINAL] 抽出は Stabilizer / bot.py 側）
+        # そのまま返す（最終フィルタは bot.py 側で [FINAL] 抽出）
         return raw[:1900]
 
     except Exception as e:
         print("[call_ovv error]", repr(e))
         try:
-            db_pg.log_audit("openai_error", {
-                "context_key": context_key,
-                "user_text": text[:500],
-                "error": repr(e),
-            })
+            db_pg.log_audit(
+                "openai_error",
+                {
+                    "context_key": context_key,
+                    "user_text": text[:500],
+                    "error": repr(e),
+                },
+            )
         except Exception:
             pass
 
