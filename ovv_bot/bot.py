@@ -1,4 +1,4 @@
-# bot.py - Ovv Discord Bot (A-3 Stable)
+# bot.py - Ovv Discord Bot (A-3 Complete Injection Edition)
 
 import os
 import json
@@ -14,9 +14,10 @@ from notion_client import Client
 # DEBUG HOOK
 # ============================================================
 from debug.debug_router import route_debug_message
+from debug.debug_context import debug_context   # ← 重要
 
 # ============================================================
-# PostgreSQL Module (絶対に from-import しない)
+# PostgreSQL Module
 # ============================================================
 import database.pg as db_pg
 
@@ -68,43 +69,16 @@ generate_thread_brain = db_pg.generate_thread_brain
 # ============================================================
 # Ovv Call
 # ============================================================
-from ovv.ovv_call import call_ovv
+from ovv.ovv_call import (
+    call_ovv,
+    OVV_CORE,
+    OVV_EXTERNAL,
+    SYSTEM_PROMPT,
+)
 
 # ============================================================
-# Boot Log
+# A-3 Debug Context Injection（ここが今回の本命）
 # ============================================================
-BOOT_CHANNEL_ID = 1446060807044468756
-
-async def send_boot_log(bot: commands.Bot):
-    ch = bot.get_channel(BOOT_CHANNEL_ID)
-    ts = datetime.now(timezone.utc).isoformat()
-
-    ENV_OK = True
-    PG_OK = bool(db_pg.PG_CONN)
-    NOTION_OK = notion is not None
-    OPENAI_OK = openai_client is not None
-    CTX_OK = all([load_runtime_memory, save_runtime_memory, append_runtime_memory])
-
-    msg = (
-        "**Ovv Boot Summary**\n\n"
-        f"ENV: {ENV_OK}\n"
-        f"PostgreSQL: {PG_OK}\n"
-        f"Notion: {NOTION_OK}\n"
-        f"OpenAI: {OPENAI_OK}\n"
-        f"Context Ready: {CTX_OK}\n\n"
-        f"`timestamp: {ts}`"
-    )
-
-    if ch:
-        await ch.send(msg)
-    else:
-        print("[BOOT] boot_log channel not found")
-
-# ============================================================
-# Debug Context Injection（重要）
-# ============================================================
-from debug.debug_context import debug_context
-
 debug_context.pg_conn = db_pg.PG_CONN
 debug_context.notion = notion
 debug_context.openai_client = openai_client
@@ -117,11 +91,41 @@ debug_context.brain_gen = generate_thread_brain
 debug_context.brain_load = load_thread_brain
 debug_context.brain_save = save_thread_brain
 
-debug_context.ovv_core = None  # A-3では未使用
-debug_context.ovv_external = None
-debug_context.system_prompt = None
+debug_context.ovv_core = OVV_CORE
+debug_context.ovv_external = OVV_EXTERNAL
+debug_context.system_prompt = SYSTEM_PROMPT
 
 print("[DEBUG] context injection complete.")
+
+# ============================================================
+# Boot Log
+# ============================================================
+BOOT_CHANNEL_ID = 1446060807044468756
+
+async def send_boot_log(bot: commands.Bot):
+    ts = datetime.now(timezone.utc).isoformat()
+
+    ENV_OK = True
+    PG_OK = bool(db_pg.PG_CONN)
+    NOTION_OK = notion is not None
+    OPENAI_OK = openai_client is not None
+    CTX_OK = all([OVV_CORE, OVV_EXTERNAL, SYSTEM_PROMPT])
+
+    msg = (
+        "**Ovv Boot Summary**\n\n"
+        f"ENV: {ENV_OK}\n"
+        f"PostgreSQL: {PG_OK}\n"
+        f"Notion: {NOTION_OK}\n"
+        f"OpenAI: {OPENAI_OK}\n"
+        f"Context Ready: {CTX_OK}\n\n"
+        f"`timestamp: {ts}`"
+    )
+
+    ch = bot.get_channel(BOOT_CHANNEL_ID)
+    if ch:
+        await ch.send(msg)
+    else:
+        print("[BOOT] boot_log channel not found")
 
 # ============================================================
 # Discord Setup
@@ -146,7 +150,7 @@ def is_task_channel(msg: discord.Message) -> bool:
     return ch.name.lower().startswith("task_")
 
 # ============================================================
-# Event: on_ready → boot_log を送信
+# Event: on_ready
 # ============================================================
 @bot.event
 async def on_ready():
@@ -162,18 +166,18 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # ① debug hook
+    # debug
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
-    # ② command
+    # command
     if message.content.startswith("!"):
         log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # ③ 推論対象の通常メッセージ
+    # normal inference
     ck = get_context_key(message)
     session_id = str(ck)
 
@@ -191,7 +195,6 @@ async def on_message(message: discord.Message):
         if summary:
             save_thread_brain(ck, summary)
 
-    # Ovv Core inference call
     ans = call_ovv(ck, message.content, mem)
     await message.channel.send(ans)
 
@@ -241,4 +244,3 @@ async def test_thread(ctx):
 # ============================================================
 print("[BOOT] Starting Discord Bot")
 bot.run(DISCORD_BOT_TOKEN)
-
