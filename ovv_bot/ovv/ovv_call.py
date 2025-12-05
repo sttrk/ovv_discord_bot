@@ -1,18 +1,19 @@
 # ovv/ovv_call.py
-# A-2 + A-3 完全統合版（Thread Brain + Scoring Layer）
-
 from typing import List
 from openai import OpenAI
 from config import OPENAI_API_KEY
 
+# ============================================================
+# Load Core / External
+# ============================================================
 from ovv.core_loader import load_core, load_external
-from ovv.threadbrain_adapter import build_tb_prompt
-from ovv.tb_scoring import build_scoring_prompt
-from database.pg import load_thread_brain
 
 OVV_CORE = load_core()
 OVV_EXTERNAL = load_external()
 
+# ============================================================
+# Soft-Core
+# ============================================================
 OVV_SOFT_CORE = """
 [Ovv Soft-Core v1.1]
 1. MUST keep user experience primary
@@ -31,9 +32,14 @@ SYSTEM_PROMPT = f"""
 {OVV_SOFT_CORE}
 """.strip()
 
+# ============================================================
+# OpenAI Client
+# ============================================================
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-
+# ============================================================
+# Ovv Main Logic（PG等を import しない）
+# ============================================================
 def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
 
     msgs = [
@@ -42,21 +48,7 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
-    # ======================================================
-    # A-2: Thread Brain Injection
-    # ======================================================
-    tb_summary = load_thread_brain(context_key)
-    tb_prompt = build_tb_prompt(tb_summary)
-    if tb_prompt:
-        msgs.append({"role": "assistant", "content": f"[Thread Brain]\n{tb_prompt}"})
-
-    # ======================================================
-    # A-3: Scoring Layer Injection（最優先ルール）
-    # ======================================================
-    scoring = build_scoring_prompt(tb_summary)
-    msgs.append({"role": "assistant", "content": scoring})
-
-    # Memory
+    # recent memory
     for m in recent_mem[-20:]:
         msgs.append({"role": m["role"], "content": m["content"]})
 
