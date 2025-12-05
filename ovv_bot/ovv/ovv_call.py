@@ -1,14 +1,15 @@
 # ovv/ovv_call.py
-# Ovv Call Layer - A4-R3 Stable Edition
+# Ovv Call Layer - September Stable Edition (FINAL-only)
 
-from typing import List, Optional
+from typing import List
 from openai import OpenAI
+
 from config import OPENAI_API_KEY
+from ovv.core_loader import load_core, load_external
 
 # ============================================================
 # Load Core / External
 # ============================================================
-from ovv.core_loader import load_core, load_external
 
 OVV_CORE = load_core()
 OVV_EXTERNAL = load_external()
@@ -16,6 +17,7 @@ OVV_EXTERNAL = load_external()
 # ============================================================
 # Soft-Core
 # ============================================================
+
 OVV_SOFT_CORE = """
 [Ovv Soft-Core v1.1]
 1. MUST keep user experience primary
@@ -27,9 +29,9 @@ OVV_SOFT_CORE = """
 7. MAY trigger CDC sparingly
 """.strip()
 
-SYSTEM_PROMPT_BASE = f"""
+SYSTEM_PROMPT = f"""
 あなたは Discord 上の Ovv です。
-次の Ovv Soft-Core を厳格に保持してください。
+次の Ovv Soft-Core を保持してください。
 
 {OVV_SOFT_CORE}
 """.strip()
@@ -37,63 +39,48 @@ SYSTEM_PROMPT_BASE = f"""
 # ============================================================
 # OpenAI Client
 # ============================================================
+
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ============================================================
-# A4-R3 context payload builder
+# Helper: FINAL 部だけを抽出
 # ============================================================
-def build_context_payload(thread_brain: Optional[dict]) -> str:
-    if not thread_brain:
-        return "(no thread_brain)"
 
-    meta = thread_brain.get("meta", {})
-    status = thread_brain.get("status", {})
-    decisions = thread_brain.get("decisions", [])[:3]
-    unresolved = thread_brain.get("unresolved", [])
-    constraints = thread_brain.get("constraints", [])
-    next_actions = thread_brain.get("next_actions", [])
-    history_digest = thread_brain.get("history_digest", "")
-    high_goal = thread_brain.get("high_level_goal", "")
-    recent_messages = thread_brain.get("recent_messages", [])[:3]
-    current_position = thread_brain.get("current_position", "")
+def _extract_final(text: str) -> str:
+    """
+    Ovv Core が [FINAL] や【FINAL】を含む場合、
+    FINAL セクションのみを返す。
+    なければ text 全体を返す（後方互換）。
+    """
+    if not text:
+        return text
 
-    return f"""
-[thread_brain payload A4-R3]
-phase: {status.get('phase')}
-last_major_event: {status.get('last_major_event')}
-high_level_goal: {high_goal}
-constraints: {constraints}
-unresolved: {unresolved}
-decisions(top3): {decisions}
-next_actions: {next_actions}
-history_digest: {history_digest}
-recent_messages(top3): {recent_messages}
-current_position: {current_position}
-""".strip()
+    markers = ["[FINAL]", "【FINAL】", "[ Final ]", "[FINAL OUTPUT]"]
+    idx = -1
+    for m in markers:
+        pos = text.find(m)
+        if pos != -1:
+            idx = pos + len(m)
+            break
+
+    if idx == -1:
+        return text.strip()
+
+    return text[idx:].strip()
 
 
 # ============================================================
-# call_ovv: Ovv Main Logic (A4-R3)
+# call_ovv: Ovv Main Logic (DB には一切依存しない)
 # ============================================================
-def call_ovv(
-    context_key: int,
-    text: str,
-    recent_mem: List[dict],
-    thread_brain: Optional[dict]
-) -> str:
 
-    context_payload = build_context_payload(thread_brain)
-
-    system_prompt = (
-        SYSTEM_PROMPT_BASE
-        + "\n\n"
-        + "以下は現在のコンテキスト情報（A4-R3形式）です：\n"
-        + context_payload
-    )
-
+def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
+    """
+    - PG や Notion には一切触れない「純粋な推論レイヤ」
+    - メモリ・監査は呼び出し側（bot.py）が責務を持つ
+    """
     msgs = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "assistant", "content": OVV_CORE},
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
@@ -105,11 +92,13 @@ def call_ovv(
 
     try:
         res = openai_client.chat.completions.create(
-            model="gpt-4.1",
+            model="gpt-4.1-mini",
             messages=msgs,
-            temperature=0.5,
+            temperature=0.7,
         )
-        return res.choices[0].message.content.strip()[:1900]
+        raw = res.choices[0].message.content.strip()
+        final = _extract_final(raw)
+        return final[:1900]
 
     except Exception as e:
         print("[call_ovv error]", repr(e))
