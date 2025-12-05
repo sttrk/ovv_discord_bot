@@ -210,9 +210,33 @@ async def test_thread(ctx):
     await ctx.send("test OK: summary saved")
 
 # ============================================================
+# Debug Context Injection（September Stable Required）
+# ============================================================
+from debug.debug_context import debug_context
+
+debug_context.pg_conn = db_pg.PG_CONN
+debug_context.notion = notion
+debug_context.openai_client = openai_client
+
+debug_context.load_mem = load_runtime_memory
+debug_context.save_mem = save_runtime_memory
+debug_context.append_mem = append_runtime_memory
+
+debug_context.brain_gen = generate_thread_brain
+debug_context.brain_load = load_thread_brain
+debug_context.brain_save = save_thread_brain
+
+debug_context.ovv_core = OVV_CORE
+debug_context.ovv_external = OVV_EXTERNAL
+debug_context.system_prompt = SYSTEM_PROMPT
+
+print("[DEBUG] context injection complete.")
+
+# ============================================================
 # Boot Complete
 # ============================================================
 print("[BOOT] PG Connected =", bool(db_pg.PG_CONN))
 print("[BOOT] Starting Discord Bot")
 
 bot.run(DISCORD_BOT_TOKEN)
+
