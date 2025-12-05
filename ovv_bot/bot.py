@@ -1,22 +1,18 @@
-# bot.py - Ovv Discord Bot (BIS-Gate Edition v1)
-# ============================================================
-# このファイルは BIS モデルの「Boundary_Gate（入口層）」であり、
-# Discord → Ovv への入力を正規化し、中間層（Interface_Box）へ受け渡す。
-# 中間ロジック（推論構築）や出力安定化は原則として担当しない。
-# ============================================================
+# bot.py - BIS Prototype A1
+# Boundary Gate / Interface Box / Stabilizer 入口実装
+# ========================================================
 
 import os
 import json
 import discord
 from discord.ext import commands
 from datetime import datetime, timezone
-from typing import List
 
 from openai import OpenAI
 from notion_client import Client
 
 # ============================================================
-# Environment Variables
+# Environment
 # ============================================================
 from config import (
     DISCORD_BOT_TOKEN,
@@ -28,7 +24,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
-# PostgreSQL Module（入口層では直接操作せず、proxy 経由で扱う）
+# PostgreSQL
 # ============================================================
 import database.pg as db_pg
 
@@ -38,56 +34,41 @@ db_pg.init_db(conn)
 
 log_audit = db_pg.log_audit
 
-# Runtime Memory proxy
 load_runtime_memory = db_pg.load_runtime_memory
 save_runtime_memory = db_pg.save_runtime_memory
 append_runtime_memory = db_pg.append_runtime_memory
 
-# Thread Brain
 load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
 
 # ============================================================
-# Ovv Core 呼び出しレイヤ（Interface_Box）
+# Ovv Core 呼び出し
 # ============================================================
 from ovv.ovv_call import (
     call_ovv,
-    OVV_CORE,
-    OVV_EXTERNAL,
     SYSTEM_PROMPT,
 )
 
 # ============================================================
-# Debug Context Injection（Boundary_Gate → debug）
+# Debug Context / Router
 # ============================================================
 from debug.debug_context import debug_context
+from debug.debug_router import route_debug_message
 
 debug_context.pg_conn = db_pg.PG_CONN
 debug_context.notion = notion
 debug_context.openai_client = openai_client
-
 debug_context.load_mem = load_runtime_memory
 debug_context.save_mem = save_runtime_memory
 debug_context.append_mem = append_runtime_memory
-
 debug_context.brain_gen = generate_thread_brain
 debug_context.brain_load = load_thread_brain
 debug_context.brain_save = save_thread_brain
-
-debug_context.ovv_core = OVV_CORE
-debug_context.ovv_external = OVV_EXTERNAL
 debug_context.system_prompt = SYSTEM_PROMPT
 
-print("[DEBUG] debug_context injection complete.")
-
 # ============================================================
-# Debug Router（Boundary_Gate で最優先に分岐）
-# ============================================================
-from debug.debug_router import route_debug_message
-
-# ============================================================
-# Notion CRUD（I/O は入口層では直接扱わない）
+# Notion CRUD
 # ============================================================
 from notion.notion_api import (
     create_task,
@@ -97,7 +78,7 @@ from notion.notion_api import (
 )
 
 # ============================================================
-# Boot Log（debug_boot に委譲）
+# Debug boot
 # ============================================================
 from debug.debug_boot import send_boot_message
 
@@ -108,18 +89,14 @@ from debug.debug_boot import send_boot_message
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None,
-)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 
 # ============================================================
-# BIS: Boundary_Gate Utilities
+# BIS: Boundary Gate Helper
 # ============================================================
 def get_context_key(msg: discord.Message) -> int:
-    """スレッド/チャンネルを一意に識別するキーを生成"""
+    """スレッド/チャンネル/DM を一意に識別するキー"""
     ch = msg.channel
     if isinstance(ch, discord.Thread):
         return ch.id
@@ -129,7 +106,6 @@ def get_context_key(msg: discord.Message) -> int:
 
 
 def is_task_channel(msg: discord.Message) -> bool:
-    """Task チャンネルのみ ThreadBrain 生成を許可"""
     ch = msg.channel
     if isinstance(ch, discord.Thread):
         parent = ch.parent
@@ -138,20 +114,20 @@ def is_task_channel(msg: discord.Message) -> bool:
 
 
 # ============================================================
-# BIS: Stabilizer（最小構築版）
+# BIS: Stabilizer（出口） FINAL抽出
 # ============================================================
 def extract_final(raw: str) -> str:
-    """
-    Ovv の出力から FINAL ブロックのみを抽出する。
-    将来的には Stabilizer 層へ分離されることを前提とする。
-    """
-    if "[FINAL]" not in raw:
-        return raw.strip()
-    return raw.split("[FINAL]", 1)[1].strip()
+    if not raw:
+        return "（出力なし）"
+
+    if "[FINAL]" in raw:
+        return raw.split("[FINAL]", 1)[1].strip()
+
+    return raw.strip()
 
 
 # ============================================================
-# Event: on_ready（入口層の責務：起動通知）
+# Event: on_ready
 # ============================================================
 @bot.event
 async def on_ready():
@@ -160,41 +136,36 @@ async def on_ready():
 
 
 # ============================================================
-# Event: on_message（Boundary_Gate の本体）
+# BIS: on_message（入口 → 中間 → 出口）
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
 
-    # --------------------------------------------------------
-    # 0. Gatekeeper: Bot 自身 / システムメッセージは拒否
-    # --------------------------------------------------------
+    # -------------------------------
+    # Boundary Gate: フィルタリング
+    # -------------------------------
     if message.author.bot:
         return
+
     if message.type is not discord.MessageType.default:
         return
 
-    # --------------------------------------------------------
-    # 1. Debug Router（B:Boundary_Gate → debug）
-    # --------------------------------------------------------
-    handled = await route_debug_message(bot, message)
-    if handled:
+    # Debug Router
+    if await route_debug_message(bot, message):
         return
 
-    # --------------------------------------------------------
-    # 2. Commands（B: Boundary_Gate）
-    # --------------------------------------------------------
+    # Discord commands (!xxxx)
     if message.content.startswith("!"):
         log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # --------------------------------------------------------
-    # 3. Normal Message → Interface_Box
-    # --------------------------------------------------------
+    # -------------------------------
+    # Interface Box: InputPacket形成
+    # -------------------------------
     ck = get_context_key(message)
     session_id = str(ck)
 
-    # Runtime Memory 保存（入口層責務）
     append_runtime_memory(
         session_id,
         "user",
@@ -204,27 +175,26 @@ async def on_message(message: discord.Message):
 
     mem = load_runtime_memory(session_id)
 
-    # Task チャンネルでは ThreadBrain 更新（後で I に渡す想定）
+    # Task 系は ThreadBrain を更新
     if is_task_channel(message):
-        summary = generate_thread_brain(ck, mem)
-        if summary:
-            save_thread_brain(ck, summary)
+        tb = generate_thread_brain(ck, mem)
+        if tb:
+            save_thread_brain(ck, tb)
 
-    # --------------------------------------------------------
-    # Interface_Box へ委譲
-    # --------------------------------------------------------
-    raw_ans = call_ovv(ck, message.content, mem)
+    # -------------------------------
+    # Ovv Core 呼び出し（推論）
+    # -------------------------------
+    raw = call_ovv(ck, message.content, mem)
 
-    # --------------------------------------------------------
-    # Stabilizer: FINAL 抽出
-    # --------------------------------------------------------
-    final_ans = extract_final(raw_ans)
-
+    # -------------------------------
+    # Stabilizer
+    # -------------------------------
+    final_ans = extract_final(raw)
     await message.channel.send(final_ans)
 
 
 # ============================================================
-# Commands（Boundary_Gate 管理下）
+# Commands
 # ============================================================
 @bot.command(name="ping")
 async def ping(ctx):
@@ -275,7 +245,7 @@ async def test_thread(ctx):
 
 
 # ============================================================
-# Run（入口層の責務：Discord 接続だけ）
+# Run
 # ============================================================
 print("[BOOT] Starting Discord Bot")
 bot.run(DISCORD_BOT_TOKEN)
