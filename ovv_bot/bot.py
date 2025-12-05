@@ -1,4 +1,4 @@
-# bot.py - Ovv Discord Bot (A-3 Complete Injection Edition)
+# bot.py - Ovv Discord Bot (A-4-R3 + FINAL Only Reply + Assistant Memory)
 
 import os
 import json
@@ -11,13 +11,12 @@ from openai import OpenAI
 from notion_client import Client
 
 # ============================================================
-# DEBUG HOOK
+# Debug Router
 # ============================================================
 from debug.debug_router import route_debug_message
-from debug.debug_context import debug_context   # ← 重要
 
 # ============================================================
-# PostgreSQL Module
+# PostgreSQL Module (絶対に from-import しない)
 # ============================================================
 import database.pg as db_pg
 
@@ -69,33 +68,7 @@ generate_thread_brain = db_pg.generate_thread_brain
 # ============================================================
 # Ovv Call
 # ============================================================
-from ovv.ovv_call import (
-    call_ovv,
-    OVV_CORE,
-    OVV_EXTERNAL,
-    SYSTEM_PROMPT,
-)
-
-# ============================================================
-# A-3 Debug Context Injection（ここが今回の本命）
-# ============================================================
-debug_context.pg_conn = db_pg.PG_CONN
-debug_context.notion = notion
-debug_context.openai_client = openai_client
-
-debug_context.load_mem = load_runtime_memory
-debug_context.save_mem = save_runtime_memory
-debug_context.append_mem = append_runtime_memory
-
-debug_context.brain_gen = generate_thread_brain
-debug_context.brain_load = load_thread_brain
-debug_context.brain_save = save_thread_brain
-
-debug_context.ovv_core = OVV_CORE
-debug_context.ovv_external = OVV_EXTERNAL
-debug_context.system_prompt = SYSTEM_PROMPT
-
-print("[DEBUG] context injection complete.")
+from ovv.ovv_call import call_ovv
 
 # ============================================================
 # Boot Log
@@ -103,13 +76,14 @@ print("[DEBUG] context injection complete.")
 BOOT_CHANNEL_ID = 1446060807044468756
 
 async def send_boot_log(bot: commands.Bot):
+    ch = bot.get_channel(BOOT_CHANNEL_ID)
     ts = datetime.now(timezone.utc).isoformat()
 
     ENV_OK = True
     PG_OK = bool(db_pg.PG_CONN)
     NOTION_OK = notion is not None
     OPENAI_OK = openai_client is not None
-    CTX_OK = all([OVV_CORE, OVV_EXTERNAL, SYSTEM_PROMPT])
+    CTX_OK = True
 
     msg = (
         "**Ovv Boot Summary**\n\n"
@@ -121,7 +95,6 @@ async def send_boot_log(bot: commands.Bot):
         f"`timestamp: {ts}`"
     )
 
-    ch = bot.get_channel(BOOT_CHANNEL_ID)
     if ch:
         await ch.send(msg)
     else:
@@ -146,16 +119,26 @@ def is_task_channel(msg: discord.Message) -> bool:
     ch = msg.channel
     if isinstance(ch, discord.Thread):
         parent = ch.parent
-        return parent and parent.name.lower().startswith("task_")
-    return ch.name.lower().startswith("task_")
+        return parent and parent.name.lower().startswith("task")
+    return ch.name.lower().startswith("task")
 
 # ============================================================
-# Event: on_ready
+# Event: on_ready → boot_log を送信
 # ============================================================
 @bot.event
 async def on_ready():
     print("[READY] Bot connected as", bot.user)
     await send_boot_log(bot)
+
+# ============================================================
+# FINAL部分だけ抽出する関数
+# ============================================================
+def extract_final(text: str) -> str | None:
+    if "[FINAL]" not in text:
+        return None
+    # FINAL の後ろだけ返す
+    part = text.split("[FINAL]", 1)[1].strip()
+    return part if part else None
 
 # ============================================================
 # Event: on_message
@@ -166,18 +149,18 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # debug
+    # Debug Router
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
-    # command
+    # Commands
     if message.content.startswith("!"):
         log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # normal inference
+    # 推論対象メッセージ
     ck = get_context_key(message)
     session_id = str(ck)
 
@@ -190,13 +173,29 @@ async def on_message(message: discord.Message):
 
     mem = load_runtime_memory(session_id)
 
+    # Thread Brain 生成（taskスレッド限定）
     if is_task_channel(message):
         summary = generate_thread_brain(ck, mem)
         if summary:
             save_thread_brain(ck, summary)
 
-    ans = call_ovv(ck, message.content, mem)
-    await message.channel.send(ans)
+    # Ovvコア推論
+    raw_ans = call_ovv(ck, message.content, mem)
+
+    # [FINAL] だけ返す
+    final = extract_final(raw_ans)
+    if final is None:
+        return  # FINAL が無い場合は返答しない（UI版と同じ）
+
+    # assistant ログを保存（FINALのみ）
+    append_runtime_memory(
+        session_id,
+        "assistant",
+        final,
+        limit=40 if is_task_channel(message) else 12,
+    )
+
+    await message.channel.send(final)
 
 # ============================================================
 # Commands
