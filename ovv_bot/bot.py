@@ -1,4 +1,4 @@
-# bot.py - Ovv Discord Bot (Stable Full Edition A4-R3 + Stabilizer v1.0)
+# bot.py - Ovv Discord Bot (Stable Full Edition A5-BIS)
 
 import os
 import json
@@ -53,10 +53,8 @@ from ovv.ovv_call import (
     SYSTEM_PROMPT,
 )
 
-# ============================================================
-# Stabilizer（出口層）
-# ============================================================
-from ovv.stabilizer import stabilize_output
+# Stabilizer（出口）
+from ovv.stabilizer import stabilize_ovv_output
 
 # ============================================================
 # Debug Context Injection（必須：debug_commands の cfg 用）
@@ -144,7 +142,7 @@ async def on_ready():
 
 
 # ============================================================
-# Event: on_message（Final Only & system message filter）
+# Event: on_message（B → I → Ovv → S）
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
@@ -171,31 +169,36 @@ async def on_message(message: discord.Message):
     # ③ 通常メッセージ → Ovv 推論
     ck = get_context_key(message)
     session_id = str(ck)
+    task_mode = is_task_channel(message)
 
+    # Boundary_Gate: runtime_memory への書き込み
     append_runtime_memory(
         session_id,
         "user",
         message.content,
-        limit=40 if is_task_channel(message) else 12,
+        limit=40 if task_mode else 12,
     )
 
     mem = load_runtime_memory(session_id)
 
     # Task チャンネルでは thread_brain を更新
-    if is_task_channel(message):
+    if task_mode:
         summary = generate_thread_brain(ck, mem)
         if summary:
             save_thread_brain(ck, summary)
 
-    # Ovv Core 呼び出し（Interface_Box）
-    raw_ans = call_ovv(ck, message.content, mem)
+    # Interface_Box + Ovv Core 呼び出し（内部で行われる）
+    raw_ans = call_ovv(
+        context_key=ck,
+        text=message.content,
+        recent_mem=mem,
+        task_mode=task_mode,
+    )
 
-    # Stabilizer で FINAL 抽出 + Discord 向け分割
-    final_messages = stabilize_output(raw_ans)
+    # Stabilizer: FINAL 抽出 + Discord 用整形
+    final_ans = stabilize_ovv_output(raw_ans)
 
-    for chunk in final_messages:
-        if chunk.strip():
-            await message.channel.send(chunk)
+    await message.channel.send(final_ans)
 
 
 # ============================================================
