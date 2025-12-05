@@ -1,18 +1,17 @@
-# bot.py - BIS Prototype A1
-# Boundary Gate / Interface Box / Stabilizer 入口実装
-# ========================================================
+# bot.py - Ovv Discord Bot (Stable Full Edition A4-R3 + Stabilizer v1.0)
 
 import os
 import json
 import discord
 from discord.ext import commands
 from datetime import datetime, timezone
+from typing import List
 
 from openai import OpenAI
 from notion_client import Client
 
 # ============================================================
-# Environment
+# Environment Variables
 # ============================================================
 from config import (
     DISCORD_BOT_TOKEN,
@@ -24,7 +23,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
-# PostgreSQL
+# PostgreSQL Module（絶対に from-import しない）
 # ============================================================
 import database.pg as db_pg
 
@@ -34,41 +33,61 @@ db_pg.init_db(conn)
 
 log_audit = db_pg.log_audit
 
+# Runtime Memory proxy
 load_runtime_memory = db_pg.load_runtime_memory
 save_runtime_memory = db_pg.save_runtime_memory
 append_runtime_memory = db_pg.append_runtime_memory
 
+# Thread Brain
 load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
 
 # ============================================================
-# Ovv Core 呼び出し
+# Ovv Core 呼び出しレイヤ（PG 初期化後に読み込む）
 # ============================================================
 from ovv.ovv_call import (
     call_ovv,
+    OVV_CORE,
+    OVV_EXTERNAL,
     SYSTEM_PROMPT,
 )
 
 # ============================================================
-# Debug Context / Router
+# Stabilizer（出口層）
+# ============================================================
+from ovv.stabilizer import stabilize_output
+
+# ============================================================
+# Debug Context Injection（必須：debug_commands の cfg 用）
 # ============================================================
 from debug.debug_context import debug_context
-from debug.debug_router import route_debug_message
 
 debug_context.pg_conn = db_pg.PG_CONN
 debug_context.notion = notion
 debug_context.openai_client = openai_client
+
 debug_context.load_mem = load_runtime_memory
 debug_context.save_mem = save_runtime_memory
 debug_context.append_mem = append_runtime_memory
+
 debug_context.brain_gen = generate_thread_brain
 debug_context.brain_load = load_thread_brain
 debug_context.brain_save = save_thread_brain
+
+debug_context.ovv_core = OVV_CORE
+debug_context.ovv_external = OVV_EXTERNAL
 debug_context.system_prompt = SYSTEM_PROMPT
 
+print("[DEBUG] debug_context injection complete.")
+
 # ============================================================
-# Notion CRUD
+# Debug Router（※必ず context injection 後にロード）
+# ============================================================
+from debug.debug_router import route_debug_message
+
+# ============================================================
+# Notion CRUD（循環依存なし）
 # ============================================================
 from notion.notion_api import (
     create_task,
@@ -78,10 +97,9 @@ from notion.notion_api import (
 )
 
 # ============================================================
-# Debug boot
+# Boot Log（debug_boot に一本化）
 # ============================================================
 from debug.debug_boot import send_boot_message
-
 
 # ============================================================
 # Discord Setup
@@ -89,14 +107,16 @@ from debug.debug_boot import send_boot_message
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+)
 
 # ============================================================
-# BIS: Boundary Gate Helper
+# Context Key utilities
 # ============================================================
 def get_context_key(msg: discord.Message) -> int:
-    """スレッド/チャンネル/DM を一意に識別するキー"""
     ch = msg.channel
     if isinstance(ch, discord.Thread):
         return ch.id
@@ -114,55 +134,41 @@ def is_task_channel(msg: discord.Message) -> bool:
 
 
 # ============================================================
-# BIS: Stabilizer（出口） FINAL抽出
-# ============================================================
-def extract_final(raw: str) -> str:
-    if not raw:
-        return "（出力なし）"
-
-    if "[FINAL]" in raw:
-        return raw.split("[FINAL]", 1)[1].strip()
-
-    return raw.strip()
-
-
-# ============================================================
-# Event: on_ready
+# Event: on_ready（boot_log 送信）
 # ============================================================
 @bot.event
 async def on_ready():
     print("[READY] Bot connected as", bot.user)
+    # boot_log 送信は debug_boot 側に委譲
     await send_boot_message(bot)
 
 
 # ============================================================
-# BIS: on_message（入口 → 中間 → 出口）
+# Event: on_message（Final Only & system message filter）
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
 
-    # -------------------------------
-    # Boundary Gate: フィルタリング
-    # -------------------------------
+    # Bot 自身・他の Bot には反応しない
     if message.author.bot:
         return
 
+    # スレッド作成通知など「通常メッセージ以外」には反応しない
     if message.type is not discord.MessageType.default:
         return
 
-    # Debug Router
-    if await route_debug_message(bot, message):
+    # ① Debug Router
+    handled = await route_debug_message(bot, message)
+    if handled:
         return
 
-    # Discord commands (!xxxx)
+    # ② コマンド（! で始まるもの）
     if message.content.startswith("!"):
         log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # -------------------------------
-    # Interface Box: InputPacket形成
-    # -------------------------------
+    # ③ 通常メッセージ → Ovv 推論
     ck = get_context_key(message)
     session_id = str(ck)
 
@@ -175,22 +181,21 @@ async def on_message(message: discord.Message):
 
     mem = load_runtime_memory(session_id)
 
-    # Task 系は ThreadBrain を更新
+    # Task チャンネルでは thread_brain を更新
     if is_task_channel(message):
-        tb = generate_thread_brain(ck, mem)
-        if tb:
-            save_thread_brain(ck, tb)
+        summary = generate_thread_brain(ck, mem)
+        if summary:
+            save_thread_brain(ck, summary)
 
-    # -------------------------------
-    # Ovv Core 呼び出し（推論）
-    # -------------------------------
-    raw = call_ovv(ck, message.content, mem)
+    # Ovv Core 呼び出し（Interface_Box）
+    raw_ans = call_ovv(ck, message.content, mem)
 
-    # -------------------------------
-    # Stabilizer
-    # -------------------------------
-    final_ans = extract_final(raw)
-    await message.channel.send(final_ans)
+    # Stabilizer で FINAL 抽出 + Discord 向け分割
+    final_messages = stabilize_output(raw_ans)
+
+    for chunk in final_messages:
+        if chunk.strip():
+            await message.channel.send(chunk)
 
 
 # ============================================================
