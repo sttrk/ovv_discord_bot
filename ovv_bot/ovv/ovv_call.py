@@ -1,5 +1,5 @@
 # ovv/ovv_call.py
-# Ovv Call Layer - A5 Reasoning Upgrade + TB-Scoring Integration
+# Ovv Call Layer - A5 Reasoning Upgrade v1 + state_hint 対応
 
 from typing import List, Optional
 import json
@@ -12,10 +12,6 @@ from ovv.core_loader import load_core, load_external
 
 # Thread Brain / Memory 参照用（循環依存なし）
 import database.pg as db_pg
-
-# ThreadBrain → テキスト変換 / スコアリング層
-from ovv.threadbrain_adapter import build_tb_prompt
-from ovv.tb_scoring import build_scoring_prompt
 
 
 # ============================================================
@@ -59,11 +55,10 @@ Ovv Soft-Core:
 
 制約:
 - ユーザーの業務・開発に直接役立つことを最優先とし、不要な雑談や冗長な前置きは避ける。
-- Thread Brain に記録された high_level_goal / next_actions / history_digest / constraints / unresolved / decisions は、
+- Thread Brain に記録された high_level_goal / next_actions / history_digest は、
   「長期的な方針」や「これまでの合意事項」として尊重しつつ、
   矛盾があれば最新のユーザー発言を優先する。
 - 実装コードに関する回答では、なるべく具体的な関数名・ファイル名・責務境界を明示する。
-- TB-Scoring で与えられた優先ルールがあれば、それを強く尊重する。
 """.strip()
 
 
@@ -74,76 +69,133 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ============================================================
-# call_ovv: A5 + ThreadBrainAdapter + TB-Scoring 統合版
+# Thread Brain -> テキスト変換（LLM に渡す要約）
 # ============================================================
-def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
+def _format_thread_brain(tb: dict) -> str:
     """
-    A5: Ovv 推論呼び出し（BIS 対応）
-    - Soft-Core / Core / External / Thread Brain / TB-Scoring / Runtime Memory を統合して LLM に渡す。
+    thread_brain(JSON) を、LLM が使いやすい短いテキストに変換する。
+    recent_messages 全部は渡さず、meta / status / goal / next_actions など要点だけ。
+    """
+    meta = tb.get("meta", {})
+    status = tb.get("status", {})
+    high_level_goal = tb.get("high_level_goal", "")
+    history_digest = tb.get("history_digest", "")
+    next_actions = tb.get("next_actions", [])
+    unresolved = tb.get("unresolved", [])
+
+    lines = []
+
+    # Meta / Status
+    phase = status.get("phase", "")
+    last_event = status.get("last_major_event", "")
+
+    if phase:
+        lines.append(f"phase: {phase}")
+    if last_event:
+        lines.append(f"last_major_event: {last_event}")
+
+    # Goal / Digest
+    if high_level_goal:
+        lines.append(f"high_level_goal: {high_level_goal}")
+    if history_digest:
+        lines.append(f"history_digest: {history_digest}")
+
+    # Next actions
+    if next_actions:
+        lines.append("next_actions:")
+        for a in next_actions[:5]:
+            lines.append(f"- {a}")
+
+    # Unresolved issues
+    if unresolved:
+        lines.append("unresolved:")
+        for u in unresolved[:5]:
+            if isinstance(u, str):
+                lines.append(f"- {u}")
+            elif isinstance(u, dict):
+                title = u.get("title") or str(u)[:80]
+                lines.append(f"- {title}")
+
+    text = "\n".join(lines)
+    if len(text) > 1200:
+        text = text[:1200] + " ...[truncated]"
+
+    return text or "(no thread_brain summary)"
+
+
+# ============================================================
+# call_ovv: A5 強化版 + state_hint
+# ============================================================
+def call_ovv(
+    context_key: int,
+    text: str,
+    recent_mem: List[dict],
+    state_hint: Optional[dict] = None,
+) -> str:
+    """
+    A5: Ovv 推論呼び出し
+    - Soft-Core / Core / External / Thread Brain / Runtime Memory / state_hint を統合して LLM に渡す。
     - 返却値は生テキストだが、[FINAL] 付きで返すことを期待。
+
+    引数:
+        context_key: int
+            Discord 文脈キー（guild / channel / thread を含む）。
+        text: str
+            今回のユーザー入力（Interface_Box で前処理された後でも良い）。
+        recent_mem: List[dict]
+            runtime_memory から取得した直近の会話ログ。
+        state_hint: Optional[dict]
+            Interface_Box / state_manager で決定された軽量ステート情報。
+            例: { "mode": "simple_sequence", "base_number": 10, ... }
     """
 
     messages: List[dict] = []
 
-    # --------------------------------------------------------
-    # 1) System + Soft-Core + Core / External 契約
-    # --------------------------------------------------------
+    # 1) System + Soft-Core
     messages.append({"role": "system", "content": SYSTEM_PROMPT})
-    # Core / External は assistant ロールで「事前合意済みコンテキスト」として渡す
-    if OVV_CORE:
-        messages.append({"role": "assistant", "content": OVV_CORE})
-    if OVV_EXTERNAL:
-        messages.append({"role": "assistant", "content": OVV_EXTERNAL})
+    messages.append({"role": "assistant", "content": OVV_CORE})
+    messages.append({"role": "assistant", "content": OVV_EXTERNAL})
 
-    # --------------------------------------------------------
-    # 2) Thread Brain + TB-Scoring（あれば）
-    # --------------------------------------------------------
-    tb_summary: Optional[dict] = None
+    # 2) Thread Brain（あれば）
     try:
-        tb_summary = db_pg.load_thread_brain(context_key)
+        tb = db_pg.load_thread_brain(context_key)
     except Exception as e:
         print("[call_ovv] thread_brain load error:", repr(e))
-        tb_summary = None
+        tb = None
 
-    if tb_summary:
-        # Long Context Injection（構造化テキスト）
-        tb_text = build_tb_prompt(tb_summary)
-        if tb_text:
-            messages.append({
-                "role": "system",
-                "content": f"[ThreadBrain]\n{tb_text}"
-            })
+    if tb:
+        tb_text = _format_thread_brain(tb)
+        messages.append({
+            "role": "system",
+            "content": f"[ThreadBrain]\n{tb_text}"
+        })
 
-        # Scoring Layer（優先ルール）
-        scoring_text = build_scoring_prompt(tb_summary)
-        if scoring_text:
-            messages.append({
-                "role": "system",
-                "content": scoring_text
-            })
+    # 2.5) state_hint（あれば）
+    if state_hint:
+        try:
+            hint_text = json.dumps(state_hint, ensure_ascii=False)
+        except Exception:
+            # シリアライズに失敗しても落とさず、repr にフォールバック
+            hint_text = repr(state_hint)
 
-    # --------------------------------------------------------
+        messages.append({
+            "role": "system",
+            "content": f"[StateHint]\n{hint_text}"
+        })
+
     # 3) 直近メモリ（PG runtime_memory）から 20 件まで
-    # --------------------------------------------------------
     for m in recent_mem[-20:]:
         role = m.get("role", "user")
         content = m.get("content", "")
         # 念のため空はスキップ
         if not content:
             continue
-        # Discord / Ovv 双方で想定される role だけ許可
-        if role not in ("user", "assistant", "system"):
-            role = "user"
         messages.append({"role": role, "content": content})
 
-    # --------------------------------------------------------
     # 4) 今回ユーザー入力
-    # --------------------------------------------------------
     messages.append({"role": "user", "content": text})
 
-    # --------------------------------------------------------
     # 5) OpenAI 呼び出し
-    # --------------------------------------------------------
     try:
         res = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -163,7 +215,7 @@ def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
         except Exception as e:
             print("[call_ovv] append_runtime_memory error:", repr(e))
 
-        # そのまま返す（最終フィルタは Boundary_Gate / Stabilizer 側で [FINAL] 抽出）
+        # そのまま返す（最終フィルタは bot.py 側で [FINAL] 抽出）
         return raw[:1900]
 
     except Exception as e:
