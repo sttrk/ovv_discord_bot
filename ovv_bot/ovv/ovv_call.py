@@ -1,12 +1,12 @@
 # ovv/ovv_call.py
-# Ovv Call Layer - September Stable Edition (FINAL-only Output)
+# Ovv Call Layer - A4-R3 Stable Edition
 
-from typing import List
+from typing import List, Optional
 from openai import OpenAI
 from config import OPENAI_API_KEY
 
 # ============================================================
-# Core / External Loader
+# Load Core / External
 # ============================================================
 from ovv.core_loader import load_core, load_external
 
@@ -18,34 +18,20 @@ OVV_EXTERNAL = load_external()
 # ============================================================
 OVV_SOFT_CORE = """
 [Ovv Soft-Core v1.1]
-1. MUST keep user experience primary; MUST NOT become over-strict.
-2. MUST use Clarify only when ambiguity materially affects answer quality.
-3. MUST avoid hallucination.
-4. MUST respect scope boundaries.
-5. SHOULD decompose → reconstruct for stability.
-6. MUST NOT phase-mix.
-7. MAY trigger CDC but sparingly.
+1. MUST keep user experience primary
+2. MUST use Clarify only when needed
+3. MUST avoid hallucination
+4. MUST respect boundaries
+5. SHOULD decompose → reconstruct
+6. MUST NOT phase-mix
+7. MAY trigger CDC sparingly
 """.strip()
 
-SYSTEM_PROMPT = f"""
-あなたは Discord 上で動作するアシスタント「Ovv」です。
-
-- ユーザー体験を最優先し、過度に厳密すぎる応答は避けてください。
-- 不明点があっても、ユーザーが次のアクションを取りやすいように実用的な回答を返してください。
-- 思考過程（ステップバイステップの推論やメタコメント）は内部でのみ行い、
-  ユーザーには「最終的な答え（FINAL）」だけを自然な文章で返してください。
-- 数値計算や手順を伴う問題では、内部で一度ていねいに検算した上で、
-  結論だけを返してください（途中計算は表示しない）。
-
-常に次の Ovv Soft-Core を前提に振る舞います：
+SYSTEM_PROMPT_BASE = f"""
+あなたは Discord 上の Ovv です。
+次の Ovv Soft-Core を厳格に保持してください。
 
 {OVV_SOFT_CORE}
-
-出力ルール：
-- ユーザーへの返答は 1 つの完成されたメッセージとして返すこと。
-- 「推論中」「PREP」「DRAFT」「THOUGHT」などのセクションを表示してはならない。
-- デバッグ用タグ（[PREP] など）も表示してはならない。
-- 必要に応じて箇条書きや見出しを使ってよいが、過度に長すぎる説明は避けること。
 """.strip()
 
 # ============================================================
@@ -55,56 +41,75 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ============================================================
-# call_ovv: メイン推論エントリポイント
+# A4-R3 context payload builder
 # ============================================================
-def call_ovv(context_key: int, text: str, recent_mem: List[dict]) -> str:
-    """
-    Ovv のメイン呼び出し。
-    - context_key: スレッド or チャンネル単位のコンテキストキー
-    - text: 今回ユーザーが送ったメッセージ
-    - recent_mem: runtime_memory から取得した直近メッセージ群（role/content形式）
-    戻り値は Discord にそのまま送信してよい「最終回答（FINAL のみ）」。
-    """
+def build_context_payload(thread_brain: Optional[dict]) -> str:
+    if not thread_brain:
+        return "(no thread_brain)"
 
-    # ベースメッセージ
+    meta = thread_brain.get("meta", {})
+    status = thread_brain.get("status", {})
+    decisions = thread_brain.get("decisions", [])[:3]
+    unresolved = thread_brain.get("unresolved", [])
+    constraints = thread_brain.get("constraints", [])
+    next_actions = thread_brain.get("next_actions", [])
+    history_digest = thread_brain.get("history_digest", "")
+    high_goal = thread_brain.get("high_level_goal", "")
+    recent_messages = thread_brain.get("recent_messages", [])[:3]
+    current_position = thread_brain.get("current_position", "")
+
+    return f"""
+[thread_brain payload A4-R3]
+phase: {status.get('phase')}
+last_major_event: {status.get('last_major_event')}
+high_level_goal: {high_goal}
+constraints: {constraints}
+unresolved: {unresolved}
+decisions(top3): {decisions}
+next_actions: {next_actions}
+history_digest: {history_digest}
+recent_messages(top3): {recent_messages}
+current_position: {current_position}
+""".strip()
+
+
+# ============================================================
+# call_ovv: Ovv Main Logic (A4-R3)
+# ============================================================
+def call_ovv(
+    context_key: int,
+    text: str,
+    recent_mem: List[dict],
+    thread_brain: Optional[dict]
+) -> str:
+
+    context_payload = build_context_payload(thread_brain)
+
+    system_prompt = (
+        SYSTEM_PROMPT_BASE
+        + "\n\n"
+        + "以下は現在のコンテキスト情報（A4-R3形式）です：\n"
+        + context_payload
+    )
+
     msgs = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "assistant", "content": OVV_CORE},
         {"role": "assistant", "content": OVV_EXTERNAL},
     ]
 
-    # 過去メモリを少なめに注入（コストと安定性のバランス）
     for m in recent_mem[-20:]:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if not content:
-            continue
-        msgs.append({"role": role, "content": content})
+        msgs.append({"role": m["role"], "content": m["content"]})
 
-    # 今回ユーザーメッセージ
     msgs.append({"role": "user", "content": text})
 
     try:
         res = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4.1",
             messages=msgs,
-            temperature=0.7,
+            temperature=0.5,
         )
-        raw = res.choices[0].message.content.strip()
-
-        # 念のため将来の拡張（[FINAL] 形式など）に備えて簡易パーサを入れておくが、
-        # 現仕様では SYSTEM_PROMPT 上「FINAL だけ返す」前提なので基本は raw をそのまま使う。
-        # もし [FINAL] を含む形式に将来変えた場合は、ここで切り出せる。
-        final_text = raw
-
-        marker = "[FINAL]"
-        if marker in raw:
-            # 例: [FINAL] 以降だけを抜き出す
-            idx = raw.rfind(marker)
-            final_text = raw[idx + len(marker):].strip()
-
-        # Discord の 2000 文字制限を少し余裕を持ってカット
-        return final_text[:1900]
+        return res.choices[0].message.content.strip()[:1900]
 
     except Exception as e:
         print("[call_ovv error]", repr(e))
