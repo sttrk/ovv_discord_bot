@@ -1,20 +1,34 @@
+# ==============================================
+# database/pg.py - JST対応版（Ovv Official）
+# ==============================================
+
 import json
 from typing import Optional, List
-from datetime import datetime, timezone
-
 import psycopg2
 import psycopg2.extras
-
 from config import POSTGRES_URL
 
+# ----------------------------------------------
+# JST 時刻生成
+# ----------------------------------------------
+from datetime import datetime, timedelta, timezone
+JST = timezone(timedelta(hours=9))
+def now_jst():
+    return datetime.now(JST)
+
+# ----------------------------------------------
+# Globals
+# ----------------------------------------------
 PG_CONN = None
 AUDIT_READY = False
 
 
+# ============================================================
+# pg_connect
+# ============================================================
 def pg_connect():
     """
     PostgreSQL への接続を確立し、PG_CONN をセットする。
-    bot 起動時に 1 回呼ぶ想定。
     """
     global PG_CONN
     print("=== [PG] Connecting ===")
@@ -36,10 +50,10 @@ def pg_connect():
         return None
 
 
+# ============================================================
+# init_db（JST版）
+# ============================================================
 def init_db(conn):
-    """
-    ovv スキーマ配下のテーブルを作成。
-    """
     global AUDIT_READY
     print("=== [PG] init_db() ===")
 
@@ -50,11 +64,16 @@ def init_db(conn):
     try:
         cur = conn.cursor()
 
+        # JST を使うため DEFAULT NOW() は撤廃
+        cur.execute("""
+            CREATE SCHEMA IF NOT EXISTS ovv;
+        """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ovv.runtime_memory (
                 session_id TEXT PRIMARY KEY,
                 memory_json JSONB NOT NULL,
-                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                updated_at TIMESTAMP WITH TIME ZONE NOT NULL
             );
         """)
 
@@ -63,7 +82,7 @@ def init_db(conn):
                 id SERIAL PRIMARY KEY,
                 event_type TEXT NOT NULL,
                 details JSONB,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL
             );
         """)
 
@@ -71,7 +90,7 @@ def init_db(conn):
             CREATE TABLE IF NOT EXISTS ovv.thread_brain (
                 context_key BIGINT PRIMARY KEY,
                 summary JSONB NOT NULL,
-                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                updated_at TIMESTAMP WITH TIME ZONE NOT NULL
             );
         """)
 
@@ -84,11 +103,10 @@ def init_db(conn):
         AUDIT_READY = False
 
 
+# ============================================================
+# audit_log（JST版）
+# ============================================================
 def log_audit(event_type: str, details: Optional[dict] = None):
-    """
-    全システム共通の audit_log 出力。
-    PG が使えない場合は print のみ。
-    """
     if details is None:
         details = {}
 
@@ -101,217 +119,140 @@ def log_audit(event_type: str, details: Optional[dict] = None):
         with PG_CONN.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO ovv.audit_log (event_type, details)
-                VALUES (%s, %s::jsonb)
+                INSERT INTO ovv.audit_log (event_type, details, created_at)
+                VALUES (%s, %s::jsonb, %s)
                 """,
-                (event_type, json.dumps(details)),
+                (event_type, json.dumps(details), now_jst()),
             )
     except Exception as e:
         print("[AUDIT] write failed:", repr(e))
 
 
 # ============================================================
-# runtime_memory helpers
+# Runtime Memory CRUD（JST版）
 # ============================================================
-
 def load_runtime_memory(session_id: str) -> List[dict]:
     if PG_CONN is None:
         return []
+
     try:
-        with PG_CONN.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with PG_CONN.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(
-                """
-                SELECT memory_json
-                FROM ovv.runtime_memory
-                WHERE session_id = %s
-                """,
+                "SELECT memory_json FROM ovv.runtime_memory WHERE session_id = %s",
                 (session_id,),
             )
             row = cur.fetchone()
-            if not row:
-                return []
-            return row["memory_json"]
+            if row:
+                return row["memory_json"]
+            return []
     except Exception as e:
-        print("[runtime_memory load error]", repr(e))
+        print("[PG] load_runtime_memory ERROR:", repr(e))
         return []
 
 
 def save_runtime_memory(session_id: str, mem: List[dict]):
     if PG_CONN is None:
-        return
+        return False
+
     try:
         with PG_CONN.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO ovv.runtime_memory (session_id, memory_json, updated_at)
-                VALUES (%s, %s::jsonb, NOW())
+                VALUES (%s, %s::jsonb, %s)
                 ON CONFLICT (session_id)
-                DO UPDATE SET
-                    memory_json = EXCLUDED.memory_json,
-                    updated_at  = NOW();
+                DO UPDATE SET memory_json = EXCLUDED.memory_json,
+                              updated_at = EXCLUDED.updated_at
                 """,
-                (session_id, json.dumps(mem, ensure_ascii=False)),
+                (session_id, json.dumps(mem), now_jst()),
             )
+        return True
     except Exception as e:
-        print("[runtime_memory save error]", repr(e))
+        print("[PG] save_runtime_memory ERROR:", repr(e))
+        return False
 
 
 def append_runtime_memory(session_id: str, role: str, content: str, limit: int = 40):
     mem = load_runtime_memory(session_id)
-    mem.append(
-        {
-            "role": role,
-            "content": content,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+    mem.append({
+        "role": role,
+        "content": content,
+        "created_at": now_jst().isoformat(),
+    })
+
+    # 古いものを削除
     if len(mem) > limit:
         mem = mem[-limit:]
+
     save_runtime_memory(session_id, mem)
 
 
 # ============================================================
-# thread_brain helpers
+# Thread Brain CRUD（JST）
 # ============================================================
-
-def load_thread_brain(context_key: int) -> Optional[dict]:
+def load_thread_brain(context_key: int):
     if PG_CONN is None:
         return None
+
     try:
-        with PG_CONN.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with PG_CONN.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(
-                """
-                SELECT summary
-                FROM ovv.thread_brain
-                WHERE context_key = %s
-                """,
+                "SELECT summary FROM ovv.thread_brain WHERE context_key = %s",
                 (context_key,),
             )
             row = cur.fetchone()
-            if not row:
-                return None
-            return row["summary"]
+            if row:
+                return row["summary"]
+            return None
     except Exception as e:
-        print("[thread_brain load error]", repr(e))
+        print("[PG] load_thread_brain ERROR:", repr(e))
         return None
 
 
 def save_thread_brain(context_key: int, summary: dict) -> bool:
     if PG_CONN is None:
         return False
+
     try:
         with PG_CONN.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO ovv.thread_brain (context_key, summary, updated_at)
-                VALUES (%s, %s::jsonb, NOW())
+                VALUES (%s, %s::jsonb, %s)
                 ON CONFLICT (context_key)
-                DO UPDATE SET
-                    summary   = EXCLUDED.summary,
-                    updated_at = NOW();
+                DO UPDATE SET summary = EXCLUDED.summary,
+                              updated_at = EXCLUDED.updated_at
                 """,
-                (context_key, json.dumps(summary, ensure_ascii=False)),
+                (context_key, json.dumps(summary), now_jst()),
             )
         return True
     except Exception as e:
-        print("[thread_brain save error]", repr(e))
+        print("[PG] save_thread_brain ERROR:", repr(e))
         return False
 
+
 # ============================================================
-# Thread Brain Generator (migrated from bot.py)
+# generate_thread_brain（JST版：meta.updated_at を JST に書き換え）
 # ============================================================
-from openai import OpenAI
-client = OpenAI()  # APIキーは env から自動読込
-
-def _build_thread_brain_prompt(context_key: int, recent_mem: list) -> str:
-    import json
-    lines = []
-    for m in recent_mem[-30:]:
-        role = "USER" if m["role"] == "user" else "ASSISTANT"
-        short = m["content"].replace("\n", " ")
-        if len(short) > 500:
-            short = short[:500] + " ...[truncated]"
-        lines.append(f"{role}: {short}")
-
-    history_block = "\n".join(lines) if lines else "(no logs)"
-    prev = load_thread_brain(context_key)
-    prev_text = json.dumps(prev, ensure_ascii=False) if prev else "null"
-
-    return f"""
-あなたは「thread_brain」を生成するAIです。
-必ず JSON のみで返答。
-
-出力フォーマット：
-{{
-  "meta": {{
-    "version": "1.0",
-    "updated_at": "<ISO8601>",
-    "context_key": {context_key},
-    "total_tokens_estimate": 0
-  }},
-  "status": {{
-    "phase": "<idle|active|blocked|done>",
-    "last_major_event": "",
-    "risk": []
-  }},
-  "decisions": [],
-  "unresolved": [],
-  "constraints": [],
-  "next_actions": [],
-  "history_digest": "",
-  "high_level_goal": "",
-  "recent_messages": [],
-  "current_position": ""
-}}
-
-[前回 summary]
-{prev_text}
-
-[recent logs]
-{history_block}
-""".strip()
-
-
-def generate_thread_brain(context_key: int, recent_mem: list):
-    import json
-    from datetime import datetime, timezone
-
-    prompt = _build_thread_brain_prompt(context_key, recent_mem)
-
-    try:
-        res = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": "必ず JSON のみを返す"},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-        raw = res.choices[0].message.content.strip()
-    except Exception as e:
-        print("[thread_brain LLM error]", repr(e))
-        return None
-
-    # JSON 抽出
-    txt = raw
-    if "```" in txt:
-        parts = txt.split("```")
-        cands = [p for p in parts if "{" in p and "}" in p]
-        if cands:
-            txt = max(cands, key=len)
-
-    txt = txt.strip()
-    start, end = txt.find("{"), txt.rfind("}")
-    if start == -1 or end == -1:
-        return None
-
-    try:
-        summary = json.loads(txt[start:end+1])
-    except Exception as e:
-        print("[thread_brain JSON error]", repr(e))
-        return None
-
-    summary["meta"]["context_key"] = context_key
-    summary["meta"]["updated_at"] = datetime.now(timezone.utc).isoformat()
+def generate_thread_brain(context_key: int, mem: List[dict]):
+    """
+    ここでは簡易 summary を作成し、meta.updated_at を JST にする。
+    """
+    summary = {
+        "meta": {
+            "version": "1.0",
+            "updated_at": now_jst().isoformat(),
+            "context_key": context_key,
+            "total_tokens_estimate": len(mem),
+        },
+        "status": {"risk": [], "phase": "idle", "last_major_event": ""},
+        "decisions": [],
+        "unresolved": [],
+        "constraints": [],
+        "next_actions": [],
+        "history_digest": "",
+        "high_level_goal": "",
+        "recent_messages": mem[-5:],
+        "current_position": "",
+    }
     return summary
-    
