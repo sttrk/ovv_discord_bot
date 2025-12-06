@@ -86,21 +86,16 @@ from ovv.ovv_call import (
     SYSTEM_PROMPT,
 )
 
-# BIS: Interface_Box / Stabilizer / State_Manager
+# BIS: Boundary_Gate / Interface_Box / Stabilizer / State_Manager
 # - NOTE:
-#   - interface_box は InputPacket 構築専用
-#   - stabilizer は [FINAL] 抽出専用
-#   - state_manager は「軽量ステート」のみ提供
+#   - boundary_gate: Discord Message → 標準化 InputPacket（入口）
+#   - interface_box: ThreadBrain / RuntimeMemory / State → OvvInputPacket（中間）
+#   - stabilizer   : [FINAL] 抽出（出口）
+#   - state_manager: 軽量ステート推定（中間）
+from ovv.bis.boundary_gate import build_input_packet as build_boundary_packet
 from ovv.bis.interface_box import build_input_packet as build_interface_packet
 from ovv.bis.stabilizer import extract_final_answer
 from ovv.bis.state_manager import decide_state
-
-# （現時点では Boundary_Gate は bot.py 内実装を継続利用）
-# 将来的に:
-#   from ovv.bis.boundary_gate import build_input_packet as build_boundary_packet
-# へ移行予定。
-
-
 
 # ============================================================
 # Debug Context Injection（必須：debug_commands の cfg 用）
