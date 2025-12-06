@@ -1,86 +1,114 @@
-# ovv/constraint_filter.py
-# Thread Brain Constraint Filter - BIS Edition
+# ovv/bis/constraint_filter.py
+# ============================================================
+# Thread Brain Constraint Filter - BIS Formal Edition
 #
 # 目的:
-# - Thread Brain に紛れ込んだ「機械向け・LLM制御向けの制約文」をフィルタリングし、
-#   Ovv 推論に不要なノイズを除去する。
-# - 人間向けの制約（ドメインルール・仕様・注意点）はできる限り残す。
+#   - Thread Brain summary に含まれる「機械的・LLM内部制御用」の制約文を取り除き、
+#     Ovv コアが扱うべき“人間向けの制約（仕様・ルール・注意点）”のみを残す。
+#   - summary の構造は絶対に壊さない。意味内容を追加・捏造しない。
 #
-# 責務:
-# - あくまで「文字列の選別」のみ行う。
-# - 新しい制約を付け足したり、意味内容を書き換えたりしない。
+# 特徴:
+#   - v0 / v1 の両方の Thread Brain summary に対応。
+#   - constraints が「直下」または「thread_brain 内」にある両方に対応。
+#
+# BIS 原則:
+#   - Boundary-Gate → Interface_Box → Ovv Core → Stabilizer
+#   - Interface_Box は “Thread Brain の安全化（サニタイズ）” を要求するため、
+#     本フィルタはその前段でノイズ制約を削除する役割を担う。
+# ============================================================
 
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 
+# ============================================================
+# ノイズ制約として除外すべきキーワード群（機械的・LLM制御用）
+# ============================================================
 _MACHINE_KEYWORDS = [
-    # 明らかに LLM 制御っぽい制約
-    "必ず JSON",
-    "JSON オブジェクトのみ",
-    "JSONオブジェクトのみ",
-    "マークダウン",
-    "Markdown",
-    "markdown",
-    "コードブロック",
-    "```",
-    "返答はJSON",
-    "回答はJSON",
-    "回答は JSON",
-    "出力は JSON",
-    # 実験用・デバッグ用の指示っぽいもの
-    "デバッグ用",
-    "実験用",
+    "system",
+    "assistant",
+    "llm",
+    "policy",
+    "do not reply",
+    "forbidden",
+    "internal",
+    "developer",
+    "instruction",
+    "ignore",
+    "override",
+    "jailbreak",
+    "rp jailbreak",
+    "###",
+    "<!--",
+    "-->",
 ]
 
 
 def _is_machine_constraint(text: str) -> bool:
-    """機械向けの制約かどうかを雑に判定する。"""
-    t = (text or "").strip()
-    if not t:
+    """
+    機械向けの制約文（LLM 制御系ノイズ）かどうか判定する。
+    完全一致ではなく「部分一致」によるフィルタ。
+    """
+    if not text or not isinstance(text, str):
         return False
 
-    # 長さが極端に短いものはそのまま残す
-    if len(t) < 5:
-        return False
-
-    # 明らかに制御系のキーワードを含むものは除外対象
+    lowered = text.lower()
     for kw in _MACHINE_KEYWORDS:
-        if kw in t:
+        if kw in lowered:
             return True
-
     return False
 
 
-def _filter_constraints_list(constraints: List[str]) -> List[str]:
-    """constraints 配列から機械向け制約だけを取り除く。"""
-    kept: List[str] = []
-    for c in constraints:
-        if isinstance(c, str):
-            if not _is_machine_constraint(c):
-                kept.append(c)
-        else:
-            # dict など他の型はそのまま残す（勝手に解釈しない）
-            kept.append(c)
-    return kept
-
-
-def filter_constraints_in_tb(summary: Optional[Dict]) -> Optional[Dict]:
+def _filter_constraints_list(items: List[Any]) -> List[Any]:
     """
-    Thread Brain summary(JSON) 内の constraints をフィルタリングする。
-    - 入力が None の場合は None を返す。
-    - constraints 以外のフィールドは一切変更しない（コピーして返す）。
+    constraint list を走査して、「人間向けの制約」だけを残す。
+    Ovv哲学に従い、意味内容を捏造しない・書き換えない。
+    """
+    cleaned = []
+    for item in items:
+        # item が dict なら "text" フィールドを見る（TB v1 フォーマットに対応）
+        if isinstance(item, dict) and "text" in item:
+            if not _is_machine_constraint(item["text"]):
+                cleaned.append(item)
+        # item が str の場合はそのまま判定（TB v0 フォーマットに対応）
+        elif isinstance(item, str):
+            if not _is_machine_constraint(item):
+                cleaned.append(item)
+        # それ以外は “構造として” そのまま残す（意味は変えない）
+        else:
+            cleaned.append(item)
+
+    return cleaned
+
+
+# ============================================================
+# Public API（Interface_Box が呼び出す正式メソッド）
+# ============================================================
+def filter_constraints_from_thread_brain(summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Thread Brain summary 内の constraint 部分のみを安全化する。
+    - summary 全体の意味構造を壊さない。
+    - constraint の「削除」以外の変形・追加は禁止。
+    - v0 / v1 形式の両方を扱う。
+
+    戻り値:
+      - フィルタ済み summary（dict）
+      - None（summary が None の場合）
     """
     if summary is None:
         return None
 
-    # 浅いコピーで十分（入れ子の中身は変更しない）
+    # 浅いコピー（summary の構造を壊さずに差し替える）
     result = dict(summary)
 
-    # 形式が v1（constraints が直下）/ v0（thread_brain 内など）の両方を許容する
+    # ============================================================
+    # v1 形式: summary["constraints"] が list の場合
+    # ============================================================
     if "constraints" in result and isinstance(result["constraints"], list):
         result["constraints"] = _filter_constraints_list(result["constraints"])
 
-    # v0 系フォーマットの可能性（thread_brain 内に含まれている）
+    # ============================================================
+    # v0 形式: summary["thread_brain"]["constraints"]
+    # ============================================================
     tb = result.get("thread_brain")
     if isinstance(tb, dict) and isinstance(tb.get("constraints"), list):
         new_tb = dict(tb)
