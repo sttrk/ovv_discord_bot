@@ -1,55 +1,32 @@
 # ovv/stabilizer.py
-# Stabilizer v1.0 (A5-Minimal)
+# Stabilizer（BIS Layer-3）
 #
 # 役割:
-#   - Ovv から返ってきた「生テキスト(raw_ans)」から、
-#     Discord に返すための最終テキストを安定して抽出する。
-#   - [FINAL] セクション抽出 / 長さ制限 / フォールバック方針を一本化する。
-#
-# BIS フロー上の位置:
-#   B (Boundary_Gate: bot.py)
-#   I (Interface_Box: interface_box.py)
-#   Ovv (ovv_call.py)
-#   S (Stabilizer: 本ファイル)
-#
-# 現在はシンプルな FINAL 抽出だが、将来的に:
-#   - エラー時の定形文
-#   - Markdown 整形
-#   - 分割送信のポリシー
-# などをここで一元管理する想定。
+# - Ovv の生出力から [FINAL] セクションだけを抽出し、Discord へ返すテキストを安定化させる。
+# - 生出力が壊れていても、必ず何かしらのテキストを返す。
 
-from typing import Optional
+from typing import Tuple
 
 
-def stabilize_output(raw_ans: Optional[str]) -> str:
+def extract_final_answer(raw: str) -> str:
     """
-    Ovv からの raw_ans を受け取り、Discord に返す最終テキストを決定する。
-
-    挙動:
-        1. raw_ans が None / 空文字 → 固定エラーメッセージを返す。
-        2. "[FINAL]" を含む場合 → その後ろだけを取り出し、strip する。
-        3. "[FINAL]" が無い場合 → 全文をそのまま使う。
-        4. いずれも 1900 文字に truncate（Discord 2000 制限の安全マージン）。
+    Ovv 生出力から [FINAL] 部分だけを取り出す。
+    - [FINAL] がある → その後ろを返す
+    - ない       → 全文をそのまま返す
+    - 空 / None  → エラーメッセージを返す
     """
-    if not raw_ans:
-        return "Ovv コアからの応答が空でした。少し時間をおいて再度お試しください。"
+    if not raw:
+        return "Ovv の応答生成に失敗しました。少し時間をおいてもう一度試してください。"
 
-    text = str(raw_ans)
+    text = raw.strip()
+    marker = "[FINAL]"
 
-    if "[FINAL]" in text:
-        try:
-            # 最初の [FINAL] 以降だけを取り出す
-            text = text.split("[FINAL]", 1)[1].strip()
-        except Exception:
-            # 分割に失敗しても落とさず、そのまま使う
-            text = text
-
-    # Discord の 2000 制限を考慮して少し余裕を見て truncate
-    if len(text) > 1900:
-        text = text[:1900] + "\n...[truncated]"
-
-    # 念のため、完全空になってしまった場合のフォールバック
-    if not text.strip():
-        return "Ovv の出力が空になりました。もう一度試してみてください。"
+    if marker in text:
+        _, tail = text.split(marker, 1)
+        tail = tail.strip()
+        if tail:
+            return tail
+        # [FINAL] 以降が空なら、生テキストを返す
+        return text
 
     return text
