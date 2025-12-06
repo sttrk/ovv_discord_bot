@@ -1,42 +1,39 @@
 # ovv/tb_scoring.py
-# Thread Brain → Scoring Layer（A-5 / BIS 対応版）
+# Thread Brain → Scoring Layer（A-3 + ConstraintFilter 統合版）
 
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List
+
+from ovv.constraint_filter import filter_constraints
 
 
-def build_scoring_prompt(summary: Optional[Dict[str, Any]]) -> str:
+def build_scoring_prompt(summary: Optional[Dict]) -> str:
     """
-    Thread Brain summary(JSON) から
+    Thread Brain summary を解析し、
     「Ovv が次の発話で守るべき優先ルール」を生成する。
 
-    ・特定のゲーム/ドメインに依存しない汎用設計
-    ・存在しないフィールドがあっても安全に動くように防御的に実装
+    - constraints は constraint_filter 経由でノイズ除去したものだけを使う。
     """
 
     if not summary:
-        return (
-            "[TB-Scoring]\n"
-            "- No summary available.\n"
-            "- Prioritize clarity.\n"
-            "- Ask the user to restate or clarify their current goal."
-        )
+        return "[TB-Scoring]\nNo summary available. Prioritize clarity and ask user to restate intent."
 
-    status: Dict[str, Any] = summary.get("status", {}) or {}
-    decisions: List[Any] = summary.get("decisions", []) or []
-    unresolved: List[Any] = summary.get("unresolved", []) or []
-    next_actions: List[Any] = summary.get("next_actions", []) or []
-    constraints: List[Any] = summary.get("constraints", []) or []
-    goal: str = summary.get("high_level_goal", "") or ""
+    status = summary.get("status", {})
+    decisions: List[str] = summary.get("decisions", [])
+    unresolved: List[str] = summary.get("unresolved", [])
+    next_actions: List[str] = summary.get("next_actions", [])
+    raw_constraints: List[str] = summary.get("constraints", [])
+    goal = summary.get("high_level_goal", "")
 
-    out: List[str] = ["[TB-Scoring]"]
+    # ★ 新ロジック: constraints を共通フィルタに通す
+    constraints = filter_constraints(raw_constraints)
+
+    out = ["[TB-Scoring]"]
 
     # ======================================================
     # 1. High-level goal
     # ======================================================
     if goal:
         out.append(f"- Maintain alignment with the high-level goal: '{goal}'")
-    else:
-        out.append("- No explicit high-level goal → focus on clarifying user intent.")
 
     # ======================================================
     # 2. Constraint Enforcement
@@ -44,18 +41,15 @@ def build_scoring_prompt(summary: Optional[Dict[str, Any]]) -> str:
     if constraints:
         out.append("- Enforce the following constraints strictly:")
         for c in constraints:
-            text = c if isinstance(c, str) else str(c)
-            out.append(f"  • {text}")
+            out.append(f"  • {c}")
 
     # ======================================================
     # 3. Unresolved Items（解消すべき項目）
-    #    unresolved があれば最優先
     # ======================================================
     if unresolved:
         out.append("- Prioritize resolving unresolved items before expanding the topic:")
         for u in unresolved:
-            text = u if isinstance(u, str) else str(u)
-            out.append(f"  • {text}")
+            out.append(f"  • {u}")
 
     # ======================================================
     # 4. Next Actions
@@ -63,32 +57,25 @@ def build_scoring_prompt(summary: Optional[Dict[str, Any]]) -> str:
     if next_actions:
         out.append("- Guide conversation based on next_actions:")
         for a in next_actions:
-            text = a if isinstance(a, str) else str(a)
-            out.append(f"  • {text}")
+            out.append(f"  • {a}")
 
     # ======================================================
     # 5. Decisions（覆さない）
     # ======================================================
     if decisions:
-        out.append("- Respect established decisions (do not overturn them lightly):")
+        out.append("- Respect established decisions:")
         for d in decisions:
-            text = d if isinstance(d, str) else str(d)
-            out.append(f"  • {text}")
+            out.append(f"  • {d}")
 
     # ======================================================
-    # 6. Risk / Phase detection
+    # 6. Risk / Idle detection
     # ======================================================
     phase = status.get("phase")
     if phase == "idle":
-        out.append("- Current phase = idle → lean towards proactive clarification and light next steps.")
+        out.append("- Current phase = idle → lean towards proactive clarification.")
     elif phase == "blocked":
-        out.append("- Current phase = blocked → propose concrete resolution options and unblock the flow.")
+        out.append("- Current phase = blocked → propose resolution options.")
     elif phase == "active":
-        out.append("- Current phase = active → maintain momentum and avoid unnecessary digression.")
-
-    # その他 status に特記事項があれば軽く反映（任意）
-    last_event = status.get("last_major_event")
-    if last_event:
-        out.append(f"- Last major event: {last_event}")
+        out.append("- Current phase = active → maintain momentum and avoid digression.")
 
     return "\n".join(out)
