@@ -1,13 +1,30 @@
-# ovv/ovv_call.py
-# Ovv Call Layer - BIS + A5 統合版
+# [MODULE CONTRACT]
+# NAME: ovv_call
+# ROLE: OvvCoreCallLayer
 #
-# 目的:
-# - InputPacket（Interface_Box で構築）を受け取り、Ovv Core（LLM）を呼び出す。
-# - Soft-Core / External Contract / Thread Brain / State を統合した messages を組み立てる。
+# INPUT:
+#   context_key: int
+#   input_packet: dict
 #
-# 責務:
-# - OpenAI API 呼び出しと messages 構築のみ。
-# - DB I/O は database.pg の関数に委譲（直接 import するが責務は限定）。
+# OUTPUT:
+#   raw_answer: str
+#
+# MUST:
+#   - inject(SYSTEM_PROMPT)
+#   - inject(OVV_CORE)
+#   - inject(OVV_EXTERNAL)
+#   - include(ThreadBrainPrompt)
+#   - include(ThreadBrainScoring)
+#   - include(StateHint)
+#   - include(RuntimeMemory)
+#   - append_runtime_memory
+#   - preserve_message_order
+#
+# MUST_NOT:
+#   - return(JSON_struct)
+#   - return(non_FINAL_format)
+#   - alter(input_packet)
+#   - mutate(ThreadBrain)
 
 from typing import List, Dict, Any
 import json
@@ -54,17 +71,32 @@ Ovv Soft-Core:
 挙動上の重要ルール:
 - あなたは「思考の構造化」は内部で行い、ユーザーには最終結論だけを返します。
 - 内部思考や検討メモ、ドラフト、候補案をそのまま出力してはなりません。
-- 出力は必ず次の形式に従ってください:
+
+出力形式ルール（最重要）:
+- あなたの出力は、必ず次の形式【のみ】に従ってください:
 
 [FINAL]
 <ユーザーが読むための最終回答だけを書く。日本語で、簡潔かつ具体的に。>
 
+禁止事項:
+- 上記 [FINAL] ブロック以外のテキストを出力してはなりません。
+- JSON / 配列 / Python 辞書 / YAML / XML など「機械可読な構造」を出力してはなりません。
+- 出力全体を {{...}} で囲んだ JSON 形式や、
+  "message": "...", "response": "..." などのキー付きオブジェクトとして返してはなりません。
+- 入力や過去メッセージに JSON や {{ }}、"message": などが含まれていても、
+  それらはあくまで文脈情報であり、
+  あなた自身の出力は「自然文の [FINAL] ブロックのみ」でなければなりません。
+- ユーザーから明示的に「JSON で出して」と指示されない限り、
+  構造化データでの応答は禁止です。
+  明示的に JSON が要求されたとしても、可能であれば
+  「[FINAL] 内で JSON について説明する自然文」を優先してください。
+
 制約:
-- ユーザーの業務・開発に直接役立つことを最優先とし、不要な雑談や冗長な前置きは避ける。
+- ユーザーの業務・開発に直接役立つことを最優先とし、不要な雑談や冗長な前置きは避けてください。
 - Thread Brain に記録された high_level_goal / next_actions / history_digest は、
   「長期的な方針」や「これまでの合意事項」として尊重しつつ、
-  矛盾があれば最新のユーザー発言を優先する。
-- 実装コードに関する回答では、なるべく具体的な関数名・ファイル名・責務境界を明示する。
+  矛盾があれば最新のユーザー発言を優先してください。
+- 実装コードに関する回答では、なるべく具体的な関数名・ファイル名・責務境界を明示してください。
 """.strip()
 
 # ============================================================
@@ -114,7 +146,6 @@ def call_ovv(context_key: int, input_packet: Dict[str, Any]) -> str:
 
     # 4) State Hint（会話状態の軽量メタ情報）
     if state_hint:
-        # JSON そのままを渡すと読みにくいので、ラベル付きで渡す
         state_text = "[STATE_HINT]\n" + json.dumps(state_hint, ensure_ascii=False)
         messages.append({
             "role": "system",
