@@ -1,53 +1,75 @@
 # ovv/interface_box.py
-# Interface_Box - BIS: Boundary_Gate → Ovv の中間整形レイヤ
+# BIS Layer: Interface_Box (InputPacket Builder)
 #
-# 役割:
-#   - Boundary_Gate（bot.py）から渡される情報を「InputPacket」として整理する
-#   - ThreadBrain の生データを、Ovv が扱いやすいテキスト/スコアリングに変換する
-#   - state_hint（軽量ステート）を Ovv に渡すための共通フォーマットを持つ
+# 目的:
+#   - Boundary_Gate から渡された raw 情報を、
+#     Ovv Core が処理できる「InputPacket」に整形する。
+#   - ThreadBrain（長期文脈）と TB-Scoring（優先ルール）を統合し、
+#     Ovv に渡す前処理の標準化を行う。
 #
-# InputPacket の構造（dict）:
-# {
-#   "user_text": str,
-#   "runtime_memory": List[dict],
-#   "thread_brain": Optional[dict],
-#   "tb_prompt": str,      # thread_brain の要約（人間/LLM向け）
-#   "tb_scoring": str,     # TB-Scoring（優先ルール）
-#   "state_hint": Optional[dict],
-# }
+# 出力:
+#   dict {
+#       "user_text": str,
+#       "runtime_memory": [...],
+#       "thread_brain_text": str or "",
+#       "scoring_hint": str or "",
+#       "state_hint": dict or None
+#   }
 
-from typing import List, Optional, Dict, Any
 
-from .threadbrain_adapter import build_tb_prompt
-from .tb_scoring import build_scoring_prompt
+from typing import Optional, List, Dict, Any
+
+from ovv.threadbrain_adapter import build_tb_prompt
+from ovv.tb_scoring import build_scoring_prompt
+
+
+def _safe(obj: Any) -> Any:
+    """None → "", それ以外はそのまま返す簡易サニタイザ。"""
+    return "" if obj is None else obj
 
 
 def build_input_packet(
     user_text: str,
     runtime_memory: List[dict],
-    thread_brain: Optional[Dict[str, Any]],
-    state_hint: Optional[Dict[str, Any]],
+    thread_brain: Optional[Dict],
+    state_hint: Optional[Dict],
 ) -> Dict[str, Any]:
     """
-    Boundary_Gate（bot.py）から渡された情報を「InputPacket」としてまとめる。
-    ここでは I/O の形式変換に専念し、LLM 呼び出しは絶対に行わない。
+    Boundary_Gate から渡された情報をもとに InputPacket を構築する。
+    - user_text: ユーザーの最新発話（文字列）
+    - runtime_memory: 最近の会話メモリ（PG runtime_memory）
+    - thread_brain: ThreadBrain summary（辞書 or None）
+    - state_hint: state_manager が返す軽量ステート（辞書 or None）
     """
 
-    # None 防御
-    runtime_memory = runtime_memory or []
-    thread_brain = thread_brain or None
-    state_hint = state_hint or None
+    # ============================================================
+    # 1. ThreadBrain の長期文脈をテキスト化
+    # ============================================================
+    tb_text = ""
+    if thread_brain:
+        try:
+            tb_text = build_tb_prompt(thread_brain)
+        except Exception:
+            tb_text = ""  # ThreadBrain が壊れていてもクラッシュしない
 
-    # ThreadBrain 系テキスト
-    tb_prompt = build_tb_prompt(thread_brain) if thread_brain else ""
-    tb_scoring = build_scoring_prompt(thread_brain) if thread_brain else ""
+    # ============================================================
+    # 2. TB-Scoring の優先ルールセット
+    # ============================================================
+    scoring_text = ""
+    if thread_brain:
+        try:
+            scoring_text = build_scoring_prompt(thread_brain)
+        except Exception:
+            scoring_text = ""
 
-    packet: Dict[str, Any] = {
-        "user_text": user_text,
+    # ============================================================
+    # 3. InputPacket 組み立て
+    # ============================================================
+    packet = {
+        "user_text": _safe(user_text),
         "runtime_memory": runtime_memory,
-        "thread_brain": thread_brain,
-        "tb_prompt": tb_prompt,
-        "tb_scoring": tb_scoring,
+        "thread_brain_text": tb_text,
+        "scoring_hint": scoring_text,
         "state_hint": state_hint,
     }
 
