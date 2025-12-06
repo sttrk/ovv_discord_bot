@@ -1,0 +1,267 @@
+# bot.py - Ovv Discord Bot (BIS Integrated Edition)
+
+import os
+import json
+import discord
+from discord.ext import commands
+from datetime import datetime, timezone
+from typing import List
+
+from openai import OpenAI
+from notion_client import Client
+
+# ============================================================
+# Environment Variables
+# ============================================================
+from config import (
+    DISCORD_BOT_TOKEN,
+    OPENAI_API_KEY,
+    NOTION_API_KEY,
+)
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+notion = Client(auth=NOTION_API_KEY)
+
+# ============================================================
+# PostgreSQL Module
+# ============================================================
+import database.pg as db_pg
+
+print("=== [BOOT] Connecting PostgreSQL ===")
+conn = db_pg.pg_connect()
+db_pg.init_db(conn)
+
+log_audit = db_pg.log_audit
+
+load_runtime_memory = db_pg.load_runtime_memory
+save_runtime_memory = db_pg.save_runtime_memory
+append_runtime_memory = db_pg.append_runtime_memory
+
+load_thread_brain = db_pg.load_thread_brain
+save_thread_brain = db_pg.save_thread_brain
+generate_thread_brain = db_pg.generate_thread_brain
+
+# ============================================================
+# Ovv Core / BIS Layer
+# ============================================================
+from ovv.ovv_call import (
+    call_ovv,
+    OVV_CORE,
+    OVV_EXTERNAL,
+    SYSTEM_PROMPT,
+)
+
+from ovv.interface_box import build_input_packet
+from ovv.stabilizer import stabilize_ovv_output      # ← 修正ポイント
+from ovv.state_manager import decide_state
+
+# ============================================================
+# Debug Context Injection
+# ============================================================
+from debug.debug_context import debug_context
+
+debug_context.pg_conn = db_pg.PG_CONN
+debug_context.notion = notion
+debug_context.openai_client = openai_client
+
+debug_context.load_mem = load_runtime_memory
+debug_context.save_mem = save_runtime_memory
+debug_context.append_mem = append_runtime_memory
+
+debug_context.brain_gen = generate_thread_brain
+debug_context.brain_load = load_thread_brain
+debug_context.brain_save = save_thread_brain
+
+debug_context.ovv_core = OVV_CORE
+debug_context.ovv_external = OVV_EXTERNAL
+debug_context.system_prompt = SYSTEM_PROMPT
+
+print("[DEBUG] debug_context injection complete.")
+
+# ============================================================
+# Debug Router
+# ============================================================
+from debug.debug_router import route_debug_message
+
+# ============================================================
+# Notion CRUD
+# ============================================================
+from notion.notion_api import (
+    create_task,
+    start_session,
+    end_session,
+    append_logs,
+)
+
+# ============================================================
+# Boot Log
+# ============================================================
+from debug.debug_boot import send_boot_message
+
+# ============================================================
+# Discord Setup
+# ============================================================
+intents = discord.Intents.default()
+intents.message_content = True
+
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+)
+
+# ============================================================
+# Context Key utilities
+# ============================================================
+def get_context_key(msg: discord.Message) -> int:
+    ch = msg.channel
+    if isinstance(ch, discord.Thread):
+        return ch.id
+    if msg.guild is None:
+        return ch.id
+    return (msg.guild.id << 32) | ch.id
+
+
+def is_task_channel(msg: discord.Message) -> bool:
+    ch = msg.channel
+    if isinstance(ch, discord.Thread):
+        parent = ch.parent
+        return parent and parent.name.lower().startswith("task_")
+    return ch.name.lower().startswith("task_")
+
+
+# ============================================================
+# Event: on_ready
+# ============================================================
+@bot.event
+async def on_ready():
+    print("[READY] Bot connected as", bot.user)
+    await send_boot_message(bot)
+
+
+# ============================================================
+# Event: on_message
+# ============================================================
+@bot.event
+async def on_message(message: discord.Message):
+
+    if message.author.bot:
+        return
+
+    if message.type is not discord.MessageType.default:
+        return
+
+    handled = await route_debug_message(bot, message)
+    if handled:
+        return
+
+    if message.content.startswith("!"):
+        log_audit("command", {"cmd": message.content})
+        await bot.process_commands(message)
+        return
+
+    ck = get_context_key(message)
+    session_id = str(ck)
+
+    # runtime memory append
+    append_runtime_memory(
+        session_id,
+        "user",
+        message.content,
+        limit=40 if is_task_channel(message) else 12,
+    )
+
+    mem = load_runtime_memory(session_id)
+
+    # thread_brain update
+    tb_summary = None
+    if is_task_channel(message):
+        tb_summary = generate_thread_brain(ck, mem)
+        if tb_summary:
+            save_thread_brain(ck, tb_summary)
+    else:
+        tb_summary = load_thread_brain(ck)
+
+    state_hint = decide_state(
+        context_key=ck,
+        user_text=message.content,
+        recent_mem=mem,
+        task_mode=is_task_channel(message),
+    )
+
+    # InputPacket
+    input_packet = build_input_packet(
+        user_text=message.content,
+        runtime_memory=mem,
+        thread_brain=tb_summary,
+        state_hint=state_hint,
+    )
+
+    # Ovv Core
+    raw_ans = call_ovv(ck, input_packet)
+
+    # === Stabilizer ===
+    final_ans = stabilize_ovv_output(raw_ans)
+
+    if not final_ans:
+        final_ans = "Ovv の応答生成に問題が発生しました。少し時間をおいてもう一度試してください。"
+
+    await message.channel.send(final_ans)
+
+
+# ============================================================
+# Commands
+# ============================================================
+@bot.command(name="ping")
+async def ping(ctx):
+    await ctx.send("pong")
+
+
+@bot.command(name="br")
+async def brain_regen(ctx):
+    ck = get_context_key(ctx.message)
+    mem = load_runtime_memory(str(ck))
+    summary = generate_thread_brain(ck, mem)
+
+    if summary:
+        save_thread_brain(ck, summary)
+        await ctx.send("thread_brain を再生成しました。")
+    else:
+        await ctx.send("生成に失敗しました。")
+
+
+@bot.command(name="bs")
+async def brain_show(ctx):
+    ck = get_context_key(ctx.message)
+    summary = load_thread_brain(ck)
+
+    if not summary:
+        await ctx.send("thread_brain はまだありません。")
+        return
+
+    text = json.dumps(summary, ensure_ascii=False, indent=2)
+    if len(text) > 1900:
+        text = text[:1900] + "\n...[truncated]"
+
+    await ctx.send(f"```json\n{text}\n```")
+
+
+@bot.command(name="tt")
+async def test_thread(ctx):
+    ck = get_context_key(ctx.message)
+    mem = load_runtime_memory(str(ck))
+    summary = generate_thread_brain(ck, mem)
+
+    if not summary:
+        await ctx.send("thread_brain 生成失敗")
+        return
+
+    save_thread_brain(ck, summary)
+    await ctx.send("test OK: summary saved")
+
+
+# ============================================================
+# Run
+# ============================================================
+print("[BOOT] Starting Discord Bot")
+bot.run(DISCORD_BOT_TOKEN)
