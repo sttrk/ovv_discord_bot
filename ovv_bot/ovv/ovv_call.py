@@ -88,6 +88,7 @@ def call_ovv(context_key: int, input_packet: Dict[str, Any]) -> str:
     runtime_mem: List[Dict[str, Any]] = input_packet.get("runtime_memory", []) or []
     tb_prompt: str = input_packet.get("tb_prompt", "") or ""
     tb_scoring: str = input_packet.get("tb_scoring", "") or ""
+    # Interface_Box 側で "state" に統一済み
     state_hint: Dict[str, Any] = input_packet.get("state", {}) or {}
 
     messages: List[Dict[str, str]] = []
@@ -101,50 +102,51 @@ def call_ovv(context_key: int, input_packet: Dict[str, Any]) -> str:
     if tb_prompt:
         messages.append({
             "role": "system",
-            "content": f"[ThreadBrain]\n{tb_prompt}",
+            "content": tb_prompt,
         })
 
-    # 3) TB-Scoring（優先ルールヒント）
+    # 3) TB-Scoring（優先ルール・フォーカス）
     if tb_scoring:
         messages.append({
             "role": "system",
             "content": tb_scoring,
         })
 
-    # 4) State Hint
+    # 4) State Hint（会話状態の軽量メタ情報）
     if state_hint:
-        try:
-            state_text = json.dumps(state_hint, ensure_ascii=False)
-        except Exception:
-            state_text = str(state_hint)
+        # JSON そのままを渡すと読みにくいので、ラベル付きで渡す
+        state_text = "[STATE_HINT]\n" + json.dumps(state_hint, ensure_ascii=False)
         messages.append({
             "role": "system",
-            "content": f"[StateHint]\n{state_text}",
+            "content": state_text,
         })
 
-    # 5) 直近メモリ（PG runtime_memory）から 20 件まで
-    for m in runtime_mem[-20:]:
-        role = m.get("role", "user")
-        content = m.get("content", "")
+    # 5) Runtime Memory（過去会話）
+    for m in runtime_mem:
+        role = m.get("role") or "user"
+        content = m.get("content") or ""
         if not content:
             continue
-        if role not in ("user", "assistant", "system"):
-            role = "user"
-        messages.append({"role": role, "content": content})
+        messages.append({
+            "role": role,
+            "content": content,
+        })
 
-    # 6) 今回ユーザー入力
-    messages.append({"role": "user", "content": user_text})
+    # 6) 現在の user 発話
+    messages.append({
+        "role": "user",
+        "content": user_text,
+    })
 
-    # 7) OpenAI 呼び出し
     try:
-        res = openai_client.chat.completions.create(
+        client = openai_client
+        resp = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=messages,
-            temperature=0.5,
         )
-        raw = res.choices[0].message.content.strip()
+        raw = resp.choices[0].message.content or ""
 
-        # runtime_memory に assistant 発話を保存
+        # runtime_memory への append はここでも行う（冗長だが安全側）
         try:
             db_pg.append_runtime_memory(
                 str(context_key),
@@ -161,11 +163,14 @@ def call_ovv(context_key: int, input_packet: Dict[str, Any]) -> str:
     except Exception as e:
         print("[call_ovv error]", repr(e))
         try:
-            db_pg.log_audit("openai_error", {
-                "context_key": context_key,
-                "user_text": user_text[:500],
-                "error": repr(e),
-            })
+            db_pg.log_audit(
+                "openai_error",
+                {
+                    "context_key": context_key,
+                    "user_text": user_text[:500],
+                    "error": repr(e),
+                },
+            )
         except Exception:
             pass
 
