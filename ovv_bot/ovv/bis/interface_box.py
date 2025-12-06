@@ -1,70 +1,79 @@
 # ovv/interface_box.py
-# Interface_Box - BIS Edition
-#
-# 目的:
-# - Boundary_Gate（bot.py）から渡された情報を、Ovv が扱いやすい InputPacket にまとめる。
-# - Thread Brain / State / Runtime Memory を「構造化」して渡すだけに徹する。
-#
-# 責務:
-# - 要約・推論・補完は禁止（構造化のみ）。
-# - 既存の情報をフィルタ・整形して 1 つの dict にパックする。
+"""
+[MODULE CONTRACT]
+NAME: interface_box
+ROLE: Interface_Box
 
-from typing import List, Dict, Any, Optional
+INPUT:
+  - user_text: str
+  - runtime_memory: List[dict]
+  - thread_brain: Optional[dict]
+  - state_hint: Optional[dict]
 
-from .threadbrain_adapter import build_tb_prompt
-from .tb_scoring import build_scoring_prompt
-from .constraint_filter import filter_constraints_in_tb
+OUTPUT:
+  - InputPacket: dict
+      {
+        "version": "1.0",
+        "user_text": <str>,
+        "runtime_memory": <List[dict]>,
+        "thread_brain": <Optional[dict]>,        # constraint_filter 済み
+        "state_hint": <Optional[dict]>,
+        "tb_prompt": <str>,                      # ThreadBrain → 推論向け要約
+        "tb_scoring": <str>,                     # ThreadBrain → 優先ルール
+      }
+
+MUST:
+  - 生の user_text / runtime_memory / thread_brain / state_hint を
+    「Ovv が直接食べられる InputPacket」に **構造化するだけ** とする。
+  - thread_brain については constraint_filter に通し、
+    AI 向け制約・machine 指令を取り除いた上で Ovv に渡す。
+  - ThreadBrain Adapter（build_tb_prompt）や TB-Scoring（build_scoring_prompt）を呼び出し、
+    その結果を tb_prompt / tb_scoring として InputPacket に格納する。
+
+MUST NOT:
+  - Ovv の代わりに推論しない（結論や解釈・助言を生成しない）。
+  - user_text や runtime_memory の内容を書き換えない（削除や要約は禁止）。
+  - Discord 向けの最終メッセージを生成しない（Stabilizer の責務）。
+
+BOUNDARY:
+  - Interface_Box は BIS の「I」層であり、B（Boundary_Gate）と S（Stabilizer）の中間にだけ位置する。
+  - Storage（PG / Notion）や Discord API を直接触らない。
+"""
+
+from typing import List, Optional, Dict, Any
+
+from ovv.threadbrain_adapter import build_tb_prompt
+from ovv.tb_scoring import build_scoring_prompt
+from ovv.constraint_filter import filter_constraints_from_thread_brain
 
 
 def build_input_packet(
     user_text: str,
-    runtime_memory: List[Dict[str, Any]],
+    runtime_memory: List[dict],
     thread_brain: Optional[Dict[str, Any]],
     state_hint: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    Ovv 呼び出し用の InputPacket を構築する。
-
-    Input:
-      - user_text: 今回ユーザーが送ったテキスト
-      - runtime_memory: PG に蓄積されている短期メモリ（user/assistant）
-      - thread_brain: thread_brain summary(JSON) or None
-      - state_hint: decide_state が返した軽量ステート or None
-
-    Output (InputPacket):
-      {
-        "version": "1.1",
-        "user_text": str,
-        "runtime_memory": [...],
-        "thread_brain": {...} or None,
-        "tb_prompt": str,
-        "tb_scoring": str,
-        "state": {...} or {}
-      }
+    Interface_Box のメインエントリ。
+    Ovv に渡すための InputPacket を構築する。
     """
 
-    # runtime_memory は念のため最大 40 件程度に絞る（安全サイド）
-    if runtime_memory is None:
-        runtime_memory = []
-    clipped_mem = runtime_memory[-40:]
+    # 1) Thread Brain を constraint_filter に通して「AIにそのまま食べさせても良い形」にする
+    safe_tb = filter_constraints_from_thread_brain(thread_brain) if thread_brain else None
 
-    # Thread Brain の constraints から機械向け制約を除去したバージョン
-    filtered_tb = filter_constraints_in_tb(thread_brain) if thread_brain else None
+    # 2) Thread Brain Adapter / TB-Scoring で、推論向けのテキストを生成
+    tb_prompt = build_tb_prompt(safe_tb) if safe_tb else ""
+    tb_scoring = build_scoring_prompt(safe_tb) if safe_tb else "[TB-Scoring]\nNo summary available. Prioritize clarity."
 
-    # TB → テキスト化（Adapter）
-    tb_prompt = build_tb_prompt(filtered_tb) if filtered_tb else ""
-
-    # TB → Scoring（優先ルールヒント）
-    tb_scoring = build_scoring_prompt(filtered_tb) if filtered_tb else "[TB-Scoring]\nNo summary available."
-
+    # 3) InputPacket を構築（将来拡張に備え version を固定フィールドとして持つ）
     packet: Dict[str, Any] = {
-        "version": "1.1",
-        "user_text": user_text or "",
-        "runtime_memory": clipped_mem,
-        "thread_brain": filtered_tb,
+        "version": "1.0",
+        "user_text": user_text,
+        "runtime_memory": runtime_memory,
+        "thread_brain": safe_tb,
+        "state_hint": state_hint,
         "tb_prompt": tb_prompt,
         "tb_scoring": tb_scoring,
-        "state": state_hint or {},
     }
 
     return packet
