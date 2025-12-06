@@ -23,7 +23,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
-# PostgreSQL Module（絶対に from-import しない）
+# PostgreSQL Module
 # ============================================================
 import database.pg as db_pg
 
@@ -33,18 +33,16 @@ db_pg.init_db(conn)
 
 log_audit = db_pg.log_audit
 
-# Runtime Memory proxy
 load_runtime_memory = db_pg.load_runtime_memory
 save_runtime_memory = db_pg.save_runtime_memory
 append_runtime_memory = db_pg.append_runtime_memory
 
-# Thread Brain
 load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
 
 # ============================================================
-# Ovv Core 呼び出しレイヤ / BIS レイヤ
+# Ovv Core / BIS Layer
 # ============================================================
 from ovv.ovv_call import (
     call_ovv,
@@ -54,11 +52,11 @@ from ovv.ovv_call import (
 )
 
 from ovv.interface_box import build_input_packet
-from ovv.stabilizer import extract_final_answer
+from ovv.stabilizer import stabilize_ovv_output      # ← 修正ポイント
 from ovv.state_manager import decide_state
 
 # ============================================================
-# Debug Context Injection（必須：debug_commands の cfg 用）
+# Debug Context Injection
 # ============================================================
 from debug.debug_context import debug_context
 
@@ -81,12 +79,12 @@ debug_context.system_prompt = SYSTEM_PROMPT
 print("[DEBUG] debug_context injection complete.")
 
 # ============================================================
-# Debug Router（※必ず context injection 後にロード）
+# Debug Router
 # ============================================================
 from debug.debug_router import route_debug_message
 
 # ============================================================
-# Notion CRUD（循環依存なし）
+# Notion CRUD
 # ============================================================
 from notion.notion_api import (
     create_task,
@@ -96,7 +94,7 @@ from notion.notion_api import (
 )
 
 # ============================================================
-# Boot Log（debug_boot に一本化）
+# Boot Log
 # ============================================================
 from debug.debug_boot import send_boot_message
 
@@ -115,7 +113,6 @@ bot = commands.Bot(
 # ============================================================
 # Context Key utilities
 # ============================================================
-
 def get_context_key(msg: discord.Message) -> int:
     ch = msg.channel
     if isinstance(ch, discord.Thread):
@@ -134,7 +131,7 @@ def is_task_channel(msg: discord.Message) -> bool:
 
 
 # ============================================================
-# Event: on_ready（boot_log 送信）
+# Event: on_ready
 # ============================================================
 @bot.event
 async def on_ready():
@@ -143,35 +140,30 @@ async def on_ready():
 
 
 # ============================================================
-# Event: on_message（Boundary_Gate / BIS 統合）
+# Event: on_message
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
 
-    # Bot 自身・他の Bot には反応しない
     if message.author.bot:
         return
 
-    # スレッド作成通知など「通常メッセージ以外」には反応しない
     if message.type is not discord.MessageType.default:
         return
 
-    # ① Debug Router
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
-    # ② コマンド（! で始まるもの）
     if message.content.startswith("!"):
         log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # ③ 通常メッセージ → Boundary_Gate
     ck = get_context_key(message)
     session_id = str(ck)
 
-    # runtime_memory: user 追記
+    # runtime memory append
     append_runtime_memory(
         session_id,
         "user",
@@ -181,7 +173,7 @@ async def on_message(message: discord.Message):
 
     mem = load_runtime_memory(session_id)
 
-    # Task チャンネルでは thread_brain を更新
+    # thread_brain update
     tb_summary = None
     if is_task_channel(message):
         tb_summary = generate_thread_brain(ck, mem)
@@ -190,7 +182,6 @@ async def on_message(message: discord.Message):
     else:
         tb_summary = load_thread_brain(ck)
 
-    # 軽量ステート決定（数字カウントゲームなど）
     state_hint = decide_state(
         context_key=ck,
         user_text=message.content,
@@ -198,7 +189,7 @@ async def on_message(message: discord.Message):
         task_mode=is_task_channel(message),
     )
 
-    # Interface_Box: InputPacket 構築
+    # InputPacket
     input_packet = build_input_packet(
         user_text=message.content,
         runtime_memory=mem,
@@ -206,13 +197,12 @@ async def on_message(message: discord.Message):
         state_hint=state_hint,
     )
 
-    # Ovv Core 呼び出し（InputPacket）
+    # Ovv Core
     raw_ans = call_ovv(ck, input_packet)
 
-    # Stabilizer: FINAL 抽出
-    final_ans = extract_final_answer(raw_ans)
+    # === Stabilizer ===
+    final_ans = stabilize_ovv_output(raw_ans)
 
-    # 念のため空防止
     if not final_ans:
         final_ans = "Ovv の応答生成に問題が発生しました。少し時間をおいてもう一度試してください。"
 
