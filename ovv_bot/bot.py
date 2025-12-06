@@ -79,16 +79,28 @@ generate_thread_brain = db_pg.generate_thread_brain
 # ============================================================
 # Ovv Core 呼び出しレイヤ / BIS レイヤ
 # ============================================================
-from ovv.core.ovv_call import (
+from ovv.ovv_call import (
     call_ovv,
     OVV_CORE,
     OVV_EXTERNAL,
     SYSTEM_PROMPT,
 )
 
-from ovv.interface.interface_box import build_input_packet
-from ovv.stabilizer.stabilizer import extract_final_answer
-from ovv.state.state_manager import decide_state
+# BIS: Interface_Box / Stabilizer / State_Manager
+# - NOTE:
+#   - interface_box は InputPacket 構築専用
+#   - stabilizer は [FINAL] 抽出専用
+#   - state_manager は「軽量ステート」のみ提供
+from ovv.bis.interface_box import build_input_packet as build_interface_packet
+from ovv.bis.stabilizer import extract_final_answer
+from ovv.bis.state_manager import decide_state
+
+# （現時点では Boundary_Gate は bot.py 内実装を継続利用）
+# 将来的に:
+#   from ovv.bis.boundary_gate import build_input_packet as build_boundary_packet
+# へ移行予定。
+
+
 
 # ============================================================
 # Debug Context Injection（必須：debug_commands の cfg 用）
@@ -244,7 +256,7 @@ async def on_message(message: discord.Message):
     )
 
     # --- Interface_Box: InputPacket 構築 ---
-    input_packet = build_input_packet(
+    input_packet = build_interface_packet(
         user_text=message.content,
         runtime_memory=mem,
         thread_brain=tb_summary,
