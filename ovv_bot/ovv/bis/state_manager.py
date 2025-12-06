@@ -1,177 +1,109 @@
-# ovv/state_manager.py
-# Ovv State Manager v2 (Generic State Hint for BIS)
-#
-# 目的:
-#   - 特定の「数字カウントゲーム」専用ではなく、
-#     一般会話・タスク会話の両方で使える「汎用ステート」を提供する。
-#   - BIS の Interface_Box に、「いまの会話状態」を簡易メタ情報として渡す。
-#
-# 出力イメージ (state_hint):
-# {
-#   "context_key": int,
-#   "mode": "general" | "task" | "idle",
-#   "intent_state": "sustain" | "drift" | "shift",
-#   "tension": 0 | 1 | 2 | 3,
-#   "progress": 0 | 1 | 2,
-# }
-#
-# 既存コードとの互換性:
-#   - シグネチャは従来通り:
-#       decide_state(context_key, user_text, recent_mem, task_mode)
-#   - 単純な dict を返すだけであり、以前の simple_sequence モードは廃止。
-#   - state_hint を使わない実装でも副作用なし。
+# ovv/bis/state_manager.py
+"""
+[MODULE CONTRACT]
+NAME: state_manager
+ROLE: StateHintGenerator (BIS-S Layer)
 
+INPUT:
+  - context_key: int
+  - user_text: str
+  - recent_mem: list[dict]   # runtime_memory (PG) 由来
+  - task_mode: bool          # task_ チャンネルかどうか
+
+OUTPUT:
+  - state_hint: dict
+      {
+        "context_key": int,
+        "mode": "task" | "general" | "idle",
+        "turn_index": int,
+        "flow": "start" | "continue" | "reset",
+        "length": "empty" | "short" | "medium" | "long",
+        "has_question": bool,
+      }
+
+MUST:
+  - generate_lightweight_state_hint           # 軽量なメタ情報のみを生成する
+  - avoid_semantic_inference                  # 意味推論に踏み込まない
+  - be_deterministic_given_inputs             # 同じ入力には同じ出力
+  - remain_stable_under_noise                 # ノイズの多い会話でも破綻しない
+
+MUST_NOT:
+  - call_LLM                                  # LLM 呼び出しは禁止
+  - perform_IO                                # PG / Notion など外部 I/O はしない
+  - interpret_long_term_intent                # 長期意図の解釈はしない（TB v3 に委譲）
+  - override_OvvCore_decisions                # Core の判断を先回りして決めない
+
+BOUNDARY:
+  - このモジュールは BIS の「S」レイヤの一部として、state_hint という軽量メタ情報のみを提供する。
+  - ThreadBrain / Interface_Box / Ovv Core と疎結合であり、意味解釈ではなく構造的ヒントに限定する。
+"""
 
 from typing import List, Dict, Optional
-from datetime import datetime, timezone
 
 
 # ============================================================
 # 内部ユーティリティ
 # ============================================================
 
-def _get_last_user_message(recent_mem: List[dict]) -> Optional[str]:
-    """直近の user メッセージを後ろから走査して 1 件返す。"""
-    for m in reversed(recent_mem):
-        if m.get("role") == "user":
-            return m.get("content") or ""
-    return None
-
-
 def _normalize_text(text: Optional[str]) -> str:
+    """None / 空白を安全に処理した上で str に変換する。"""
     if not text:
         return ""
     return str(text).strip()
 
 
-def _is_question(text: str) -> bool:
-    """簡易的な「質問らしさ」判定。"""
+def _count_user_turns(recent_mem: List[dict]) -> int:
+    """runtime_memory 内の 'user' ロールの件数を数える。"""
+    count = 0
+    for m in recent_mem:
+        if m.get("role") == "user":
+            count += 1
+    return count
+
+
+def _classify_length(text: str) -> str:
+    """
+    発話長を簡易分類する。
+      - empty : 文字数 0
+      - short : 1〜30
+      - medium: 31〜120
+      - long  : 121 以上
+    """
+    length = len(text)
+    if length == 0:
+        return "empty"
+    if length <= 30:
+        return "short"
+    if length <= 120:
+        return "medium"
+    return "long"
+
+
+def _has_question_mark(text: str) -> bool:
+    """記号レベルの質問っぽさのみ判定（意味までは読まない）。"""
     if not text:
         return False
-    if "?" in text or "？" in text:
-        return True
-    # よくある日本語の質問語
-    question_keywords = ["教えて", "どう", "なに", "何", "どこ", "どれ", "なぜ", "なんで", "ですか", "でしょうか"]
-    return any(k in text for k in question_keywords)
+    return ("?" in text) or ("？" in text)
 
 
-def _estimate_tension(recent_mem: List[dict], user_text: str) -> int:
+def _detect_topic_reset(text: str) -> bool:
     """
-    軽量な「テンション（苛立ち/違和感の強さ）」推定。
-    0: 通常
-    1: 違和感・軽い不満
-    2: 明確な不満・苛立ち
-    3: 強い苛立ち・トラブルモード
+    「話題リセット」らしき合図を最小限の語彙で検出する。
+    ※ 意味推論ではなく、固定フレーズ検出に限定する。
     """
-    text = _normalize_text(user_text)
-    if not text:
-        return 0
+    t = _normalize_text(text)
+    if not t:
+        return False
 
-    # 直近数メッセージを対象に軽量判定
-    window = list(reversed(recent_mem[-5:]))
-
-    # ネガティブワードの簡易セット（日本語中心）
-    mild_words = ["ん？", "え？", "違う", "おかしい", "変だ"]
-    strong_words = ["ふざけ", "ムカつく", "最悪", "使えない", "ダメ", "なんでやねん", "は？"]
-
-    score = 0
-
-    def scan(s: str) -> int:
-        s_norm = _normalize_text(s)
-        if not s_norm:
-            return 0
-        local = 0
-        if any(w in s_norm for w in mild_words):
-            local += 1
-        if any(w in s_norm for w in strong_words):
-            local += 2
-        return local
-
-    # 現在ユーザー入力
-    score += scan(text)
-
-    # 過去数件（user のみ）も軽く見る
-    for m in window:
-        if m.get("role") != "user":
-            continue
-        score += scan(m.get("content", ""))
-
-    # 正規化（最大 3）
-    if score <= 0:
-        return 0
-    if score == 1:
-        return 1
-    if 2 <= score <= 3:
-        return 2
-    return 3
-
-
-def _estimate_intent_state(user_text: str, last_user_text: Optional[str]) -> str:
-    """
-    intent_state:
-      - sustain: 直前までの話題の継続っぽい
-      - drift  : 少し話題がズレつつも関連はありそう
-      - shift  : 完全に話題が変わった / 新規トピックの可能性が高い
-    """
-    current = _normalize_text(user_text)
-    last = _normalize_text(last_user_text)
-
-    if not last:
-        # 過去 user 発話がない → 新規トピック
-        return "shift"
-
-    # 質問かどうか
-    current_q = _is_question(current)
-    last_q = _is_question(last)
-
-    # 長さと overlap を簡易評価
-    # （本格的な類似度は使わず、トークンの粗い共通部分を見る）
-    current_tokens = set(current.replace("、", " ").replace("。", " ").split())
-    last_tokens = set(last.replace("、", " ").replace("。", " ").split())
-    overlap = len(current_tokens & last_tokens)
-
-    # かなり粗いヒューリスティックだが、軽量で壊れない範囲に留める
-    if overlap >= 3:
-        # 単語の被りが多い → ほぼ同一トピック
-        return "sustain"
-
-    if current_q != last_q:
-        # 文の性質が質問⇔回答系で切り替わっている場合は drift 気味
-        return "drift"
-
-    if overlap == 0 and len(current_tokens) >= 3:
-        # ほぼ共通語無しの新規発話
-        return "shift"
-
-    # デフォルトは drift に寄せる
-    return "drift"
-
-
-def _estimate_progress(user_text: str, recent_mem: List[dict]) -> int:
-    """
-    progress:
-      0: 停滞・戸惑い寄り（「え？」「違う」「なんで」系）
-      1: 通常進行（挨拶・軽い返答など）
-      2: 前進度高め（新しい問い / 明確なリクエスト）
-    """
-    text = _normalize_text(user_text)
-    if not text:
-        return 0
-
-    # ごく簡単な「戸惑い/停止」パターン
-    stop_words = ["え？", "は？", "なんで", "違う", "わからない", "どういうこと"]
-    if any(w in text for w in stop_words):
-        return 0
-
-    # 新しい質問・依頼っぽいものは 2
-    if _is_question(text):
-        return 2
-    request_keywords = ["してほしい", "やって", "作って", "教えて", "設計", "実装"]
-    if any(k in text for k in request_keywords):
-        return 2
-
-    # それ以外は 1（会話は進んでいる）
-    return 1
+    reset_keywords = [
+        "リセット",
+        "reset",
+        "最初から",
+        "一旦整理",
+        "話題変えて",
+        "別の話",
+    ]
+    return any(k in t for k in reset_keywords)
 
 
 # ============================================================
@@ -185,47 +117,62 @@ def decide_state(
     task_mode: bool,
 ) -> Dict[str, object]:
     """
-    汎用ステート判定を行い、state_hint を返す。
+    Discord 版 Ovv 向けの汎用 state_hint を生成する。
 
     返り値例:
     {
       "context_key": 1234567890,
       "mode": "task",
-      "intent_state": "sustain",
-      "tension": 1,
-      "progress": 2,
+      "turn_index": 5,
+      "flow": "continue",
+      "length": "medium",
+      "has_question": True,
     }
 
-    ※ 以前の実装との違い:
-      - simple_sequence や数字カウント専用モードは廃止。
-      - None を返さず、常に dict を返す（互換性は保たれる）。
+    特徴:
+      - 意味推論には踏み込まず、構造・長さ・記号など「薄いメタ情報」に限定する。
+      - None を返さず、常に dict を返す。
+      - TB v3 / Ovv Core との責務分離を徹底する。
     """
+
+    text_norm = _normalize_text(user_text)
 
     # 1) mode 判定
     if task_mode:
         mode = "task"
     else:
-        # recent_mem がほぼ無い場合は idle に寄せる
+        # 会話履歴がほぼ無い場合は idle、それ以外は general
         mode = "idle" if len(recent_mem) == 0 else "general"
 
-    # 2) 直近ユーザー発話
-    last_user_text = _get_last_user_message(recent_mem[:-1])  # 今回発話を除く
+    # 2) ユーザー発話回数（turn_index）
+    # recent_mem には直前までの履歴＋今回発話が含まれている前提
+    user_turns = _count_user_turns(recent_mem)
+    if user_turns <= 0:
+        # 念のため安全側フォールバック
+        user_turns = 1
+    turn_index = user_turns
 
-    # 3) intent_state 推定
-    intent_state = _estimate_intent_state(user_text, last_user_text)
+    # 3) flow 判定
+    if turn_index <= 1:
+        flow = "start"
+    elif _detect_topic_reset(text_norm):
+        flow = "reset"
+    else:
+        flow = "continue"
 
-    # 4) tension 推定
-    tension = _estimate_tension(recent_mem, user_text)
+    # 4) length 判定
+    length_tag = _classify_length(text_norm)
 
-    # 5) progress 推定
-    progress = _estimate_progress(user_text, recent_mem)
+    # 5) 質問記号の有無
+    has_q = _has_question_mark(text_norm)
 
     state_hint: Dict[str, object] = {
         "context_key": context_key,
         "mode": mode,
-        "intent_state": intent_state,
-        "tension": tension,
-        "progress": progress,
+        "turn_index": turn_index,
+        "flow": flow,
+        "length": length_tag,
+        "has_question": has_q,
     }
 
     return state_hint
