@@ -12,23 +12,22 @@
 #   - preserve_structure(summary)
 #   - remove(machine_constraints)
 #   - remove(json_output_forcing_rules)
+#   - remove(markdown_ban_rules)
 #   - support(TB_v0)
 #   - support(TB_v1)
 #
 # MUST_NOT:
 #   - invent_content
 #   - mutate(non_constraint_fields)
-#   - allow(JSON_only_constraints)
-#   - allow(Markdown_ban_constraints)
+#   - remove(human_conversation_rules)
 
 from typing import Optional, Dict, List, Any
 
 # ============================================================
-# ノイズ制約キーワード（英語 + 日本語）
+# 英語系ノイズキーワード（機械制約・LLM制御系）
 # ============================================================
 
-_MACHINE_KEYWORDS = [
-    # 英語系ノイズ
+_MACHINE_KEYWORDS_EN = [
     "system",
     "assistant",
     "llm",
@@ -41,43 +40,79 @@ _MACHINE_KEYWORDS = [
     "ignore",
     "override",
     "jailbreak",
+    "rp jailbreak",
     "###",
     "<!--",
     "-->",
-
-    # 日本語系の危険制約（今回の問題の原因）
-    "必ずjson",            # 必ずJSONで返すこと
-    "jsonで返す",          # JSONで返す
-    "json形式で返す",
-    "jsonのみ",
-    "マークダウンを含めない",
-    "マークダウン禁止",
-    "説明文を含めない",
-    "構造化データのみを返す",
-    "構造化データで返す",
-    "オブジェクトのみ",
 ]
 
 
 # ============================================================
-# 内部判定
+# 日本語系の危険制約パターン
+#   - JSON強制
+#   - 構造化データ強制
+#   - マークダウン・説明文の禁止
+# ============================================================
+
+def _is_japanese_machine_constraint(text: str) -> bool:
+    """
+    日本語で書かれた「出力形式を不自然に縛る制約」を検出する。
+    例:
+      - 必ずJSONオブジェクトのみを返すこと
+      - JSON形式で返す
+      - マークダウンや説明文を含めないこと
+    """
+
+    if not text or not isinstance(text, str):
+        return False
+
+    # JSON 強制系
+    # 例: "必ずJSONオブジェクトのみを返すこと", "JSON形式で返す", "JSONで返す"
+    if "json" in text.lower():
+        if ("返す" in text) or ("のみ" in text) or ("オブジェクト" in text) or ("形式" in text):
+            return True
+
+    # 構造化データ強制っぽい表現
+    # 例: "構造化データのみを返す", "オブジェクトのみを返す"
+    if "構造化データ" in text and "返す" in text:
+        return True
+    if "オブジェクト" in text and "のみ" in text and "返す" in text:
+        return True
+
+    # マークダウン・説明文の禁止
+    # 例: "マークダウンや説明文を含めないこと", "マークダウンを含めない", "説明文を含めない"
+    if "マークダウン" in text and ("含めない" in text or "禁止" in text):
+        return True
+    if "説明文" in text and "含めない" in text:
+        return True
+
+    # ここでは「敬語禁止」などの会話スタイル制約は機械制約として扱わない。
+    return False
+
+
+# ============================================================
+# 総合判定
 # ============================================================
 
 def _is_machine_constraint(text: str) -> bool:
     """
     ThreadBrain constraints のうち、
-    LLM の出力を強制的に構造化方向へ歪める“危険制約”を排除する。
+    LLM の出力を歪める「機械制約 / 形式強制」を排除する。
     """
     if not text or not isinstance(text, str):
         return False
 
     lowered = text.lower()
-    original = text
 
-    # 英語・日本語ノイズの部分一致で判定
-    for kw in _MACHINE_KEYWORDS:
-        if kw in lowered or kw in original:
+    # 1) 英語系キーワード（部分一致）
+    for kw in _MACHINE_KEYWORDS_EN:
+        if kw in lowered:
             return True
+
+    # 2) 日本語系パターン
+    if _is_japanese_machine_constraint(text):
+        return True
+
     return False
 
 
@@ -86,7 +121,7 @@ def _filter_constraints_list(items: List[Any]) -> List[Any]:
     constraints 配列から危険制約だけ除去し、
     構造と順序は維持する。
     """
-    cleaned = []
+    cleaned: List[Any] = []
 
     for item in items:
         # dict（v1形式）
