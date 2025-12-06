@@ -1,4 +1,35 @@
-# bot.py - Ovv Discord Bot (BIS Integrated Edition + Constraint_Filter v2.0)
+# bot.py - Ovv Discord Bot (BIS Integrated Edition)
+
+"""
+[MODULE CONTRACT]
+NAME: bot
+ROLE: Boundary_Gate / Dispatcher
+
+INPUT:
+  - Discord Message (discord.Message)
+  - Discord Command Context (commands.Context)
+
+OUTPUT:
+  - Discord チャンネルへのメッセージ送信（text）
+  - PostgreSQL / Notion への副作用（audit_log, runtime_memory, thread_brain 等）
+
+MUST:
+  - Discord からの全イベント入力を一元的に受け取り、BIS の流れに沿って処理する:
+      Boundary_Gate → Interface_Box → Ovv Core → Stabilizer → Discord
+  - runtime_memory / thread_brain などの状態更新を **Ovv に隠蔽したまま** 行う。
+  - Ovv Core には常に InputPacket（構造化済み入力）だけを渡す。
+  - Stabilizer から返ってきた **最終テキストのみ** を Discord に送信する。
+
+MUST NOT:
+  - Ovv Core の出力内容を書き換えない（文意の改変・再生成・補完は禁止）。
+  - 推論ロジックを実装しない（意味解釈・方針決定は Ovv / ThreadBrain に委譲）。
+  - Notion・PG のデータ構造をこのファイル内で設計・変更しない（I/O 呼び出しのみ）。
+
+BOUNDARY:
+  - このモジュールは BIS の「B（Boundary_Gate）」層および Discord Command Dispatcher としてのみ振る舞う。
+  - Interface_Box / Stabilizer / Ovv Core / Storage（PG・Notion）との境界を厳守し、
+    それらの内部構造に依存するロジックを持たない。
+"""
 
 import os
 import json
@@ -53,10 +84,9 @@ from ovv.ovv_call import (
     SYSTEM_PROMPT,
 )
 
-from ovv.bis.interface_box import build_input_packet
-from ovv.bis.stabilizer import extract_final_answer
-from ovv.bis.state_manager import decide_state
-from ovv.bis.constraint_filter import apply_constraint_filter
+from ovv.interface_box import build_input_packet
+from ovv.stabilizer import extract_final_answer
+from ovv.state_manager import decide_state
 
 # ============================================================
 # Debug Context Injection（必須：debug_commands の cfg 用）
@@ -182,7 +212,7 @@ async def on_message(message: discord.Message):
 
     mem = load_runtime_memory(session_id)
 
-    # Task チャンネルでは thread_brain を更新、それ以外は最新をロード
+    # Task チャンネルでは thread_brain を更新
     tb_summary = None
     if is_task_channel(message):
         tb_summary = generate_thread_brain(ck, mem)
@@ -191,7 +221,7 @@ async def on_message(message: discord.Message):
     else:
         tb_summary = load_thread_brain(ck)
 
-    # 軽量ステート決定（数字カウントゲームなどの状態ヒント）
+    # 軽量ステート決定（数字カウントゲームなど汎用ステート判定）
     state_hint = decide_state(
         context_key=ck,
         user_text=message.content,
@@ -199,29 +229,9 @@ async def on_message(message: discord.Message):
         task_mode=is_task_channel(message),
     )
 
-    # ---------- Constraint_Filter（曖昧入力の除去） ----------
-    filter_result = apply_constraint_filter(
-        user_text=message.content,
-        runtime_memory=mem,
-        thread_brain=tb_summary,
-    )
-
-    if filter_result["status"] == "reject":
-        # 破棄: Core には流さない
-        await message.channel.send(filter_result["message"])
-        return
-
-    if filter_result["status"] == "clarify":
-        # 追加情報要求: Core には流さない
-        await message.channel.send(filter_result["message"])
-        return
-
-    # status == ok → 安全なテキストを使用
-    safe_text = filter_result["clean_text"]
-
     # Interface_Box: InputPacket 構築
     input_packet = build_input_packet(
-        user_text=safe_text,
+        user_text=message.content,
         runtime_memory=mem,
         thread_brain=tb_summary,
         state_hint=state_hint,
