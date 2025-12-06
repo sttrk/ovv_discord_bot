@@ -1,4 +1,4 @@
-# bot.py - Ovv Discord Bot (Stable Full Edition A4-R3 + BIS A5-Minimal)
+# bot.py - Ovv Discord Bot (BIS Integrated Edition)
 
 import os
 import json
@@ -44,7 +44,7 @@ save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
 
 # ============================================================
-# Ovv Core 呼び出しレイヤ（PG 初期化後に読み込む）
+# Ovv Core 呼び出しレイヤ / BIS レイヤ
 # ============================================================
 from ovv.ovv_call import (
     call_ovv,
@@ -53,15 +53,9 @@ from ovv.ovv_call import (
     SYSTEM_PROMPT,
 )
 
-# ============================================================
-# Interface Box（BIS: B → I → Ovv → S）
-# ============================================================
 from ovv.interface_box import build_input_packet
-
-# ============================================================
-# Stabilizer（BIS: 最終出力安定化）
-# ============================================================
-from ovv.stabilizer import stabilize_output
+from ovv.stabilizer import extract_final_answer
+from ovv.state_manager import decide_state
 
 # ============================================================
 # Debug Context Injection（必須：debug_commands の cfg 用）
@@ -121,6 +115,7 @@ bot = commands.Bot(
 # ============================================================
 # Context Key utilities
 # ============================================================
+
 def get_context_key(msg: discord.Message) -> int:
     ch = msg.channel
     if isinstance(ch, discord.Thread):
@@ -144,12 +139,11 @@ def is_task_channel(msg: discord.Message) -> bool:
 @bot.event
 async def on_ready():
     print("[READY] Bot connected as", bot.user)
-    # boot_log 送信は debug_boot 側に委譲
     await send_boot_message(bot)
 
 
 # ============================================================
-# Event: on_message（B → I → Ovv → S）
+# Event: on_message（Boundary_Gate / BIS 統合）
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
@@ -173,11 +167,11 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # ③ 通常メッセージ → B (Boundary_Gate) → I (Interface_Box) → Ovv → S (Stabilizer)
+    # ③ 通常メッセージ → Boundary_Gate
     ck = get_context_key(message)
     session_id = str(ck)
 
-    # B: Runtime memory へ user メッセージを追加
+    # runtime_memory: user 追記
     append_runtime_memory(
         session_id,
         "user",
@@ -188,30 +182,39 @@ async def on_message(message: discord.Message):
     mem = load_runtime_memory(session_id)
 
     # Task チャンネルでは thread_brain を更新
-    task_mode = is_task_channel(message)
-    if task_mode:
-        summary = generate_thread_brain(ck, mem)
-        if summary:
-            save_thread_brain(ck, summary)
+    tb_summary = None
+    if is_task_channel(message):
+        tb_summary = generate_thread_brain(ck, mem)
+        if tb_summary:
+            save_thread_brain(ck, tb_summary)
+    else:
+        tb_summary = load_thread_brain(ck)
 
-    # I: Interface_Box で InputPacket を構築
-    packet = build_input_packet(
+    # 軽量ステート決定（数字カウントゲームなど）
+    state_hint = decide_state(
         context_key=ck,
         user_text=message.content,
         recent_mem=mem,
-        task_mode=task_mode,
+        task_mode=is_task_channel(message),
     )
 
-    # Ovv: コア呼び出し（state_hint を渡す）
-    raw_ans = call_ovv(
-        ck,
-        packet["user_text"],
-        packet["recent_mem"],
-        state_hint=packet.get("state_hint"),
+    # Interface_Box: InputPacket 構築
+    input_packet = build_input_packet(
+        user_text=message.content,
+        runtime_memory=mem,
+        thread_brain=tb_summary,
+        state_hint=state_hint,
     )
 
-    # S: Stabilizer で [FINAL] 抽出＋truncate
-    final_ans = stabilize_output(raw_ans)
+    # Ovv Core 呼び出し（InputPacket）
+    raw_ans = call_ovv(ck, input_packet)
+
+    # Stabilizer: FINAL 抽出
+    final_ans = extract_final_answer(raw_ans)
+
+    # 念のため空防止
+    if not final_ans:
+        final_ans = "Ovv の応答生成に問題が発生しました。少し時間をおいてもう一度試してください。"
 
     await message.channel.send(final_ans)
 
