@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 512 512">
+
+  <!-- カラー定義 -->
+  <defs>
+    <style>
+      .deep  { fill:#0C4F53; }   /* Ovv Deep Teal */
+      .light { fill:#2A8B8F; }   /* Ovv Shell Teal Light */
+      .core  { fill:#F9F6EE; }   /* Ovv Core White */
+      .dot   { fill:#0D4D50; }   /* Ovv Dot Deep */
+    </style>
+  </defs>
+
+  <!-- 中央にロゴを配置 -->
+  <g transform="translate(256 256)">
+
+    <!-- 吊り糸 -->
+    <rect x="-4" y="-210" width="8" height="80" class="deep"/>
+    <circle cx="0" cy="-130" r="18" class="deep"/>
+
+    <!-- 外殻（繭のベース） -->
+    <!-- 対称の涙滴形。元ロゴより少し整理された形状 -->
+    <path class="deep" d="
+      M 0 -110
+      C -70 -80, -110 -10, -110 70
+      C -110 130, -75 185, 0 220
+      C  75 185, 110 130, 110  70
+      C 110 -10,  70 -80,  0 -110
+      Z" />
+
+    <!-- 内側の濃い帯（中心ラインのベース） -->
+    <path class="deep" d="
+      M 10 -60 
+      C -40 -40, -70 10, -70 60
+      C -70 100, -45 145, 0 170
+      C  25 155,  45 130,  60 100
+      C  70  75,  75  50,  75  30
+      C  30   5,  20 -30, 10 -60
+      Z" />
+
+    <!-- ライトグリーンの外殻帯（左上～右下への流線） -->
+    <path class="light" d="
+      M 0 -110
+      C -55 -85, -90 -25, -95 30
+      L -70 30
+      C -60 -20, -30 -60, 10 -80
+      Z" />
+
+    <!-- ライトグリーンの下側フラップ -->
+    <path class="light" d="
+      M -80  40
+      C -70  90, -45 135, 0 160
+      L  15 140
+      C -25 120, -50 80, -60 40
+      Z" />
+
+    <!-- コア円（Ovvの思考核） -->
+    <circle cx="50" cy="-10" r="55" class="core"/>
+
+    <!-- 白い情報ライン（O/Vライン） -->
+    <path class="core" d="
+      M -60  40
+      C -25  10, 10 -10, 50 -20
+      C  35  10, 15  40, -10  70
+      C -25  55, -45  45, -60 40
+      Z" />
+
+    <!-- 3つのドット（P→A→F の思考粒子） -->
+    <circle cx="40" cy="105" r="9"  class="dot"/>
+    <circle cx="65" cy="125" r="11" class="dot"/>
+    <circle cx="95" cy="145" r="13" class="dot"/>
+
+  </g>
+</svg>
