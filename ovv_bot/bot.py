@@ -1,4 +1,4 @@
-# bot.py - Ovv Discord Bot (BIS Integrated Edition)
+# bot.py - Ovv Discord Bot (BIS Integrated Edition + Constraint_Filter v2.0)
 
 import os
 import json
@@ -23,7 +23,7 @@ openai_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = Client(auth=NOTION_API_KEY)
 
 # ============================================================
-# PostgreSQL Module
+# PostgreSQL Module（絶対に from-import しない）
 # ============================================================
 import database.pg as db_pg
 
@@ -33,16 +33,18 @@ db_pg.init_db(conn)
 
 log_audit = db_pg.log_audit
 
+# Runtime Memory proxy
 load_runtime_memory = db_pg.load_runtime_memory
 save_runtime_memory = db_pg.save_runtime_memory
 append_runtime_memory = db_pg.append_runtime_memory
 
+# Thread Brain
 load_thread_brain = db_pg.load_thread_brain
 save_thread_brain = db_pg.save_thread_brain
 generate_thread_brain = db_pg.generate_thread_brain
 
 # ============================================================
-# Ovv Core / BIS Layer
+# Ovv Core 呼び出しレイヤ / BIS レイヤ
 # ============================================================
 from ovv.ovv_call import (
     call_ovv,
@@ -51,12 +53,13 @@ from ovv.ovv_call import (
     SYSTEM_PROMPT,
 )
 
-from ovv.interface_box import build_input_packet
-from ovv.stabilizer import stabilize_ovv_output      # ← 修正ポイント
-from ovv.state_manager import decide_state
+from ovv.bis.interface_box import build_input_packet
+from ovv.bis.stabilizer import extract_final_answer
+from ovv.bis.state_manager import decide_state
+from ovv.bis.constraint_filter import apply_constraint_filter
 
 # ============================================================
-# Debug Context Injection
+# Debug Context Injection（必須：debug_commands の cfg 用）
 # ============================================================
 from debug.debug_context import debug_context
 
@@ -79,12 +82,12 @@ debug_context.system_prompt = SYSTEM_PROMPT
 print("[DEBUG] debug_context injection complete.")
 
 # ============================================================
-# Debug Router
+# Debug Router（※必ず context injection 後にロード）
 # ============================================================
 from debug.debug_router import route_debug_message
 
 # ============================================================
-# Notion CRUD
+# Notion CRUD（循環依存なし）
 # ============================================================
 from notion.notion_api import (
     create_task,
@@ -94,7 +97,7 @@ from notion.notion_api import (
 )
 
 # ============================================================
-# Boot Log
+# Boot Log（debug_boot に一本化）
 # ============================================================
 from debug.debug_boot import send_boot_message
 
@@ -113,6 +116,7 @@ bot = commands.Bot(
 # ============================================================
 # Context Key utilities
 # ============================================================
+
 def get_context_key(msg: discord.Message) -> int:
     ch = msg.channel
     if isinstance(ch, discord.Thread):
@@ -131,7 +135,7 @@ def is_task_channel(msg: discord.Message) -> bool:
 
 
 # ============================================================
-# Event: on_ready
+# Event: on_ready（boot_log 送信）
 # ============================================================
 @bot.event
 async def on_ready():
@@ -140,30 +144,35 @@ async def on_ready():
 
 
 # ============================================================
-# Event: on_message
+# Event: on_message（Boundary_Gate / BIS 統合）
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
 
+    # Bot 自身・他の Bot には反応しない
     if message.author.bot:
         return
 
+    # スレッド作成通知など「通常メッセージ以外」には反応しない
     if message.type is not discord.MessageType.default:
         return
 
+    # ① Debug Router
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
+    # ② コマンド（! で始まるもの）
     if message.content.startswith("!"):
         log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
+    # ③ 通常メッセージ → Boundary_Gate
     ck = get_context_key(message)
     session_id = str(ck)
 
-    # runtime memory append
+    # runtime_memory: user 追記
     append_runtime_memory(
         session_id,
         "user",
@@ -173,7 +182,7 @@ async def on_message(message: discord.Message):
 
     mem = load_runtime_memory(session_id)
 
-    # thread_brain update
+    # Task チャンネルでは thread_brain を更新、それ以外は最新をロード
     tb_summary = None
     if is_task_channel(message):
         tb_summary = generate_thread_brain(ck, mem)
@@ -182,6 +191,7 @@ async def on_message(message: discord.Message):
     else:
         tb_summary = load_thread_brain(ck)
 
+    # 軽量ステート決定（数字カウントゲームなどの状態ヒント）
     state_hint = decide_state(
         context_key=ck,
         user_text=message.content,
@@ -189,20 +199,41 @@ async def on_message(message: discord.Message):
         task_mode=is_task_channel(message),
     )
 
-    # InputPacket
-    input_packet = build_input_packet(
+    # ---------- Constraint_Filter（曖昧入力の除去） ----------
+    filter_result = apply_constraint_filter(
         user_text=message.content,
+        runtime_memory=mem,
+        thread_brain=tb_summary,
+    )
+
+    if filter_result["status"] == "reject":
+        # 破棄: Core には流さない
+        await message.channel.send(filter_result["message"])
+        return
+
+    if filter_result["status"] == "clarify":
+        # 追加情報要求: Core には流さない
+        await message.channel.send(filter_result["message"])
+        return
+
+    # status == ok → 安全なテキストを使用
+    safe_text = filter_result["clean_text"]
+
+    # Interface_Box: InputPacket 構築
+    input_packet = build_input_packet(
+        user_text=safe_text,
         runtime_memory=mem,
         thread_brain=tb_summary,
         state_hint=state_hint,
     )
 
-    # Ovv Core
+    # Ovv Core 呼び出し（InputPacket）
     raw_ans = call_ovv(ck, input_packet)
 
-    # === Stabilizer ===
-    final_ans = stabilize_ovv_output(raw_ans)
+    # Stabilizer: FINAL 抽出
+    final_ans = extract_final_answer(raw_ans)
 
+    # 念のため空防止
     if not final_ans:
         final_ans = "Ovv の応答生成に問題が発生しました。少し時間をおいてもう一度試してください。"
 
