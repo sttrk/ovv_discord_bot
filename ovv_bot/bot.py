@@ -197,80 +197,100 @@ async def on_ready():
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
+    """
+    Discord の生メッセージ → Debug Router → Command Router → Boundary_Gate → BIS パイプライン
 
-    # Bot 自身・他の Bot には反応しない
+    フロー:
+      1) Bot / System メッセージは早期 return（Boundary_Gate と二重だが、安全側）
+      2) Debug Router に委譲（!dbg ... 系）
+      3) 通常コマンド（!xxx）は process_commands へ委譲
+      4) Boundary_Gate.build_boundary_packet で InputPacket を構築
+      5) runtime_memory / ThreadBrain / State を更新
+      6) Interface_Box → Ovv Core → Stabilizer → Discord 送信
+    """
+
+    # 0) Bot 自身・他の Bot には反応しない（Boundary_Gate でも確認するが、早期 return）
     if message.author.bot:
         return
 
-    # スレッド作成通知など「通常メッセージ以外」には反応しない
+    # 1) スレッド作成通知など「通常メッセージ以外」には反応しない
+    #    （Boundary_Gate でも弾くが、ここでも念のためフィルタ）
     if message.type is not discord.MessageType.default:
         return
 
-    # ① Debug Router（!dbg ...）
+    # 2) Debug Router（!dbg ...）に先に通す
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
-    # ② コマンド（! で始まるもの）→ Discord Commands に委譲
+    # 3) 通常コマンド（!xxx）は Discord Commands Framework に委譲
     if message.content.startswith("!"):
-        log_audit("command", {"cmd": message.content})
         await bot.process_commands(message)
         return
 
-    # ③ 通常メッセージ → Boundary_Gate 処理開始
-    ck = get_context_key(message)
-    session_id = str(ck)
+    # 4) Boundary_Gate: Discord Message → 標準化 InputPacket
+    boundary_packet = build_boundary_packet(message)
+    if boundary_packet is None:
+        # Bot / System / 空メッセージ 等はここで終了
+        return
 
-    # --- Runtime Memory: user 追記 ---
+    # Boundary_Gate から必要情報を取得
+    context_key = boundary_packet.context_key
+    session_id = boundary_packet.session_id
+    is_task = boundary_packet.is_task_channel
+    user_text = boundary_packet.text
+
+    # 5) runtime_memory 更新（session_id 単位）
     append_runtime_memory(
         session_id,
         "user",
-        message.content,
-        limit=40 if is_task_channel(message) else 12,
+        user_text,
+        limit=40 if is_task else 12,
     )
 
+    # 6) runtime_memory 読み出し
     mem = load_runtime_memory(session_id)
 
-    # --- Thread Brain 更新 / 取得 ---
+    # 7) Thread Brain 更新 / 取得
     tb_summary = None
-    if is_task_channel(message):
+    if is_task:
         # Task チャンネルでは毎回更新
-        tb_summary = generate_thread_brain(ck, mem)
+        tb_summary = generate_thread_brain(context_key, mem)
         if tb_summary:
-            save_thread_brain(ck, tb_summary)
+            save_thread_brain(context_key, tb_summary)
     else:
         # 通常チャンネルは既存 TB があれば利用
-        tb_summary = load_thread_brain(ck)
+        tb_summary = load_thread_brain(context_key)
 
-    # --- 軽量ステート決定（数字カウント等の simple_sequence 含む） ---
+    # 8) 軽量ステート決定
     state_hint = decide_state(
-        context_key=ck,
-        user_text=message.content,
+        context_key=context_key,
+        user_text=user_text,
         recent_mem=mem,
-        task_mode=is_task_channel(message),
+        task_mode=is_task,
     )
 
-    # --- Interface_Box: InputPacket 構築 ---
+    # 9) Interface_Box: OvvInput 用 InputPacket 構築
     input_packet = build_interface_packet(
-        user_text=message.content,
+        user_text=user_text,
         runtime_memory=mem,
         thread_brain=tb_summary,
         state_hint=state_hint,
     )
 
-    # --- Ovv Core 呼び出し（InputPacket） ---
-    raw_ans = call_ovv(ck, input_packet)
+    # 10) Ovv Core 呼び出し（InputPacket ベース）
+    raw_ans = call_ovv(context_key, input_packet)
 
-    # --- Stabilizer: [FINAL] 抽出 & 崩れ補正 ---
+    # 11) Stabilizer: [FINAL] 抽出 & 崩れ補正
     final_ans = extract_final_answer(raw_ans)
 
-    # 念のため空防止（Stabilizer 側で全落ちした場合のフェイルセーフ）
+    # 12) 念のため空防止（Stabilizer 側で全落ちした場合のフェイルセーフ）
     if not final_ans:
         final_ans = "Ovv の応答生成に問題が発生しました。少し時間をおいてもう一度試してください。"
 
+    # 13) Discord へ送信
     await message.channel.send(final_ans)
-
-
+    
 # ============================================================
 # Commands（BIS 外だが、Boundary_Gate の一部として扱う）
 # ============================================================
@@ -284,17 +304,24 @@ async def brain_regen(ctx: commands.Context):
     """
     現在 context_key の runtime_memory から thread_brain を再生成して保存。
     """
-    ck = get_context_key(ctx.message)
-    mem = load_runtime_memory(str(ck))
+    boundary_packet = build_boundary_packet(ctx.message)
+    if boundary_packet is None:
+        await ctx.send("このメッセージから context_key を生成できません。")
+        return
+
+    ck = boundary_packet.context_key
+    session_id = boundary_packet.session_id
+
+    mem = load_runtime_memory(session_id)
     summary = generate_thread_brain(ck, mem)
 
     if summary:
         save_thread_brain(ck, summary)
         await ctx.send("thread_brain を再生成しました。")
     else:
-        await ctx.send("生成に失敗しました。")
-
-
+        await ctx.send("thread_brain の再生成に失敗しました。")
+        
+        
 @bot.command(name="bs")
 async def brain_show(ctx: commands.Context):
     """
@@ -314,14 +341,21 @@ async def brain_show(ctx: commands.Context):
     await ctx.send(f"```json\n{text}\n```")
 
 
-@bot.command(name="tt")
+@bot.command(name="test_thread")
 async def test_thread(ctx: commands.Context):
     """
     テスト用：現在 context_key の runtime_memory から thread_brain を生成し、
     保存できるかどうかを確認する。
     """
-    ck = get_context_key(ctx.message)
-    mem = load_runtime_memory(str(ck))
+    boundary_packet = build_boundary_packet(ctx.message)
+    if boundary_packet is None:
+        await ctx.send("このメッセージから context_key を生成できません。")
+        return
+
+    ck = boundary_packet.context_key
+    session_id = boundary_packet.session_id
+
+    mem = load_runtime_memory(session_id)
     summary = generate_thread_brain(ck, mem)
 
     if not summary:
@@ -330,8 +364,7 @@ async def test_thread(ctx: commands.Context):
 
     save_thread_brain(ck, summary)
     await ctx.send("test OK: summary saved")
-
-
+    
 # ============================================================
 # Run
 # ============================================================
