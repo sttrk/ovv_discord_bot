@@ -1,138 +1,90 @@
-# ovv/bis/constraint_filter.py
-# Constraint_Filter v2.0 (BIS Layer-1 Final)
+# ovv/constraint_filter.py
+# Thread Brain Constraint Filter - BIS Edition
 #
 # 目的:
-#   - Core に「曖昧・未定義・情報不足」を流入させない。
-#   - Boundary_Gate→Constraint_Filter→Interface_Box の安全ルートを確保。
+# - Thread Brain に紛れ込んだ「機械向け・LLM制御向けの制約文」をフィルタリングし、
+#   Ovv 推論に不要なノイズを除去する。
+# - 人間向けの制約（ドメインルール・仕様・注意点）はできる限り残す。
 #
-# 出力:
-#   {
-#     "status": "ok" | "clarify" | "reject",
-#     "reason": "...",
-#     "message": "...",       # ユーザーへ返す文
-#     "clean_text": "..."     # Core に送る安全なテキスト
-#   }
-#
-# 曖昧カテゴリ:
-#   A: input_insufficient
-#   B: ambiguous_modifier
-#   C: missing_required_field
-#   D: undefined_action
-#   E: referent_not_found
-#
-# 注意:
-#   - 本フィルタは「答えを生成しない」。
-#   - Core の安全性を最大化する入口フィルタ。
+# 責務:
+# - あくまで「文字列の選別」のみ行う。
+# - 新しい制約を付け足したり、意味内容を書き換えたりしない。
 
-from typing import Dict, List, Optional
+from typing import Optional, Dict, List
 
 
-# ============================================================
-# ユーティリティ
-# ============================================================
-
-AMBIGUOUS_MODIFIERS = [
-    "適当に", "いい感じに", "雑に", "ほどほどに", "まあまあ",
-    "何となく", "なんとなく", "いつもの感じで", "例のやつで"
-]
-
-UNDEFINED_ACTIONS = [
-    "対応して", "処理して", "なんとかして", "頼む", "お願いします"
+_MACHINE_KEYWORDS = [
+    # 明らかに LLM 制御っぽい制約
+    "必ず JSON",
+    "JSON オブジェクトのみ",
+    "JSONオブジェクトのみ",
+    "マークダウン",
+    "Markdown",
+    "markdown",
+    "コードブロック",
+    "```",
+    "返答はJSON",
+    "回答はJSON",
+    "回答は JSON",
+    "出力は JSON",
+    # 実験用・デバッグ用の指示っぽいもの
+    "デバッグ用",
+    "実験用",
 ]
 
 
-def _make(status: str, reason: str, message: str = "", clean: str = "") -> Dict:
-    return {
-        "status": status,
-        "reason": reason,
-        "message": message,
-        "clean_text": clean
-    }
+def _is_machine_constraint(text: str) -> bool:
+    """機械向けの制約かどうかを雑に判定する。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    # 長さが極端に短いものはそのまま残す
+    if len(t) < 5:
+        return False
+
+    # 明らかに制御系のキーワードを含むものは除外対象
+    for kw in _MACHINE_KEYWORDS:
+        if kw in t:
+            return True
+
+    return False
 
 
-# ============================================================
-# メインフィルタ
-# ============================================================
+def _filter_constraints_list(constraints: List[str]) -> List[str]:
+    """constraints 配列から機械向け制約だけを取り除く。"""
+    kept: List[str] = []
+    for c in constraints:
+        if isinstance(c, str):
+            if not _is_machine_constraint(c):
+                kept.append(c)
+        else:
+            # dict など他の型はそのまま残す（勝手に解釈しない）
+            kept.append(c)
+    return kept
 
-def apply_constraint_filter(
-    user_text: str,
-    runtime_memory: List[Dict],
-    thread_brain: Optional[Dict]
-) -> Dict:
+
+def filter_constraints_in_tb(summary: Optional[Dict]) -> Optional[Dict]:
     """
-    Constraint_Filter v2.0（決定版）
+    Thread Brain summary(JSON) 内の constraints をフィルタリングする。
+    - 入力が None の場合は None を返す。
+    - constraints 以外のフィールドは一切変更しない（コピーして返す）。
     """
+    if summary is None:
+        return None
 
-    text = user_text.strip()
+    # 浅いコピーで十分（入れ子の中身は変更しない）
+    result = dict(summary)
 
-    # -----------------------------------------
-    # A. 内容が空 / 成立しない入力
-    # -----------------------------------------
-    if len(text) == 0:
-        return _make(
-            "reject",
-            "input_insufficient",
-            "ごめん、もう少し詳しく教えてほしい。"
-        )
+    # 形式が v1（constraints が直下）/ v0（thread_brain 内など）の両方を許容する
+    if "constraints" in result and isinstance(result["constraints"], list):
+        result["constraints"] = _filter_constraints_list(result["constraints"])
 
-    # 極端に短い曖昧 ("どう？", "これどう", etc.)
-    if text in ["どう？", "どう", "これどう", "どう思う？", "どう思う"]:
-        return _make(
-            "clarify",
-            "input_insufficient",
-            "もう少し具体的に質問内容を教えてほしい。"
-        )
+    # v0 系フォーマットの可能性（thread_brain 内に含まれている）
+    tb = result.get("thread_brain")
+    if isinstance(tb, dict) and isinstance(tb.get("constraints"), list):
+        new_tb = dict(tb)
+        new_tb["constraints"] = _filter_constraints_list(tb["constraints"])
+        result["thread_brain"] = new_tb
 
-    # -----------------------------------------
-    # B. 曖昧修飾語（意味が広すぎて Core が解釈不能）
-    # -----------------------------------------
-    for w in AMBIGUOUS_MODIFIERS:
-        if w in text:
-            return _make(
-                "clarify",
-                "ambiguous_modifier",
-                f"「{w}」は曖昧なので、具体的にどうしたいか教えてほしい。"
-            )
-
-    # -----------------------------------------
-    # C. 必須情報不足（最低限の指定なし）
-    # 例: 「コード書いて」→種類不明
-    # -----------------------------------------
-    if text.startswith("コード書いて") or text == "コード書いて":
-        return _make(
-            "clarify",
-            "missing_required_field",
-            "どの言語で？また、作りたい処理の内容を教えてほしい。"
-        )
-
-    # -----------------------------------------
-    # D. 多義的な動詞（「対応して」「処理して」）
-    # -----------------------------------------
-    for w in UNDEFINED_ACTIONS:
-        if w in text:
-            # 文脈が無いなら曖昧
-            if len(runtime_memory) < 1:
-                return _make(
-                    "clarify",
-                    "undefined_action",
-                    f"「{w}」だけだと意図が絞れない。具体的に何をしたい？"
-                )
-
-    # -----------------------------------------
-    # E. 参照が曖昧 ("それ", "前のやつ", etc.)
-    # -----------------------------------------
-    if text in ["それ", "それで", "前のやつ", "前の"]:
-        # runtime_memory に該当対象がない場合は曖昧
-        if len(runtime_memory) < 2:
-            return _make(
-                "clarify",
-                "referent_not_found",
-                "どのメッセージを指している？もう少し詳しく説明してほしい。"
-            )
-
-    # -----------------------------------------
-    # OK → 安全なテキストを返却
-    # -----------------------------------------
-    clean_text = text  # 現段階ではそのまま。今後の v3 で正規化ルール追加可能。
-
-    return _make("ok", "pass", clean=clean_text)
+    return result
