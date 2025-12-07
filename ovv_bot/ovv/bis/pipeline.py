@@ -28,7 +28,7 @@
 #
 # DEPENDENCY:
 #   - ovv.bis.state_manager.decide_state
-#   - ovv.bis.interface_box.build_input_packet
+#   - ovv.bis.interface_box.build_interface_packet
 #   - ovv.bis.stabilizer.extract_final_answer
 #   - ovv.bis.constraint_filter.filter_constraints_from_thread_brain
 #   - ovv.ovv_call.call_ovv
@@ -45,7 +45,7 @@ from ovv.bis.boundary_gate import InputPacket
 from ovv.bis.state_manager import decide_state
 
 # [IFACE] Interface Box
-from ovv.bis.interface_box import build_input_packet as build_interface_packet
+from ovv.bis.interface_box import build_interface_packet
 
 # [STAB] Stabilizer
 from ovv.bis.stabilizer import extract_final_answer
@@ -61,8 +61,10 @@ import database.pg as db_pg
 
 
 # ============================================================
-# [PIPELINE] Ovv メインストリーム
-#  BoundaryPacket(InputPacket) → Interface → Core → Stabilizer
+# [PIPELINE] run_ovv_pipeline_from_boundary
+#  ROLE:
+#    - IFACE+CORE+STAB+PERSIST の「調整役」
+#    - Gate / Discord / bot には依存しない純粋パイプライン
 # ============================================================
 def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     """
@@ -96,7 +98,7 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     # -----------------------------------------
     # [PERSIST/CORE] ThreadBrain の利用・更新
     # -----------------------------------------
-    tb_summary = None
+    tb_summary: Optional[dict] = None
 
     if is_task:
         # タスク系スレッドでは常に TB を最新化
