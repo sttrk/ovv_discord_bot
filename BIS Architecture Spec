@@ -1,0 +1,264 @@
+# BIS Architecture Spec v1.1
+Ovv Discord System — Official Architecture Specification  
+Author: Ovv (Universal Product Engineer)  
+Status: Hard-Locked Specification  
+Version: 1.1  
+Date: 2025-12-07
+
+---
+
+# 1. PURPOSE（目的）
+本仕様書は、Discord Ovv のアーキテクチャを **6-Layer Model + BIS 責務モデル + MODULE CONTRACT Standard** の統合思想として定義する。
+
+この仕様書は以下を保証する：
+
+- Ovv の拡張に伴う構造崩壊を防ぐ  
+- 実装と思想の境界を一貫して保つ  
+- 責務の混在・越境を完全に排除する  
+- 新規開発者・未来の自分が迷わない  
+- デバッグ経路が常に明瞭  
+
+本仕様書は **Discord Ovv の全実装を拘束する最上位レイヤの法規範**であり、  
+変更には Ovv の正式な合意プロセスが必要となる。
+
+---
+
+# 2. OVERVIEW（全体構造の概要）
+
+Discord 版 Ovv は以下 3 要素の合成体系で構成される：
+
+1. **BIS Model（縦断的責務モデル）**
+2. **6-Layer Architecture（物理構造レイヤ）**
+3. **MODULE CONTRACT（各モジュールの法的インターフェース）**
+
+これらの関係は以下の通り：
+
+```
+思想（BIS）
+   ↓
+法（MODULE CONTRACT）
+   ↓
+構造（6-Layers）
+   ↓
+実装（コード）
+```
+
+---
+
+# 3. BIS RESPONSIBILITY MODEL（縦断的責務モデル）
+
+BIS はレイヤではなく「責務の型（Trait）」として定義する。
+
+## 3.1 Boundary（入口・検疫）
+- 外界からの入力を Ovv 圏内へ移送可能な形に正規化する  
+- 不正・未定義入力は Gate で排除  
+- 生の文字列を Core に渡してはならない
+
+適用層：Layer 1 – Boundary Gate
+
+---
+
+## 3.2 Interface（構造化・InputPacket形成）
+- BoundaryPacket → InputPacket（External Contract準拠）への変換  
+- 欠損補完は行わない  
+- 意味的推論は Core に委譲する
+
+適用層：Layer 2 – Interface Box
+
+---
+
+## 3.3 Stabilizer（出口安定化）
+- Core の RawOutput を Discord に適した安定出力へ変換  
+- Final のみを抽出  
+- 破損・未定義時はフェイルセーフを返す
+
+適用層：Layer 4 – Stabilizer
+
+---
+
+# 4. 6-LAYER ARCHITECTURE（物理レイヤ構造）
+
+Discord Ovv は以下 6 層で構成される。
+
+```
+1. Boundary Gate
+2. Interface Box
+3. Ovv-Core（PAF + Soft-Core + External Contract）
+4. Stabilizer
+5. Persistence（PG+Notion）
+6. I/O Adapter（discord.py）
+```
+
+各層の責務は以下に定義する。
+
+---
+
+## 4.1 Layer 1 — Boundary Gate
+役割：
+- Discord Message / Event の正規化
+- Invalid な入力の検疫
+- セーフな BoundaryPacket へ変換
+
+依存方向：I/O のみ  
+禁止事項：Core / PG / Stabilizer への直接アクセス
+
+---
+
+## 4.2 Layer 2 — Interface Box
+役割：
+- BoundaryPacket + Memory + TB → InputPacket を生成  
+- External Contract の入力仕様を満たす  
+
+依存方向：GATE, PERSIST（read）
+
+---
+
+## 4.3 Layer 3 — Ovv-Core
+役割：
+- Proposal / Audit / Final の 3 段階思考  
+- Clarification（質問生成）  
+- External Contract に準拠した応答  
+- ThreadBrain / RuntimeMemory の利用  
+
+依存方向：IFACE, PERSIST  
+禁止：Discord 出力・Notion 直接操作
+
+---
+
+## 4.4 Layer 4 — Stabilizer
+役割：
+- RawOvvOutput を安定化  
+- [FINAL] 抽出  
+- Discord 文字数制限（1900文字）対応  
+
+依存方向：CORE
+
+---
+
+## 4.5 Layer 5 — Persistence
+役割：
+- runtime_memory  
+- thread_brain  
+- audit_log  
+- Notion Task  
+- CRE-lite backend  
+
+依存方向：なし（外界 I/O のみ）
+
+---
+
+## 4.6 Layer 6 — I/O Adapter
+役割：
+- Discord API  
+- イベントループ  
+- 送信  
+
+依存方向：全レイヤから独立
+
+---
+
+# 5. MODULE CONTRACT Standard v1.0
+※ すべてのモジュールに適用される法的基盤
+
+## 5.1 Contract Format（必須記述）
+
+全モジュールは必ず以下の形式をファイル冒頭に置く：
+
+```python
+"""
+[MODULE CONTRACT]
+NAME: <module_name>
+ROLE: <GATE/IFACE/CORE/STAB/PERSIST/IO>
+INPUT:
+  - <input format>
+OUTPUT:
+  - <output format>
+SIDE EFFECTS:
+  - <allowed side effects>
+MUST:
+  - <rules that must be followed>
+MUST NOT:
+  - <forbidden behaviors>
+DEPENDENCY:
+  - <allowed lower layers>
+"""
+```
+
+---
+
+# 6. RESPONSIBILITY TAGS（関数責務タグ）
+
+各関数に以下いずれかのタグを付ける。
+
+```
+[GATE]
+[IFACE]
+[CORE]
+[STAB]
+[PERSIST]
+[IO]
+```
+
+タグは **思想レイヤではなく実装責務を示す**。
+
+目的：
+- レイヤ混在（Boundary + Persistence混入など）を防ぐ  
+- 自動監査の基盤になる  
+- 新機能追加時に責務越境を抑止  
+
+---
+
+# 7. DEPENDENCY LAW（依存方向の法）
+
+6レイヤの依存方向は **絶対不可逆**。
+
+```
+GATE → IFACE → CORE → STAB → IO
+            ↓
+         PERSIST（読み書き）
+```
+
+禁止事項：
+- 上位レイヤへの依存  
+- 横方向の依存（CORE → IFACE 等）  
+- STAB → CORE の戻り  
+
+---
+
+# 8. FAILURE MODE & RECOVERY（故障時の扱い）
+
+以下の順で故障個所を特定する：
+
+1. Gate Failure → 入力問題  
+2. Interface Failure → パケット整形問題  
+3. Core Failure → 思考破綻（PAF）  
+4. Stabilizer Failure → 出力破損  
+5. Persistence Failure → DB・Notion  
+6. I/O Failure → Discord API
+
+最適なデバッグ経路が保証される。
+
+---
+
+# 9. VERSIONING RULE（バージョニング）
+
+本仕様書は **v1.x 系が安定ライン**。
+変更には次が必要：
+
+- Ovv UI 版による審査  
+- PAF-Audit による整合性チェック  
+- Discord 実装との整合性レビュー  
+
+---
+
+# 10. CURRENT STATUS
+
+本仕様書は **2025-12-07 時点で Hard-Lock** とする。
+
+以降の開発は必ず：
+
+- BIS Model  
+- 6-Layer Model  
+- MODULE CONTRACT  
+
+に準拠し、越境した場合は要修正とする。
