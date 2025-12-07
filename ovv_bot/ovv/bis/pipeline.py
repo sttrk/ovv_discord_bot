@@ -1,5 +1,5 @@
 # ovv/bis/pipeline.py
-# Ovv Flow Pipeline v1.0 – Boundary → Interface → Core → Stabilizer
+# Ovv Flow Pipeline v1.1 – Boundary → Interface → Core → Stabilizer
 #
 # [MODULE CONTRACT]
 # NAME: pipeline
@@ -21,7 +21,7 @@
 #   - Interface_Box / Ovv-Core / Stabilizer の責務を越境しない
 #   - runtime_memory / thread_brain の I/O 詳細は database.pg に委譲する
 #
-# MUST NOT:
+# MUST_NOT:
 #   - Discord API を直接呼ばない
 #   - bot インスタンスに依存しない
 #   - Debug 用の挙動を紛れ込ませない
@@ -37,14 +37,16 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Dict, Any
+from dataclasses import asdict, is_dataclass
 
+# [GATE INPUT]
 from ovv.bis.boundary_gate import InputPacket
 
 # [IFACE] state hint
 from ovv.bis.state_manager import decide_state
 
-# [IFACE] Interface Box
+# [IFACE] Interface Box (NEW SPEC)
 from ovv.bis.interface_box import build_interface_packet
 
 # [STAB] Stabilizer
@@ -61,10 +63,17 @@ import database.pg as db_pg
 
 
 # ============================================================
+# Utility — Convert BoundaryPacket dataclass → dict
+# ============================================================
+def _packet_to_dict(packet: InputPacket) -> Dict[str, Any]:
+    if is_dataclass(packet):
+        return asdict(packet)
+    # fallback
+    return packet.__dict__
+
+
+# ============================================================
 # [PIPELINE] run_ovv_pipeline_from_boundary
-#  ROLE:
-#    - IFACE+CORE+STAB+PERSIST の「調整役」
-#    - Gate / Discord / bot には依存しない純粋パイプライン
 # ============================================================
 def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     """
@@ -75,14 +84,17 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     Gate / Discord / bot インスタンスには一切依存しない。
     """
 
+    # Convert dataclass → dict (InterfaceBox 仕様準拠)
+    boundary_packet: Dict[str, Any] = _packet_to_dict(packet)
+
+    session_id = boundary_packet["session_id"]
+    context_key = boundary_packet["context_key"]
+    user_text = boundary_packet["text"]
+    is_task = boundary_packet["is_task_channel"]
+
     # -----------------------------------------
     # [PERSIST] runtime_memory append
     # -----------------------------------------
-    session_id = packet.session_id
-    context_key = packet.context_key
-    user_text = packet.text
-    is_task = packet.is_task_channel
-
     db_pg.append_runtime_memory(
         session_id,
         "user",
@@ -101,13 +113,11 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     tb_summary: Optional[dict] = None
 
     if is_task:
-        # タスク系スレッドでは常に TB を最新化
         tb_summary = db_pg.generate_thread_brain(context_key, mem)
         if tb_summary:
             tb_summary = filter_constraints_from_thread_brain(tb_summary)
             db_pg.save_thread_brain(context_key, tb_summary)
     else:
-        # 通常スレッドでは既存 TB を読むだけ
         tb_summary = db_pg.load_thread_brain(context_key)
         if tb_summary:
             tb_summary = filter_constraints_from_thread_brain(tb_summary)
@@ -123,10 +133,10 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     )
 
     # -----------------------------------------
-    # [IFACE] Interface_Box で Core 入力パケットを組み立て
+    # [IFACE] InterfaceBox（新仕様）へ統合データを渡す
     # -----------------------------------------
-    input_packet = build_interface_packet(
-        user_text=user_text,
+    iface_packet = build_interface_packet(
+        boundary_packet=boundary_packet,
         runtime_memory=mem,
         thread_brain=tb_summary,
         state_hint=state_hint,
@@ -135,10 +145,10 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     # -----------------------------------------
     # [CORE] Ovv-Core 呼び出し
     # -----------------------------------------
-    raw_ans = call_ovv(context_key, input_packet)
+    raw_ans = call_ovv(context_key, iface_packet)
 
     # -----------------------------------------
-    # [STAB] Stabilizer で Discord 向けの最終テキストを抽出
+    # [STAB] Stabilizer で Discord 向け最終出力へ変換
     # -----------------------------------------
     final_ans = extract_final_answer(raw_ans)
 
