@@ -1,6 +1,6 @@
 # [MODULE CONTRACT]
 # NAME: threadbrain_adapter
-# ROLE: ThreadBrainAdapter_v3
+# ROLE: ThreadBrainAdapter_v3.1
 #
 # INPUT:
 #   summary: dict | None
@@ -10,10 +10,11 @@
 #   tb_prompt: str
 #
 # MUST:
-#   - upgrade(TB_v1_v2_to_v3)
+#   - upgrade(TB_v1_v2_to_v3_1)
 #   - keep(constraints_soft_only)
 #   - drop(format_hard_constraints)
 #   - preserve_core_fields
+#   - apply(granularity_control)
 #   - be_deterministic
 #
 # MUST_NOT:
@@ -23,6 +24,7 @@
 #   - control_output_format
 
 from typing import Optional, Dict, Any, List
+from datetime import datetime, timezone
 
 
 # ============================================================
@@ -140,6 +142,162 @@ def _split_constraints_v1(constraints: List[Any]) -> Dict[str, List[str]]:
 
 
 # ============================================================
+# 内部ヘルパ: 粒度制御（granularity control）
+# ============================================================
+
+def _is_low_value_message(text: str) -> bool:
+    """
+    低価値なメッセージ（TB に長期保存する必要が薄いもの）を判定する。
+    - 短い数字だけの発話（「1」「10」など）
+    - ごく短い相槌・挨拶
+    """
+    if not text:
+        return True
+
+    s = str(text).strip()
+    if not s:
+        return True
+
+    # 純粋な数字のみ（短いもの）はノイズ扱い
+    if s.isdigit() and len(s) <= 3:
+        return True
+
+    # 典型的な相槌・挨拶（最小セット）
+    low_words = {"ok", "OK", "Ok", "了解", "うん", "はい", "おけ", "おｋ", "ありがとう", "サンキュー"}
+    if s in low_words:
+        return True
+
+    # 2〜3文字のひらがなだけ（「あー」「ん？」など）は基本ノイズ
+    if len(s) <= 3 and all("ぁ" <= ch <= "ん" for ch in s):
+        return True
+
+    return False
+
+
+def _dedup_preserve_order(items: List[str], max_items: int) -> List[str]:
+    """
+    重複排除しつつ順序を維持し、最大件数を制限する。
+    """
+    seen = set()
+    result: List[str] = []
+    for x in items:
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        result.append(x)
+        if len(result) >= max_items:
+            break
+    return result
+
+
+def _compress_history_digest(text: str, max_len: int = 800) -> str:
+    """
+    history_digest が長すぎる場合に、前後を残して中間を省略する。
+    """
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+
+    head_len = max_len // 2
+    tail_len = max_len - head_len - 10  # " ... " 等の余白
+    head = text[:head_len]
+    tail = text[-tail_len:] if tail_len > 0 else ""
+    return head + "\n...[snip]...\n" + tail
+
+
+def _compress_recent_messages(recent: List[str], max_items: int = 5) -> List[str]:
+    """
+    recent_messages から低価値ノイズを除去しつつ、最大件数を制限する。
+    """
+    if not isinstance(recent, list):
+        return []
+
+    filtered: List[str] = []
+    for raw in recent:
+        if not isinstance(raw, str):
+            continue
+        s = raw.strip()
+        if not s:
+            continue
+        if _is_low_value_message(s):
+            continue
+        filtered.append(s)
+
+    if not filtered:
+        return []
+
+    # 直近を優先（末尾が新しいと仮定）
+    filtered = filtered[-max_items:]
+    return filtered
+
+
+def _apply_granularity(tb_v3: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    TB v3 に対して粒度制御を適用し、v3.1 として安定化させる。
+    - decisions / unresolved / next_actions / constraints_soft の重複除去・上限数
+    - recent_messages のノイズ除去・上限数
+    - history_digest の長さ制限
+    - meta.version / updated_at の整備
+    """
+    if not isinstance(tb_v3, dict):
+        return tb_v3
+
+    out = dict(tb_v3)
+
+    # --- meta ---
+    meta = dict(out.get("meta") or {})
+    meta["version"] = "3.1"
+    # updated_at が無ければ、または v3.1 で上書きしたい場合は現在時刻を入れる
+    try:
+        meta["updated_at"] = datetime.now(timezone.utc).isoformat()
+    except Exception:
+        # 時刻取得失敗時はそのまま
+        pass
+    out["meta"] = meta
+
+    # --- list 系フィールドの重複除去・制限 ---
+    def norm_list(key: str, max_items: int = 10) -> None:
+        vals = out.get(key)
+        if not isinstance(vals, list):
+            out[key] = []
+            return
+        # 文字列以外も来る可能性があるので文字列化して扱う
+        str_items = [str(v).strip() for v in vals if str(v).strip()]
+        out[key] = _dedup_preserve_order(str_items, max_items)
+
+    norm_list("decisions", max_items=12)
+    norm_list("unresolved", max_items=12)
+    norm_list("next_actions", max_items=12)
+    norm_list("constraints_soft", max_items=12)
+
+    # --- history_digest ---
+    history_digest = out.get("history_digest") or ""
+    out["history_digest"] = _compress_history_digest(str(history_digest), max_len=800)
+
+    # --- recent_messages ---
+    recent = out.get("recent_messages")
+    if isinstance(recent, list):
+        # recent が dict などの場合もあるかもしれないので、文字列に寄せる
+        str_msgs: List[str] = []
+        for m in recent:
+            if isinstance(m, str):
+                str_msgs.append(m)
+            else:
+                # "role: content" 形式などに落とすこともできるが、ここでは安全側で str()
+                s = str(m).strip()
+                if s:
+                    str_msgs.append(s)
+        out["recent_messages"] = _compress_recent_messages(str_msgs, max_items=5)
+    else:
+        out["recent_messages"] = []
+
+    return out
+
+
+# ============================================================
 # TB v3 正規化
 # ============================================================
 
@@ -152,7 +310,7 @@ def _upgrade_to_v3(summary: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(summary, dict):
         return {
             "meta": {
-                "version": "3.0",
+                "version": "3.1",
             },
             "status": {},
             "decisions": [],
@@ -190,7 +348,7 @@ def _upgrade_to_v3(summary: Dict[str, Any]) -> Dict[str, Any]:
 
     v3: Dict[str, Any] = {
         "meta": {
-            "version": "3.0",
+            "version": "3.1",
             "updated_at": src_meta.get("updated_at"),
             "context_key": src_meta.get("context_key"),
             "total_tokens_estimate": src_meta.get("total_tokens_estimate"),
@@ -213,28 +371,29 @@ def normalize_thread_brain(summary: Optional[Dict[str, Any]]) -> Optional[Dict[s
     """
     Public API:
       - v1/v2/v3 いずれの TB でも受け取り、
-        v3 形式（constraints_soft のみ）に正規化して返す。
+        v3.1 形式（constraints_soft のみ＋粒度制御済み）に正規化して返す。
       - None の場合は None を返す。
     """
     if summary is None:
         return None
 
     if not isinstance(summary, dict):
-        return _upgrade_to_v3({})
+        tb_v3 = _upgrade_to_v3({})
+        return _apply_granularity(tb_v3)
 
     meta = summary.get("meta") or {}
     version = str(meta.get("version", "")).strip()
 
     if version.startswith("3"):
-        # すでに v3 想定。最低限のフィールドがあるかだけ確認して返す。
-        if "constraints_soft" not in summary or not isinstance(summary["constraints_soft"], list):
-            summary = dict(summary)
-            summary["constraints_soft"] = []
-        # 旧 constraints が残っていたら無視（壊さない）
-        return summary
+        # すでに v3 系想定。最低限のフィールドを満たさせたうえで粒度制御。
+        tb_v3 = dict(summary)
+        if "constraints_soft" not in tb_v3 or not isinstance(tb_v3["constraints_soft"], list):
+            tb_v3["constraints_soft"] = []
+        return _apply_granularity(tb_v3)
 
-    # v1/v2 → v3 へアップグレード
-    return _upgrade_to_v3(summary)
+    # v1/v2 → v3.1 へアップグレード
+    tb_v3 = _upgrade_to_v3(summary)
+    return _apply_granularity(tb_v3)
 
 
 # ============================================================
@@ -243,9 +402,9 @@ def normalize_thread_brain(summary: Optional[Dict[str, Any]]) -> Optional[Dict[s
 
 def build_tb_prompt(thread_brain: Optional[Dict[str, Any]]) -> str:
     """
-    TB v3 を前提に、LLM へ渡す [TB] プロンプトを構築する。
+    TB v3.1 を前提に、LLM へ渡す [TB] プロンプトを構築する。
     - None の場合は最小限のプレースホルダを返す。
-    - v1/v2 の場合も normalize_thread_brain で v3 に揃える。
+    - v1/v2 の場合も normalize_thread_brain で v3.1 に揃える。
     """
 
     tb_v3 = normalize_thread_brain(thread_brain)
@@ -265,7 +424,7 @@ def build_tb_prompt(thread_brain: Optional[Dict[str, Any]]) -> str:
 
     lines: List[str] = []
     lines.append("[TB]")
-    lines.append(f"version: {meta.get('version', '3.0')}")
+    lines.append(f"version: {meta.get('version', '3.1')}")
     if meta.get("context_key") is not None:
         lines.append(f"context_key: {meta.get('context_key')}")
 
@@ -318,7 +477,7 @@ def build_tb_prompt(thread_brain: Optional[Dict[str, Any]]) -> str:
         lines.append("\n[CURRENT_POSITION]")
         lines.append(current_position)
 
-    # Recent Messages（必要なら短く）
+    # Recent Messages（粒度制御済みのものだけ）
     if recent_messages:
         lines.append("\n[RECENT_MESSAGES]")
         for msg in recent_messages[-5:]:
