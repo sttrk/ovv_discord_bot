@@ -33,7 +33,6 @@ Discord 版 Ovv は以下 3 要素の合成体系で構成される：
 
 これらの関係は以下の通り：
 
-```
 思想（BIS）
    ↓
 法（MODULE CONTRACT）
@@ -41,7 +40,6 @@ Discord 版 Ovv は以下 3 要素の合成体系で構成される：
 構造（6-Layers）
    ↓
 実装（コード）
-```
 
 ---
 
@@ -80,16 +78,12 @@ BIS はレイヤではなく「責務の型（Trait）」として定義する�
 
 Discord Ovv は以下 6 層で構成される。
 
-```
 1. Boundary Gate
 2. Interface Box
 3. Ovv-Core（PAF + Soft-Core + External Contract）
 4. Stabilizer
 5. Persistence（PG+Notion）
 6. I/O Adapter（discord.py）
-```
-
-各層の責務は以下に定義する。
 
 ---
 
@@ -158,14 +152,9 @@ Discord Ovv は以下 6 層で構成される。
 ---
 
 # 5. MODULE CONTRACT Standard v1.0
-※ すべてのモジュールに適用される法的基盤
-
-## 5.1 Contract Format（必須記述）
 
 全モジュールは必ず以下の形式をファイル冒頭に置く：
 
-```python
-"""
 [MODULE CONTRACT]
 NAME: <module_name>
 ROLE: <GATE/IFACE/CORE/STAB/PERSIST/IO>
@@ -181,84 +170,59 @@ MUST NOT:
   - <forbidden behaviors>
 DEPENDENCY:
   - <allowed lower layers>
-"""
-```
 
 ---
 
 # 6. RESPONSIBILITY TAGS（関数責務タグ）
 
-各関数に以下いずれかのタグを付ける。
+各関数に以下いずれかのタグを付ける：
 
-```
 [GATE]
 [IFACE]
 [CORE]
 [STAB]
 [PERSIST]
 [IO]
-```
-
-タグは **思想レイヤではなく実装責務を示す**。
 
 目的：
-- レイヤ混在（Boundary + Persistence混入など）を防ぐ  
-- 自動監査の基盤になる  
-- 新機能追加時に責務越境を抑止  
+- レイヤ混在を防ぐ  
+- 自動監査の基盤  
+- 新機能追加時の越境防止  
 
 ---
 
 # 7. DEPENDENCY LAW（依存方向の法）
 
-6レイヤの依存方向は **絶対不可逆**。
+依存方向（不可逆）：
 
-```
 GATE → IFACE → CORE → STAB → IO
             ↓
          PERSIST（読み書き）
-```
-
-禁止事項：
-- 上位レイヤへの依存  
-- 横方向の依存（CORE → IFACE 等）  
-- STAB → CORE の戻り  
 
 ---
 
-# 8. FAILURE MODE & RECOVERY（故障時の扱い）
+# 8. FAILURE MODE & RECOVERY
 
-以下の順で故障個所を特定する：
-
-1. Gate Failure → 入力問題  
-2. Interface Failure → パケット整形問題  
-3. Core Failure → 思考破綻（PAF）  
+1. Gate Failure → 入力  
+2. Interface Failure → パケット整形  
+3. Core Failure → 思考破綻  
 4. Stabilizer Failure → 出力破損  
-5. Persistence Failure → DB・Notion  
+5. Persistence Failure → DB/Notion  
 6. I/O Failure → Discord API
 
-最適なデバッグ経路が保証される。
-
 ---
 
-# 9. VERSIONING RULE（バージョニング）
+# 9. VERSIONING RULE
 
-本仕様書は **v1.x 系が安定ライン**。
-変更には次が必要：
+v1.x 系が安定ライン。  
+変更には：
 
 - Ovv UI 版による審査  
-- PAF-Audit による整合性チェック  
-- Discord 実装との整合性レビュー  
+- PAF-Audit 整合性チェック  
+- Discord 実装との整合レビュー  
 
 ---
 
 # 10. CURRENT STATUS
 
-本仕様書は **2025-12-07 時点で Hard-Lock** とする。
-
-以降の開発は必ず：
-
-- BIS Model  
-- 6-Layer Model  
-- MODULE CONTRACT  
-
-に準拠し、越境した場合は要修正とする。
+本仕様書は **2025-12-07 Hard-Lock** とする。
