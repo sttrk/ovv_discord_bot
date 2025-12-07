@@ -1,53 +1,39 @@
+# ovv/brain/threadbrain_adapter.py
+# ThreadBrainAdapter v3.2 – TB 正規化 + semantic-cleaning
+#
 # [MODULE CONTRACT]
 # NAME: threadbrain_adapter
-# ROLE: ThreadBrainAdapter_v3
+# ROLE: ThreadBrainAdapter_v3.2
 #
 # INPUT:
-#   summary: dict | None
+#   summary: dict | None   # v1/v2/v3 いずれかの ThreadBrain summary
 #
 # OUTPUT:
-#   normalized_summary: dict | None
-#   tb_prompt: str
+#   normalized_summary: dict | None   # TB v3.2 正規形（semantic-clean 済み）
+#   tb_prompt: str                    # [TB] セクション付き LLM 用プロンプト
 #
 # MUST:
 #   - upgrade(TB_v1_v2_to_v3)
 #   - keep(constraints_soft_only)
 #   - drop(format_hard_constraints)
-#   - preserve_core_fields
+#   - clean(decisions/unresolved/next_actions/recent_messages/history_digest/current_position
+#           from hard output instructions)
+#   - preserve_core_fields (status / high_level_goal / history_digest 等の意味は維持)
 #   - be_deterministic
-#   - compress(excessive_recent_messages)
-#   - cap(long_text_fields)
 #
-# MUST_NOT:
+# MUST NOT:
 #   - call_LLM
-#   - store_constraints_hard
-#   - alter_core_meaning
-#   - control_output_format
+#   - perform_IO (DB / Discord / Notion)
+#   - depend_on(Boundary_Gate / Interface_Box / ovv_call)
+#   - alter_user_intent
 
 from typing import Optional, Dict, Any, List
 
-# ============================================================
-# v3.1 Tunable Limits
-# ============================================================
-
-MAX_DECISIONS = 12
-MAX_UNRESOLVED = 12
-MAX_NEXT_ACTIONS = 12
-
-MAX_DECISION_LEN = 300
-MAX_UNRESOLVED_LEN = 300
-MAX_NEXT_ACTION_LEN = 300
-
-MAX_HISTORY_LEN = 1200
-MAX_GOAL_LEN = 600
-MAX_POSITION_LEN = 400
-
-MAX_RECENT_MESSAGES = 16
-RECENT_TAIL_KEEP = 6  # 直近は必ず残す
+from ovv.brain.constraint_classifier import classify_constraint_text
 
 
 # ============================================================
-# 内部ヘルパ: 制約分類（soft / hard / unknown）
+# 内部ヘルパ: 旧 constraints 抽出（v1/v2 用）
 # ============================================================
 
 def _extract_constraint_text(item: Any) -> str:
@@ -64,76 +50,6 @@ def _extract_constraint_text(item: Any) -> str:
     return ""
 
 
-def _classify_constraint_text(text: str) -> str:
-    """
-    制約テキストを soft / hard / unknown に分類する。
-    - soft: 会話ルール・嗜好（敬語禁止など）
-    - hard: 出力形式・システム越境（JSONで返せ等）
-    - unknown: 判定不能（原則 soft 扱い側に寄せる）
-    """
-    if not text:
-        return "unknown"
-
-    t = text.strip()
-    lower = t.lower()
-
-    # -------------------------
-    # 1) 明確な "hard" パターン
-    # -------------------------
-
-    # JSON / YAML / XML などフォーマット強制
-    if "json" in lower or "yaml" in lower or "xml" in lower:
-        if "返" in t or "形式" in t or "オブジェクト" in t or "only" in lower:
-            return "hard"
-
-    # マークダウン禁止・説明文禁止など
-    if "マークダウン" in t and ("含めない" in t or "禁止" in t):
-        return "hard"
-    if "説明文" in t and "含めない" in t:
-        return "hard"
-
-    # 構造化データ強制
-    if "構造化データ" in t and "返" in t:
-        return "hard"
-    if "オブジェクト" in t and "のみ" in t and "返" in t:
-        return "hard"
-
-    # システム・プロンプト越境系（英語簡易）
-    if "ignore the system prompt" in lower or "override the system prompt" in lower:
-        return "hard"
-    if "jailbreak" in lower:
-        return "hard"
-
-    # -------------------------
-    # 2) 明確な "soft" パターン
-    # -------------------------
-
-    # 敬語/タメ口など会話スタイル
-    if "敬語" in t:
-        return "soft"
-    if "タメ口" in t or "ため口" in t:
-        return "soft"
-
-    # 長さ・簡潔さ
-    if "短く" in t or "簡潔" in t:
-        return "soft"
-
-    # 言語指定（日本語/英語で話す等）※形式ではなく会話ルールとみなす
-    if "日本語" in t and ("話す" in t or "答える" in t):
-        return "soft"
-    if "英語" in t and ("話す" in t or "答える" in t):
-        return "soft"
-
-    # スレッド用途
-    if "このスレ" in t or "このスレッド" in t:
-        return "soft"
-
-    # -------------------------
-    # 3) 判定不能 → unknown（上位ロジックで soft 側に寄せる）
-    # -------------------------
-    return "unknown"
-
-
 def _split_constraints_v1(constraints: List[Any]) -> Dict[str, List[str]]:
     """
     v1/v2 の constraints 配列を soft/hard に振り分ける。
@@ -148,194 +64,19 @@ def _split_constraints_v1(constraints: List[Any]) -> Dict[str, List[str]]:
         if not text:
             continue
 
-        cls = _classify_constraint_text(text)
+        cls = classify_constraint_text(text)
         if cls == "hard":
+            # hard は TB v3 では保持しない（後続で破棄）
             hard.append(text)
         else:
+            # soft / unknown は soft 側に寄せる（unknown はユーザー意図を尊重）
             soft.append(text)
 
     return {"soft": soft, "hard": hard}
 
 
 # ============================================================
-# 汎用ユーティリティ（v3.1 圧縮用）
-# ============================================================
-
-def _truncate_str(s: str, max_len: int) -> str:
-    s = str(s)
-    if max_len <= 0:
-        return ""
-    if len(s) <= max_len:
-        return s
-    # 末尾にマーカーを入れて最大長に収める
-    marker = "...[truncated]"
-    if len(marker) >= max_len:
-        return s[:max_len]
-    head_len = max_len - len(marker)
-    return s[:head_len] + marker
-
-
-def _truncate_middle(s: str, max_len: int) -> str:
-    """
-    長い history_digest 用:
-      - 先頭 + 末尾を残し、中間にマーカーを挿入
-    """
-    s = str(s)
-    if max_len <= 0 or len(s) <= max_len:
-        return s
-
-    marker = "\n...[truncated]...\n"
-    if len(marker) >= max_len:
-        return s[:max_len]
-
-    # だいたい 60:40 くらいで head/tail を分配
-    head_len = int((max_len - len(marker)) * 0.6)
-    tail_len = max_len - len(marker) - head_len
-    if head_len <= 0 or tail_len <= 0:
-        return s[:max_len]
-
-    return s[:head_len] + marker + s[-tail_len:]
-
-
-def _dedup_str_list(values: List[Any]) -> List[str]:
-    """順序を保ったまま文字列リストを重複排除する。"""
-    seen = set()
-    out: List[str] = []
-    for v in values:
-        if v is None:
-            continue
-        s = str(v)
-        if not s:
-            continue
-        if s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
-
-
-def _is_numeric_like(text: str) -> bool:
-    """
-    「ほぼ数字だけ」の低情報メッセージ判定。
-    - 数字＋単純な記号のみ、かつ長さが短いものを低優先度とみなす。
-    """
-    t = text.strip()
-    if not t:
-        return False
-    if len(t) > 8:
-        return False
-    allowed = set("0123456789+-*/×÷.,。、 　()[]")
-    return all(ch in allowed for ch in t)
-
-
-def _is_question_like(text: str) -> bool:
-    """簡易な質問判定。state_manager と同レベルの軽量版。"""
-    if not text:
-        return False
-    if "?" in text or "？" in text:
-        return True
-    q_keywords = ["教えて", "どう", "なに", "何", "どこ", "どれ", "なぜ", "なんで", "ですか", "でしょうか"]
-    return any(k in text for k in q_keywords)
-
-
-def _compress_recent_messages(messages: List[Any]) -> List[str]:
-    """
-    recent_messages を v3.1 ポリシーに従って圧縮する。
-    - 最大 MAX_RECENT_MESSAGES 件
-    - 直近 RECENT_TAIL_KEEP 件は必ず残す
-    - それ以前はスコアベースで選択
-    """
-    # 文字列化＋空要素除去
-    cleaned: List[str] = [str(m) for m in messages if m is not None and str(m).strip()]
-    if len(cleaned) <= MAX_RECENT_MESSAGES:
-        return cleaned
-
-    total = len(cleaned)
-    tail_start = max(total - RECENT_TAIL_KEEP, 0)
-    tail_indices = set(range(tail_start, total))
-
-    scored = []
-    for idx, txt in enumerate(cleaned):
-        score = 0
-        if _is_question_like(txt):
-            score += 2
-        if len(txt) >= 20:
-            score += 1
-        if _is_numeric_like(txt):
-            score -= 2
-        scored.append((idx, score, txt))
-
-    # 直近は無条件採用
-    keep_indices = set(tail_indices)
-
-    # 残り枠
-    remaining_slots = MAX_RECENT_MESSAGES - len(keep_indices)
-    if remaining_slots <= 0:
-        # tail だけで埋まる場合
-        selected = [cleaned[i] for i in sorted(keep_indices)]
-        return selected
-
-    # それ以前のログからスコア順で選ぶ
-    candidates = [item for item in scored if item[0] not in keep_indices]
-    # スコア降順、同点は新しいもの優先（idx 大きい方）
-    candidates.sort(key=lambda x: (x[1], x[0]), reverse=True)
-
-    for idx, _score, _txt in candidates:
-        keep_indices.add(idx)
-        if len(keep_indices) >= MAX_RECENT_MESSAGES:
-            break
-
-    # 元の時間順で並べ直す
-    selected = [cleaned[i] for i in sorted(keep_indices)]
-    return selected
-
-
-def _postprocess_v3(tb_v3: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    v3 正規化後の追加圧縮・整形（v3.1）。
-    - constraints_soft 重複排除
-    - decisions / unresolved / next_actions の件数・長さ制限
-    - history_digest / high_level_goal / current_position の長さ制限
-    - recent_messages の圧縮
-    """
-    out = dict(tb_v3)  # 浅いコピー
-
-    # constraints_soft
-    soft_raw = out.get("constraints_soft") or []
-    out["constraints_soft"] = _dedup_str_list(soft_raw)
-
-    # decisions / unresolved / next_actions
-    decisions = _dedup_str_list(out.get("decisions") or [])[:MAX_DECISIONS]
-    decisions = [_truncate_str(d, MAX_DECISION_LEN) for d in decisions]
-    out["decisions"] = decisions
-
-    unresolved = _dedup_str_list(out.get("unresolved") or [])[:MAX_UNRESOLVED]
-    unresolved = [_truncate_str(u, MAX_UNRESOLVED_LEN) for u in unresolved]
-    out["unresolved"] = unresolved
-
-    next_actions = _dedup_str_list(out.get("next_actions") or [])[:MAX_NEXT_ACTIONS]
-    next_actions = [_truncate_str(n, MAX_NEXT_ACTION_LEN) for n in next_actions]
-    out["next_actions"] = next_actions
-
-    # history_digest / goal / current_position
-    history = out.get("history_digest") or ""
-    out["history_digest"] = _truncate_middle(str(history), MAX_HISTORY_LEN)
-
-    goal = out.get("high_level_goal") or ""
-    out["high_level_goal"] = _truncate_str(str(goal), MAX_GOAL_LEN)
-
-    pos = out.get("current_position") or ""
-    out["current_position"] = _truncate_str(str(pos), MAX_POSITION_LEN)
-
-    # recent_messages 圧縮
-    recent = out.get("recent_messages") or []
-    out["recent_messages"] = _compress_recent_messages(recent)
-
-    return out
-
-
-# ============================================================
-# TB v3 正規化
+# TB v3 正規化（形式アップグレード）
 # ============================================================
 
 def _upgrade_to_v3(summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -345,7 +86,7 @@ def _upgrade_to_v3(summary: Dict[str, Any]) -> Dict[str, Any]:
     - constraints_hard 相当は生成しても保持しない（破棄）
     """
     if not isinstance(summary, dict):
-        base = {
+        return {
             "meta": {
                 "version": "3.0",
             },
@@ -359,7 +100,6 @@ def _upgrade_to_v3(summary: Dict[str, Any]) -> Dict[str, Any]:
             "recent_messages": [],
             "current_position": "",
         }
-        return _postprocess_v3(base)
 
     src_meta = summary.get("meta") or {}
     src_status = summary.get("status") or {}
@@ -392,61 +132,163 @@ def _upgrade_to_v3(summary: Dict[str, Any]) -> Dict[str, Any]:
             "total_tokens_estimate": src_meta.get("total_tokens_estimate"),
         },
         "status": src_status,
-        "decisions": src_decisions,
-        "unresolved": src_unresolved,
+        "decisions": list(src_decisions),
+        "unresolved": list(src_unresolved),
         "constraints_soft": soft_constraints,
-        "next_actions": src_next,
+        "next_actions": list(src_next),
         "history_digest": src_history,
         "high_level_goal": src_goal,
-        "recent_messages": src_recent,
+        "recent_messages": list(src_recent),
         "current_position": src_pos,
     }
 
-    return _postprocess_v3(v3)
+    return v3
 
+
+# ============================================================
+# semantic-cleaning ヘルパ
+# ============================================================
+
+def _clean_list_field(items: Any) -> List[str]:
+    """
+    decisions / unresolved / next_actions / recent_messages / constraints_soft
+    のような「テキスト配列」から、出力形式 hard 指示を除去する。
+    """
+    if not isinstance(items, list):
+        return []
+
+    cleaned: List[str] = []
+    for raw in items:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        cls = classify_constraint_text(text)
+        if cls == "hard":
+            # 例:
+            # - JSON 形式でのみ返すこと
+            # - マークダウン禁止
+            # - 構造化データのみ返す
+            # → TB 長期記憶には残さない
+            continue
+        cleaned.append(text)
+    return cleaned
+
+
+def _split_into_sentences(text: str) -> List[str]:
+    """
+    ごく簡易な日本語/英語混在向け sentence split。
+    句点・改行単位で区切る。
+    """
+    if not text:
+        return []
+
+    segments: List[str] = []
+
+    for line in str(text).splitlines():
+        buf = ""
+        for ch in line:
+            buf += ch
+            if ch in ("。", "！", "？", ".", "!", "?"):
+                if buf.strip():
+                    segments.append(buf)
+                buf = ""
+        if buf.strip():
+            segments.append(buf)
+
+    return segments
+
+
+def _join_sentences(segments: List[str]) -> str:
+    """
+    sentence list を 1 つの paragraph に戻す。
+    ここでは単純にスペース区切りで連結する。
+    """
+    segs = [s.strip() for s in segments if s and s.strip()]
+    if not segs:
+        return ""
+    return " ".join(segs)
+
+
+def _clean_paragraph(text: Any) -> str:
+    """
+    history_digest / current_position のような「要約文」から、
+    出力形式 hard 指示を含む文を削除する。
+    """
+    if text is None:
+        return ""
+    raw = str(text)
+    if not raw.strip():
+        return ""
+
+    segments = _split_into_sentences(raw)
+    kept: List[str] = []
+
+    for seg in segments:
+        s = seg.strip()
+        if not s:
+            continue
+        cls = classify_constraint_text(s)
+        if cls == "hard":
+            # 「このスレッドでは JSON 形式でのみ返答する」等を落とす
+            continue
+        kept.append(s)
+
+    return _join_sentences(kept)
+
+
+# ============================================================
+# Public API: normalize_thread_brain
+# ============================================================
 
 def normalize_thread_brain(summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     Public API:
       - v1/v2/v3 いずれの TB でも受け取り、
-        v3.1 形式（constraints_soft + 圧縮済み）に正規化して返す。
+        v3.2 形式（constraints_soft のみ + semantic-clean 済み）に正規化して返す。
       - None の場合は None を返す。
     """
     if summary is None:
         return None
 
+    base: Dict[str, Any]
     if not isinstance(summary, dict):
-        return _upgrade_to_v3({})
+        base = {}
+    else:
+        base = summary
 
-    meta = summary.get("meta") or {}
+    meta = base.get("meta") or {}
     version = str(meta.get("version", "")).strip()
 
+    # 1) v1/v2 → v3 にアップグレード
     if version.startswith("3"):
-        # すでに v3 想定。最低限のフィールドがあるかだけ確認し、v3.1 postprocess を適用。
-        base = dict(summary)
+        # すでに v3 想定。最低限のフィールドがあるかだけ確認して shallow copy。
+        tb_v3: Dict[str, Any] = dict(base)
+        if not isinstance(tb_v3.get("constraints_soft"), list):
+            tb_v3["constraints_soft"] = []
+    else:
+        tb_v3 = _upgrade_to_v3(base)
 
-        if "constraints_soft" not in base or not isinstance(base["constraints_soft"], list):
-            base["constraints_soft"] = []
+    # 2) semantic-cleaning 適用
+    # 2-1) constraints_soft 再スキャン（念のため）
+    tb_v3["constraints_soft"] = _clean_list_field(tb_v3.get("constraints_soft"))
 
-        if "decisions" not in base:
-            base["decisions"] = []
-        if "unresolved" not in base:
-            base["unresolved"] = []
-        if "next_actions" not in base:
-            base["next_actions"] = []
-        if "history_digest" not in base:
-            base["history_digest"] = ""
-        if "high_level_goal" not in base:
-            base["high_level_goal"] = ""
-        if "recent_messages" not in base:
-            base["recent_messages"] = []
-        if "current_position" not in base:
-            base["current_position"] = ""
+    # 2-2) list 系フィールドをクリーン
+    for key in ["decisions", "unresolved", "next_actions", "recent_messages"]:
+        tb_v3[key] = _clean_list_field(tb_v3.get(key))
 
-        return _postprocess_v3(base)
+    # 2-3) paragraph 系フィールドをクリーン
+    tb_v3["history_digest"] = _clean_paragraph(tb_v3.get("history_digest", ""))
+    tb_v3["current_position"] = _clean_paragraph(tb_v3.get("current_position", ""))
 
-    # v1/v2 → v3.1 へアップグレード
-    return _upgrade_to_v3(summary)
+    # 3) meta.version を v3.2 に揃える（明示）
+    meta_out = tb_v3.get("meta") or {}
+    meta_out = dict(meta_out)
+    meta_out["version"] = "3.2"
+    tb_v3["meta"] = meta_out
+
+    return tb_v3
 
 
 # ============================================================
@@ -455,9 +297,9 @@ def normalize_thread_brain(summary: Optional[Dict[str, Any]]) -> Optional[Dict[s
 
 def build_tb_prompt(thread_brain: Optional[Dict[str, Any]]) -> str:
     """
-    TB v3.1 を前提に、LLM へ渡す [TB] プロンプトを構築する。
+    TB v3.2 を前提に、LLM へ渡す [TB] プロンプトを構築する。
     - None の場合は最小限のプレースホルダを返す。
-    - v1/v2 の場合も normalize_thread_brain で v3.1 に揃える。
+    - v1/v2 の場合も normalize_thread_brain で v3.2 に揃える。
     """
 
     tb_v3 = normalize_thread_brain(thread_brain)
@@ -477,14 +319,14 @@ def build_tb_prompt(thread_brain: Optional[Dict[str, Any]]) -> str:
 
     lines: List[str] = []
     lines.append("[TB]")
-    lines.append(f"version: {meta.get('version', '3.0')}")
+    lines.append(f"version: {meta.get('version', '3.2')}")
     if meta.get("context_key") is not None:
         lines.append(f"context_key: {meta.get('context_key')}")
 
     # High Level Goal
     if high_level_goal:
         lines.append("\n[GOAL]")
-        lines.append(str(high_level_goal))
+        lines.append(high_level_goal)
 
     # Status
     if status:
@@ -523,17 +365,17 @@ def build_tb_prompt(thread_brain: Optional[Dict[str, Any]]) -> str:
     # History Digest
     if history_digest:
         lines.append("\n[HISTORY_DIGEST]")
-        lines.append(str(history_digest))
+        lines.append(history_digest)
 
     # Current Position
     if current_position:
         lines.append("\n[CURRENT_POSITION]")
-        lines.append(str(current_position))
+        lines.append(current_position)
 
-    # Recent Messages（直近圧縮済み）
+    # Recent Messages（必要なら短く）
     if recent_messages:
         lines.append("\n[RECENT_MESSAGES]")
-        for msg in recent_messages:
+        for msg in recent_messages[-5:]:
             lines.append(f"- {msg}")
 
     return "\n".join(lines)
