@@ -1,107 +1,88 @@
 # ============================================================
 # [MODULE CONTRACT]
 # NAME: domain_control_splitter
-# ROLE: IFACE (Pre-Processing: Memory Classification)
+# ROLE: TB Domain/Control Separator (TB v3.1)
 #
 # INPUT:
-#   - runtime_memory: List[dict]
+#   tb: dict | None    - ThreadBrain (filtered)
 #
 # OUTPUT:
-#   - domain_log: List[dict]
-#   - control_log: List[dict]
+#   domain_tb: dict | None
+#   control_tb: dict | None
+#
+# PURPOSE:
+#   - TB から「LLM 向けの指示（制御語）」を分離し、
+#     TB を純粋なドメイン状態だけにする。
 #
 # MUST:
-#   - classify memory into domain/control based on strict rules
-#   - remove ALL LLM-format instructions from domain_log
-#   - preserve chronological order
-#   - avoid altering original memory entries
+#   - TB の構造を破壊しない
+#   - domain_tb に control 用語を混入させない
+#   - control_tb をオプションとして保持し、Core は利用しない（拡張ポイント）
 #
 # MUST_NOT:
-#   - perform IO
-#   - call Core / Stabilizer / PG / Discord
-#   - perform semantic inference beyond allowed rules
-#
-# DEPENDENCY:
-#   - None (pure local logic)
+#   - TB を改変し意味を変えてはならない
+#   - Control 情報を domain_tb に戻してはならない
 # ============================================================
 
-from typing import List, Tuple, Dict, Any
+from typing import Dict, Any, Tuple, Optional
 
 
-# ============================================================
-# [IFACE] Splitter Main Entry
-# ============================================================
-def split_memory(runtime_memory: List[Dict[str, Any]]) -> Tuple[List[dict], List[dict]]:
+CONTROL_KEYS = {
+    "format",            # 例: "json", "markdown 禁止"
+    "output_style",      # 例: "short", "long"
+    "role_instruction",  # 例: "あなたはOvvとして動作せよ"
+    "constraints_soft",  # LLM向けの形式制約
+    "llm_rules",         # 将来の追加ルール
+}
+
+
+def split_thread_brain(tb: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    runtime_memory を domain_log / control_log に分類する。
+    TB を Domain 情報と Control 情報に分離する。
 
-    domain_log:
-        - スレッドの目的・状態・決定・未解決・作業内容 など
-        - 長期的意味を持つ情報のみを残す
+    Domain:
+        - decisions
+        - unresolved
+        - next_actions
+        - history_digest
+        - high_level_goal
+        - recent_messages
+        - meta のうち domain に関係するもの
 
-    control_log:
-        - JSONで返して
-        - ○○として振る舞え
-        - 箇条書きで返答せよ
-        - PROMPT専用命令
-        - その他 LLM 向け操作指示
-
-    ※ この段階ではまだ「単純分類ロジック」だけ。
-       精度は後で段階的に強化する。
+    Control:
+        - constraints_soft
+        - format
+        - output_style
+        - role_instruction
+        - その他 LLM向けの操作命令
     """
 
-    domain_log = []
-    control_log = []
+    if tb is None:
+        return None, None
 
-    for entry in runtime_memory:
-        content: str = entry.get("content", "")
+    domain: Dict[str, Any] = {}
+    control: Dict[str, Any] = {}
 
-        # -----------------------------------------
-        # [RULE] PROMPT指示（[PROMPT]タグ）は control へ
-        # -----------------------------------------
-        if content.strip().startswith("[PROMPT]"):
-            control_log.append(entry)
+    for key, value in tb.items():
+        # Control ワードまたはキーなら control_tb に吸収
+        if key in CONTROL_KEYS:
+            control[key] = value
             continue
 
-        # -----------------------------------------
-        # [RULE] 明白なフォーマット指示
-        # -----------------------------------------
-        if _is_llm_format_instruction(content):
-            control_log.append(entry)
-            continue
+        # 値が LLM向け指示語を含む場合も control 側へ送る
+        if isinstance(value, str):
+            v = value.lower()
+            if any(x in v for x in ["jsonで返", "markdown", "禁止", "フォーマット"]):
+                control[key] = value
+                continue
 
-        # -----------------------------------------
-        # [RULE] その他すべて domain に入れる（v0.1）
-        #         ※ 次バージョンで強化
-        # -----------------------------------------
-        domain_log.append(entry)
+        # Domain 側として保持
+        domain[key] = value
 
-    return domain_log, control_log
+    # 完全空の場合は None にする
+    if not domain:
+        domain = None
+    if not control:
+        control = None
 
-
-# ============================================================
-# [IFACE] Helper — Format Instruction Detector
-# ============================================================
-def _is_llm_format_instruction(text: str) -> bool:
-    """
-    LLM向けの操作指示かどうかを判定する簡易ルール。
-    v0.1 では最小限。後で拡張する。
-    """
-
-    lowered = text.lower()
-
-    triggers = [
-        "jsonで返して",
-        "json形式で返して",
-        "jsonで答えて",
-        "markdown禁止",
-        "箇条書きで返答",
-        "あなたは",
-        "〜として振る舞え",
-        "role:",
-        "format:",
-        "返答形式",
-        "出力形式",
-    ]
-
-    return any(t in lowered for t in triggers)
+    return domain, control
