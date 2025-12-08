@@ -25,8 +25,9 @@ def capture_interface_packet(packet: dict):
     _last_iface_packet = packet
 
 
-def get_last_interface_packet():
+def capture_last_iface_packet():
     """
     debug_commands から参照するためのゲッター。
+    （旧 get_last_interface_packet の正式名）
     """
     return _last_iface_packet
