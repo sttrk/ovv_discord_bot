@@ -20,7 +20,6 @@
 #
 # DEPENDENCY:
 #   - debug_router
-#   - debug_boot
 #   - boundary_gate.build_input_packet
 #   - pipeline.run_ovv_pipeline_from_boundary
 # ============================================================
@@ -29,10 +28,10 @@ import discord
 from discord.ext import commands
 
 # ============================================================
-# [DEBUG BOOT] Debug context を必ず最初に注入
+# [REMOVE] 旧型 debug_boot は BIS 違反のため削除
 # ============================================================
-from debug.debug_boot import inject_debug_context
-inject_debug_context()
+# from debug.debug_boot import inject_debug_context
+# inject_debug_context()
 
 # Debug router
 from debug.debug_router import route_debug_message
@@ -40,7 +39,7 @@ from debug.debug_router import route_debug_message
 # Boundary Gate
 from ovv.bis.boundary_gate import build_input_packet
 
-# Main Pipeline
+# Pipeline
 from ovv.bis.pipeline import run_ovv_pipeline_from_boundary
 
 
@@ -58,7 +57,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_message(message: discord.Message):
 
     # -----------------------------------------
-    # [GATE] Bot 自身
+    # [GATE] Bot 自身を無視
     # -----------------------------------------
     if message.author.bot:
         return
@@ -91,7 +90,7 @@ async def on_message(message: discord.Message):
         return
 
     # -----------------------------------------
-    # [PIPELINE] Main Stream Dispatch
+    # [PIPELINE] Boundary → Interface → Core → Stabilizer
     # -----------------------------------------
     try:
         final_text = run_ovv_pipeline_from_boundary(boundary_packet)
@@ -111,6 +110,6 @@ async def on_message(message: discord.Message):
 if __name__ == "__main__":
     import os
 
-    TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     print("=== Booting Discord Ovv (BIS v1.1) ===")
+    TOKEN = os.getenv("DISCORD_BOT_TOKEN")
     bot.run(TOKEN)
