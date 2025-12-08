@@ -120,20 +120,23 @@ def register_debug_commands(bot: commands.Bot):
             "[RuntimeMemory]",
             json.dumps(mem, ensure_ascii=False, indent=2)[:800] if mem else "(empty)",
         ]
-        await ctx.send("```\n" + "\n".join(text) + "\n```")
 
-    # ------------------------------------------------------------
-    # !dbg_packet — 直近の InterfacePacket を確認
-    # ------------------------------------------------------------
-    @bot.command(name="dbg_packet")
-    async def dbg_packet(ctx: commands.Context):
-        if not _latest_iface_packet:
-            await ctx.send("No InterfacePacket has been captured yet.")
-            return
+# 追加インポート
+from ovv.bis.capture_interface_packet import get_last_interface_packet
 
-        out = json.dumps(_latest_iface_packet, ensure_ascii=False, indent=2)[:1900]
-        await ctx.send(f"```\n{out}\n```")
+@bot.command(name="dbg_packet")
+async def dbg_packet(ctx: commands.Context):
+    pkt = get_last_interface_packet()
+    if not pkt:
+        await ctx.send("No InterfacePacket has been captured yet.")
+        return
 
+    text = str(pkt)
+    if len(text) > 1900:
+        text = text[:1900] + " ... (truncated)"
+
+    await ctx.send(f"```\n{text}\n```")
+    
     # ------------------------------------------------------------
     # !dbg_flow — BIS パイプラインの構造チェック
     # ------------------------------------------------------------
