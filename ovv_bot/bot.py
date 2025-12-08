@@ -18,6 +18,7 @@ from discord.ext import commands
 
 from debug.debug_router import route_debug_message
 from debug.debug_commands import register_debug_commands
+from debug.health_monitor import run_health_monitor   # ← ADDED
 
 from ovv.bis.boundary_gate import build_input_packet
 from ovv.bis.pipeline import run_ovv_pipeline_from_boundary
@@ -57,11 +58,14 @@ async def on_message(message: discord.Message):
     # commands フレームワーク（!xxx）
     if message.content.startswith("!"):
         await bot.process_commands(message)
+        # ※ commands 実行後も health monitor は呼ぶべき
+        await run_health_monitor(bot)          # ← ADDED
         return
 
     # Boundary Packet 生成
     boundary_packet = build_input_packet(message)
     if boundary_packet is None:
+        await run_health_monitor(bot)          # ← ADDED
         return
 
     # Pipeline 実行
@@ -73,12 +77,17 @@ async def on_message(message: discord.Message):
     if final_text:
         await message.channel.send(final_text)
 
+    # =======================================================
+    # Auto BIS Health Check（自動自己診断）
+    # =======================================================
+    await run_health_monitor(bot)              # ← ADDED
+
 
 # ============================================================
 # ENTRYPOINT
 # ============================================================
 
 if __name__ == "__main__":
-    print("=== Booting Discord Ovv (BIS v1.1, Tagged & Logged) ===")
+    print("=== Booting Discord Ovv (BIS v1.1, Health Monitor Enabled) ===")
     token = os.getenv("DISCORD_BOT_TOKEN")
     bot.run(token)
