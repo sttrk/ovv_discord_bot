@@ -1,54 +1,31 @@
 # ovv/bis/stabilizer.py
-"""
-[MODULE CONTRACT]
-NAME: stabilizer
-LAYER: BIS-4 (Stabilizer)
-ROLE:
-  - Ovv Core からの生テキスト raw_answer から [FINAL] セクションのみを抽出する。
+# ---------------------------------------------------------------------
+# Stabilizer Layer
+# ・Discord 出力の整形
+# ・NotionOps Executor を最後に実行
+# ---------------------------------------------------------------------
 
-INPUT:
-  - raw_answer: str | None
-
-OUTPUT:
-  - final_answer: str  # Discord にそのまま送信可能なテキスト
-
-MUST:
-  - [FINAL] があればその中身だけを返す
-  - [FINAL] が無ければ raw_answer 全体を FINAL とみなす
-  - Discord の 2000 文字制限を考慮して ~1900 文字で truncate する
-
-MUST NOT:
-  - 要約 / 書き換え / 生成を行わない
-  - DB / LLM / Discord に依存しない（print は除く）
-"""
-
-from typing import Optional
+from external_services.notion.ops.executor import execute_notion_ops
 
 
-def extract_final_answer(raw_answer: Optional[str]) -> str:
-    """
-    Ovv Core からの生テキストから [FINAL] セクションのみを抽出し、
-    Discord に送信可能な安定テキストとして返す。
-    """
-    if not raw_answer:
-        print("[BIS-4] Stabilizer: empty raw_answer")
-        return ""
+class Stabilizer:
+    def __init__(self, *, message_for_user, notion_ops, context_key, user_id):
+        self.message_for_user = message_for_user
+        self.notion_ops = notion_ops
+        self.context_key = context_key
+        self.user_id = user_id
 
-    text = str(raw_answer).strip()
-    if not text:
-        print("[BIS-4] Stabilizer: whitespace raw_answer")
-        return ""
+    async def finalize(self):
+        # 1. Discord 返信内容の整形（必要に応じて拡張）
+        formatted = self.message_for_user
 
-    if "[FINAL]" in text:
-        parts = text.split("[FINAL]", 1)
-        final_block = parts[1].strip()
-        if not final_block:
-            print("[BIS-4] Stabilizer: [FINAL] present but empty")
-            return ""
-        out = final_block[:1900]
-        print(f"[BIS-4] Stabilizer: [FINAL] extracted (len={len(out)})")
-        return out
+        # 2. NotionOps の実行（任意・非同期処理でも可）
+        if self.notion_ops:
+            await execute_notion_ops(
+                self.notion_ops,
+                context_key=self.context_key,
+                user_id=self.user_id,
+                request_id=None,
+            )
 
-    out = text[:1900]
-    print(f"[BIS-4] Stabilizer: no [FINAL], raw used (len={len(out)})")
-    return out
+        return formatted
