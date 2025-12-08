@@ -1,75 +1,54 @@
 # debug/debug_router.py
-# Debug Router v2.0 (BIS/OVFS Compatible)
+# Debug Router v3.0 (BIS/OVFS Ready)
 #
 # ROLE:
-#   - "!dbg_xxx" コマンドを安全に受け取り、
-#     debug_commands の該当関数へ委譲する Dispatcher。
+#   - "!dbg_xxx" を検知し、debug_commands に委譲する Dispatcher。
 #
 # MUST:
-#   - "!dbg" から始まるメッセージのみ処理する
-#   - 壊れにくいパーサを使う（parts[1] を直接取らない）
-#   - debug_commands の関数に直接ディスパッチする
-#   - Discord へは必ず str を返す
+#   - "!dbg" prefix のみに反応
+#   - すべての Debug I/O はここで完結させる（Pipeline へ流さない）
+#   - commands 側 API にハード依存しない
 #
-# MUST NOT:
-#   - run_debug_command のような旧 API を使わない
-#   - OvvCore に影響する処理を書かない
-#   - ThreadBrain や runtime_memory を変更しない
+# DEPENDENCY:
+#   - debug_commands.register_debug_commands()
+#   - debug_static_messages.DEBUG_HELP
 #
-# COMMANDS:
-#   - !dbg_mem
-#   - !dbg_all
-#   - !dbg_help
 
+from debug import debug_commands
+from debug.debug_static_messages import DEBUG_HELP_TEXT
 
-from debug.debug_commands import dbg_mem, dbg_all
-from debug.debug_context import debug_context
-
-
-# ============================================================
-# Debug router (safe dispatcher)
-# ============================================================
 
 async def route_debug_message(bot, message):
+    """Return True if handled."""
+
     content = message.content.strip()
 
-    # Debug prefix check
+    # Debug prefix のみ対象
     if not content.startswith("!dbg"):
-        return False  # Not a debug message
+        return False
 
-    # Tokenize
+    # コマンド部分抽出
     parts = content.split()
-    cmd = parts[0]      # "!dbg_mem" など
-    args = parts[1:]    # 将来の拡張用
+    cmd = parts[0]
+    args = parts[1:]
 
-    try:
-        # -----------------------------------------
-        # Routing table（完全一致順）
-        # -----------------------------------------
-        if cmd == "!dbg_mem":
-            await dbg_mem(bot, message)
-            return True
+    # Debug command registry（debug_commands 側にある dict）
+    registry = getattr(debug_commands, "DEBUG_COMMAND_REGISTRY", {})
 
-        if cmd == "!dbg_all":
-            await dbg_all(bot, message)
-            return True
-
-        if cmd in ("!dbg", "!dbg_help"):
-            help_text = (
-                "[DEBUG COMMANDS]\n"
-                "!dbg_mem  - runtime_memory を表示\n"
-                "!dbg_all  - memory + thread_brain を表示\n"
-                "!dbg_help - このヘルプを表示"
-            )
-            await message.channel.send(f"```txt\n{help_text}\n```")
-            return True
-
-        # -----------------------------------------
-        # Unknown command
-        # -----------------------------------------
-        await message.channel.send(f"[DEBUG] Unknown command: {cmd}")
+    # "!dbg_help" or "!dbg"
+    if cmd in ("!dbg", "!dbg_help"):
+        await message.channel.send(f"```txt\n{DEBUG_HELP_TEXT}\n```")
         return True
 
-    except Exception as e:
-        await message.channel.send(f"[DEBUG] Router Error: {repr(e)}")
+    # 通常の debug コマンド
+    if cmd in registry:
+        try:
+            handler = registry[cmd]
+            await handler(bot, message, *args)
+        except Exception as e:
+            await message.channel.send(f"[DEBUG ERROR] {repr(e)}")
         return True
+
+    # 未知コマンド
+    await message.channel.send(f"[DEBUG] Unknown command: {cmd}")
+    return True
