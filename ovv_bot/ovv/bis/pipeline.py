@@ -17,11 +17,12 @@
 # MUST:
 #   - runtime_memory / thread_brain の永続化は database.pg のみ経由する
 #   - state_manager / interface_box / ovv_call / stabilizer を直列に呼び出す
+#   - health_monitor が参照できるよう InterfacePacket を capture する
 #
 # MUST NOT:
 #   - Discord API を呼ばない
 #   - commands.Bot に依存しない
-#   - debug 用の挙動を紛れ込ませない（※専用フックのみ許可）
+#   - debug 用の挙動を紛れ込ませない（print ログは許可）
 # ============================================================
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ from ovv.ovv_call import call_ovv
 # [PERSIST] PostgreSQL access
 import database.pg as db_pg
 
-# [DEBUG] InterfacePacket capture hook (BIS Debug Layer)
+# [DIAG] InterfacePacket capture（health_monitor / dbg_flow 用）
 from ovv.bis.capture_interface_packet import capture_interface_packet
 
 
@@ -61,6 +62,9 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     Boundary_Gate から渡された InputPacket を起点に、
     runtime_memory / thread_brain / state_manager / interface_box / ovv_core / stabilizer
     を直列パイプラインとして実行する。
+
+    - Discord / Bot に依存しない純粋な処理関数。
+    - health_monitor / !dbg_flow 用に InterfacePacket を capture する。
     """
 
     context_key = packet.context_key
@@ -96,6 +100,7 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
 
     # -----------------------------------------
     # [PERSIST/CORE] ThreadBrain の利用・更新
+    #   - ここでは TB の生成・保存のみを扱う
     # -----------------------------------------
     tb_summary: Optional[dict] = None
 
@@ -142,16 +147,6 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
         return "Ovv の内部処理（InterfaceBox）でエラーが発生しました。"
 
     # -----------------------------------------
-    # [DEBUG] InterfacePacket Capture Hook
-    # -----------------------------------------
-    try:
-        capture_interface_packet(iface_packet)
-        print("[BIS-PIPE] Debug capture_interface_packet OK")
-    except Exception as e:
-        # デバッグ機構は本流を止めない
-        print("[BIS-PIPE] Debug capture_interface_packet ERROR:", repr(e))
-
-    # -----------------------------------------
     # [CORE] Ovv-Core 呼び出し
     # -----------------------------------------
     try:
@@ -160,6 +155,19 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     except Exception as e:
         print("[BIS-PIPE] Core call_ovv ERROR:", repr(e))
         return "Ovv のコア処理でエラーが発生しました。"
+
+    # -----------------------------------------
+    # [DIAG] InterfacePacket キャプチャ（health_monitor / dbg_flow 用）
+    #   - raw_core_answer を埋め込んだ上で capture
+    #   - 本流の挙動には影響を与えない
+    # -----------------------------------------
+    try:
+        iface_packet_for_diag = dict(iface_packet)
+        iface_packet_for_diag["raw_core_answer"] = raw_ans
+        capture_interface_packet(iface_packet_for_diag)
+        print("[BIS-PIPE] capture_interface_packet OK")
+    except Exception as e:
+        print("[BIS-PIPE] capture_interface_packet ERROR:", repr(e))
 
     # -----------------------------------------
     # [STAB] Stabilizer で Discord 向けの最終テキストを抽出
