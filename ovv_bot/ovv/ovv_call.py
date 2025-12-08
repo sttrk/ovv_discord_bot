@@ -1,42 +1,42 @@
 # ============================================================
 # [MODULE CONTRACT]
 # NAME: ovv_call
-# ROLE: OvvCoreCallLayer (BIS Layer 3)
+# LAYER: BIS-3 (Core Call Layer)
+#
+# ROLE:
+#   - Interface_Box が組み立てた iface_packet を元に LLM を呼び出す。
+#   - SYSTEM_PROMPT / Core Spec / External Contract / TB / State / Memory を統合し、
+#     1 回の chat.completions によって raw_answer を得る。
 #
 # INPUT:
 #   - context_key: int
-#   - iface_packet: dict (Interface_Box 出力)
+#   - iface_packet: dict
 #
 # OUTPUT:
 #   - raw_answer: str（Stabilizer が [FINAL] を抽出）
 #
 # MUST:
-#   - SYSTEM_PROMPT / OVV_CORE / OVV_EXTERNAL を注入する
-#   - ThreadBrainPrompt / TB-Scoring / StateHint / RuntimeMemory を含める
-#   - assistant 応答を runtime_memory に append する
-#   - ChatCompletionMessage を辞書として扱わない（subscript しない）
+#   - ChatCompletionMessage を dict のように subscript しない
+#   - runtime_memory に assistant 応答を append する
 #
 # MUST NOT:
-#   - iface_packet を変更してはならない
-#   - JSON を勝手に返してはならない
-#   - ThreadBrain を mutate してはならない
+#   - iface_packet を変更しない
+#   - ThreadBrain を mutate しない
+#   - Discord / Notion / 直接 I/O に触れない（print は除く）
 # ============================================================
 
 from typing import List, Dict, Any
 import json
-from openai import OpenAI
 
+from openai import OpenAI
 from config import OPENAI_API_KEY
 
-# Core / External spec loader
 from ovv.core_loader import load_core, load_external
-
-# Persistence（最小限の append のみ許可）
 import database.pg as db_pg
 
 
 # ============================================================
-# Load Core / External
+# Core / External / Soft-Core
 # ============================================================
 
 OVV_CORE = load_core()
@@ -52,11 +52,6 @@ OVV_SOFT_CORE = """
 6. MUST NOT phase-mix.
 7. MAY trigger CDC but sparingly and structured.
 """.strip()
-
-
-# ============================================================
-# SYSTEM PROMPT（完全BIS対応）
-# ============================================================
 
 SYSTEM_PROMPT = f"""
 あなたは Discord 上で動作する「Ovv」です。
@@ -78,7 +73,6 @@ Ovv Soft-Core:
 - 高い安定性と可読性を保持しつつ、OvvCore と External Contract の仕様に従う。
 """.strip()
 
-
 # ============================================================
 # OpenAI Client
 # ============================================================
@@ -87,7 +81,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ============================================================
-# call_ovv（BIS Layer 3 の本体）
+# call_ovv
 # ============================================================
 
 def call_ovv(context_key: int, iface_packet: Dict[str, Any]) -> str:
@@ -97,9 +91,6 @@ def call_ovv(context_key: int, iface_packet: Dict[str, Any]) -> str:
     - Stabilizer が [FINAL] を抽出できるよう raw を返す
     """
 
-    # --------------------------------------------------------
-    # Unpack（読み取りのみ、変更禁止）
-    # --------------------------------------------------------
     user_text: str = iface_packet.get("input", "") or ""
     runtime_mem: List[Dict[str, Any]] = iface_packet.get("memory", []) or []
     tb_prompt: str = iface_packet.get("tb_prompt", "") or ""
@@ -107,7 +98,7 @@ def call_ovv(context_key: int, iface_packet: Dict[str, Any]) -> str:
     state_hint: Dict[str, Any] = iface_packet.get("state", {}) or {}
 
     # --------------------------------------------------------
-    # Message Assembly (GPT-4.1)
+    # Message Assembly
     # --------------------------------------------------------
 
     messages: List[Dict[str, str]] = []
@@ -115,7 +106,7 @@ def call_ovv(context_key: int, iface_packet: Dict[str, Any]) -> str:
     # SYSTEM
     messages.append({"role": "system", "content": SYSTEM_PROMPT})
 
-    # CORE / EXTERNAL を assistant ロールで注入
+    # CORE / EXTERNAL
     messages.append({"role": "assistant", "content": OVV_CORE})
     messages.append({"role": "assistant", "content": OVV_EXTERNAL})
 
@@ -134,19 +125,17 @@ def call_ovv(context_key: int, iface_packet: Dict[str, Any]) -> str:
             "content": "[STATE_HINT]\n" + json.dumps(state_hint, ensure_ascii=False),
         })
 
-    # runtime_memory
+    # RUNTIME MEMORY
     for m in runtime_mem:
-        r = m.get("role") or "user"
-        c = m.get("content") or ""
-        if c:
-            messages.append({"role": r, "content": c})
+        role = m.get("role") or "user"
+        content = m.get("content") or ""
+        if content:
+            messages.append({"role": role, "content": content})
 
-    # current user message
+    # CURRENT USER MESSAGE
     messages.append({"role": "user", "content": user_text})
 
-    # --------------------------------------------------------
-    # Call LLM（ChatCompletionMessage 対応）
-    # --------------------------------------------------------
+    print(f"[BIS-3] CoreCall: messages={len(messages)} (ctx={context_key})")
 
     try:
         resp = client.chat.completions.create(
@@ -154,13 +143,13 @@ def call_ovv(context_key: int, iface_packet: Dict[str, Any]) -> str:
             messages=messages,
         )
 
-        # ChatCompletionMessage（辞書アクセス禁止）
+        # ChatCompletionMessage（辞書ではない）
         msg = resp.choices[0].message
         raw = msg.content or ""
 
-        # --------------------------------------------------------
-        # runtime_memory へ append（副作用 OK）
-        # --------------------------------------------------------
+        print(f"[BIS-3] CoreCall: LLM responded (len={len(raw)})")
+
+        # runtime_memory append（安全側）
         try:
             db_pg.append_runtime_memory(
                 str(context_key),
@@ -169,20 +158,22 @@ def call_ovv(context_key: int, iface_packet: Dict[str, Any]) -> str:
                 limit=40,
             )
         except Exception as e:
-            print("[call_ovv] append_runtime_memory error:", repr(e))
+            print("[BIS-3] runtime_memory append error:", repr(e))
 
         return raw[:1900]
 
     except Exception as e:
-        print("[call_ovv error]", repr(e))
-
-        # audit（失敗しても止めない）
+        print("[BIS-3] CoreCall ERROR:", repr(e))
         try:
             db_pg.log_audit(
                 "openai_error",
-                {"context_key": context_key, "user_text": user_text, "error": repr(e)},
+                {
+                    "context_key": context_key,
+                    "error": repr(e),
+                    "user_text": user_text[:200],
+                },
             )
         except Exception:
             pass
 
-        return "[FINAL]\nOvv コア処理中にエラーが発生しました。再試行してください。"
+        return "[FINAL]\nOvv コア処理中にエラーが発生しました。時間を置いて再度お試しください。"
