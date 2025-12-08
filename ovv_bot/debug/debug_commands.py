@@ -1,13 +1,23 @@
-# debug/debug_commands.py
 """
 [MODULE CONTRACT]
 NAME: debug_commands
-ROLE: Gate-Assist (Debug Command Handler)
+LAYER: Gate-Assist
+ROLE:
+  - Discord の "!xxx" コマンドとして、Ovv の内部状態を安全に覗くためのユーティリティ群。
+
+INPUT:
+  - bot (commands.Bot)
+
+OUTPUT:
+  - Discord messages（人間可読な debug 情報）
 
 MUST:
-  - read-only access to DB except wipe
-  - never call Ovv-Core
-  - never mutate ThreadBrain except wipe
+  - DB 読み取り主体（wipe を除き更新しない）
+  - LLM / Core / Interface を呼ばない
+
+MUST NOT:
+  - ThreadBrain を書き換えない（wipe は例外）
+  - Notion に書き込まない
 """
 
 import discord
@@ -18,7 +28,7 @@ import database.pg as db_pg
 def register_debug_commands(bot: commands.Bot):
 
     # ------------------------------------------------------------
-    # !bs — Boot Summary
+    # !bs — Boot Summary（DB 接続状況など）
     # ------------------------------------------------------------
     @bot.command(name="bs")
     async def bs(ctx: commands.Context):
@@ -34,10 +44,10 @@ def register_debug_commands(bot: commands.Bot):
             "",
             f"session_id: {ctx.channel.id}",
         ]
-        await ctx.send(f"```txt\n" + "\n".join(lines) + "\n```")
+        await ctx.send("```\n" + "\n".join(lines) + "\n```")
 
     # ------------------------------------------------------------
-    # !br — ThreadBrain dump
+    # !br — Thread Brain dump
     # ------------------------------------------------------------
     @bot.command(name="br")
     async def br(ctx: commands.Context):
@@ -53,7 +63,7 @@ def register_debug_commands(bot: commands.Bot):
         if len(out) > 1900:
             out = out[:1900]
 
-        await ctx.send(f"```txt\n{out}\n```")
+        await ctx.send("```\n" + out + "\n```")
 
     # ------------------------------------------------------------
     # !dbg_mem — runtime memory dump
@@ -72,10 +82,10 @@ def register_debug_commands(bot: commands.Bot):
         if len(out) > 1900:
             out = out[:1900]
 
-        await ctx.send(f"```txt\n{out}\n```")
+        await ctx.send("```\n" + out + "\n```")
 
     # ------------------------------------------------------------
-    # !dbg_all — TB + runtime memory
+    # !dbg_all — TB + memory のまとめ
     # ------------------------------------------------------------
     @bot.command(name="dbg_all")
     async def dbg_all(ctx: commands.Context):
@@ -96,10 +106,10 @@ def register_debug_commands(bot: commands.Bot):
             str(mem)[:800] if mem else "(empty)",
         ]
 
-        await ctx.send(f"```txt\n" + "\n".join(text) + "\n```")
+        await ctx.send("```\n" + "\n".join(text) + "\n```")
 
     # ------------------------------------------------------------
-    # !wipe — delete TB + runtime memory
+    # !wipe — TB および memory の削除
     # ------------------------------------------------------------
     @bot.command(name="wipe")
     async def wipe(ctx: commands.Context):
