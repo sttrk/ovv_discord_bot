@@ -21,7 +21,7 @@
 # MUST NOT:
 #   - Discord API を呼ばない
 #   - commands.Bot に依存しない
-#   - debug 用の挙動を紛れ込ませない
+#   - debug 用の挙動を紛れ込ませない（※専用フックのみ許可）
 # ============================================================
 
 from __future__ import annotations
@@ -47,6 +47,9 @@ from ovv.ovv_call import call_ovv
 
 # [PERSIST] PostgreSQL access
 import database.pg as db_pg
+
+# [DEBUG] InterfacePacket capture hook (BIS Debug Layer)
+from ovv.bis.capture_interface_packet import capture_interface_packet
 
 
 # ============================================================
@@ -137,6 +140,16 @@ def run_ovv_pipeline_from_boundary(packet: InputPacket) -> str:
     except Exception as e:
         print("[BIS-PIPE] InterfaceBox ERROR:", repr(e))
         return "Ovv の内部処理（InterfaceBox）でエラーが発生しました。"
+
+    # -----------------------------------------
+    # [DEBUG] InterfacePacket Capture Hook
+    # -----------------------------------------
+    try:
+        capture_interface_packet(iface_packet)
+        print("[BIS-PIPE] Debug capture_interface_packet OK")
+    except Exception as e:
+        # デバッグ機構は本流を止めない
+        print("[BIS-PIPE] Debug capture_interface_packet ERROR:", repr(e))
 
     # -----------------------------------------
     # [CORE] Ovv-Core 呼び出し
