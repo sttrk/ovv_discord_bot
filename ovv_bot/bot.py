@@ -1,52 +1,70 @@
-# bot.py (BIS v1.1 + Debug Commands Enabled)
+# ============================================================
+# [MODULE CONTRACT]
+# NAME: bot
+# LAYER: GATE + IO Adapter
+#
+# ROLE:
+#   - Discord のイベントを受け取り、BIS-1（Boundary_Gate）に渡す最初の入口。
+#   - Debug Router / commands フレームワークの両方を尊重する。
+#
+# MUST:
+#   - Persistence / Core / Stabilizer に直接触れない（Pipeline に委譲）
+#   - Discord の send 以外の I/O を持たない（print は除く）
+# ============================================================
 
+import os
 import discord
 from discord.ext import commands
 
-# Debug Router
 from debug.debug_router import route_debug_message
-
-# Debug Commands
 from debug.debug_commands import register_debug_commands
 
-# Boundary Gate
 from ovv.bis.boundary_gate import build_input_packet
-
-# Pipeline
 from ovv.bis.pipeline import run_ovv_pipeline_from_boundary
 
+
+# ============================================================
+# Bot Instance
+# ============================================================
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 必須：Bot 生成後に Debug Commands を登録
+# Debug Commands 登録
 register_debug_commands(bot)
 
+
+# ============================================================
+# on_message — Discord → Boundary Gate Entry
+# ============================================================
 
 @bot.event
 async def on_message(message: discord.Message):
 
+    # Bot 自身
     if message.author.bot:
         return
 
+    # System message 除外
     if getattr(message, "type", discord.MessageType.default) is not discord.MessageType.default:
         return
 
-    # Debug 判定（!dbg_* のみ True）
+    # Debug Router（!dbg 系）
     handled = await route_debug_message(bot, message)
     if handled:
         return
 
-    # 通常コマンド処理
+    # commands フレームワーク（!xxx）
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
 
-    # ここから Ovv Main Stream
+    # Boundary Packet 生成
     boundary_packet = build_input_packet(message)
     if boundary_packet is None:
         return
 
+    # Pipeline 実行
     try:
         final_text = run_ovv_pipeline_from_boundary(boundary_packet)
     except Exception as e:
@@ -56,8 +74,11 @@ async def on_message(message: discord.Message):
         await message.channel.send(final_text)
 
 
+# ============================================================
+# ENTRYPOINT
+# ============================================================
+
 if __name__ == "__main__":
-    import os
-    print("=== Booting Discord Ovv (BIS v1.1 + Debug) ===")
-    TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-    bot.run(TOKEN)
+    print("=== Booting Discord Ovv (BIS v1.1, Tagged & Logged) ===")
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    bot.run(token)
