@@ -2,36 +2,10 @@
 # [MODULE CONTRACT]
 # NAME: bot
 # ROLE: GATE + IO Adapter
-#
-# INPUT:
-#   - Discord Message (discord.Message)
-#
-# OUTPUT:
-#   - Discord Message (send)
-#
-# MUST:
-#   - Boundary_Gate から処理が始まること
-#   - Pipeline に処理を委譲し、Core/Stabilizer をここで扱わない
-#   - Discord 入出力以外の責務を持たない
-#
-# MUST NOT:
-#   - Persistence（PG/Notion）へ直接アクセスしない
-#   - Core ロジックを実装しない
-#
-# DEPENDENCY:
-#   - debug_router
-#   - debug_commands.register_debug_commands
-#   - boundary_gate.build_input_packet
-#   - pipeline.run_ovv_pipeline_from_boundary
 # ============================================================
 
 import discord
 from discord.ext import commands
-
-# ============================================================
-# [DEBUG BOOT REMOVED]
-# BIS 違反の旧 inject_debug_context は廃止
-# ============================================================
 
 # Debug router
 from debug.debug_router import route_debug_message
@@ -52,7 +26,7 @@ from ovv.bis.pipeline import run_ovv_pipeline_from_boundary
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Debug Commands registration (MUST be after bot instance)
+# register debug commands
 register_debug_commands(bot)
 
 
@@ -75,10 +49,13 @@ async def on_message(message: discord.Message):
         return
 
     # -----------------------------------------
-    # [GATE] Debug Router（最優先判定）
+    # [GATE] Debug Router（最優先）
+    #       → pipeline へは流さないが、
+    #         Discord commands (!dbg_xxx) は必ず実行する
     # -----------------------------------------
-    handled = await route_debug_message(bot, message)
-    if handled:
+    is_debug = await route_debug_message(bot, message)
+    if is_debug:
+        await bot.process_commands(message)   # ← これが必須
         return
 
     # -----------------------------------------
@@ -104,7 +81,7 @@ async def on_message(message: discord.Message):
         final_text = f"Ovv の処理中に予期しないエラーが発生しました: {e}"
 
     # -----------------------------------------
-    # [IO] Discord へ最終出力
+    # [IO] Discord 出力
     # -----------------------------------------
     if final_text:
         await message.channel.send(final_text)
