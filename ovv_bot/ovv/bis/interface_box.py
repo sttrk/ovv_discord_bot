@@ -1,94 +1,69 @@
-# ============================================================
-# [MODULE CONTRACT]
-# NAME: interface_box
-# LAYER: BIS-2 (Interface Box)
-#
-# ROLE:
-#   - BoundaryPacket (物理レイヤ) を Ovv Core 入力用の InterfacePacket に変換する。
-#   - ThreadBrain / runtime_memory / state_hint を統合し、LLM に渡す直前の構造を組み立てる。
-#
-# INPUT:
-#   - boundary_packet: dict
-#   - runtime_memory: list[dict]
-#   - thread_brain: dict | None
-#   - state_hint: dict | None
-#
-# OUTPUT:
-#   - iface_packet: dict
-#
-# MUST:
-#   - constraint_filter を通した ThreadBrain のみを Core に渡す
-#   - runtime_memory を改変せずそのまま渡す
-#   - state_hint を "state" に正規化して渡す
-#   - TB 用の tb_prompt / tb_scoring を生成する
-#
-# MUST NOT:
-#   - DB / Notion / Discord に触れない
-#   - LLM を直接呼ばない
-#   - 物理 I/O（print を除く）を行わない
-# ============================================================
+# ovv/bis/interface_box.py
+# ---------------------------------------------------------------------
+# Interface Box Layer
+# ・InputPacket → Request
+# ・Core I/O（system/user prompt の整流）
+# ・Core 実行
+# ・NotionOps（builders）生成
+# ・Response 構築
+# ---------------------------------------------------------------------
 
-from typing import List, Optional, Dict, Any
-
-from ovv.brain.threadbrain_adapter import build_tb_prompt
-from ovv.brain.tb_scoring import build_scoring_prompt
-from ovv.bis.constraint_filter import filter_constraints_from_thread_brain
+from ovv.core.ovv_core import run_ovv_core
+from external_services.notion.ops.builders import build_notion_ops
+from ovv.bis.stabilizer import Stabilizer
 
 
-# ============================================================
-# [IFACE] Interface Packet Builder
-# ============================================================
+class Request:
+    def __init__(self, *, context_key, command_type, payload, user_meta):
+        self.context_key = context_key
+        self.command_type = command_type
+        self.payload = payload
+        self.user_meta = user_meta
 
-def build_interface_packet(
-    boundary_packet: Dict[str, Any],
-    runtime_memory: List[dict],
-    thread_brain: Optional[dict],
-    state_hint: Optional[dict] = None,
-) -> Dict[str, Any]:
-    """
-    Interface Box（Layer 2）
-    Discord 物理レイヤ（Boundary）→ Ovv 論理レイヤ（Core 入力）
-    """
 
-    context_key = boundary_packet.get("context_key")
-    session_id = boundary_packet.get("session_id")
+def convert_to_request(packet):
+    return Request(
+        context_key=packet.context_key,
+        command_type=packet.command_type,
+        payload=packet.payload,
+        user_meta=packet.user_meta,
+    )
 
-    # -----------------------------------------
-    # 1) ThreadBrain の制約フィルタリング
-    # -----------------------------------------
-    safe_tb = filter_constraints_from_thread_brain(thread_brain) if thread_brain else None
 
-    # -----------------------------------------
-    # 2) TB Prompt
-    # -----------------------------------------
-    if safe_tb:
-        tb_prompt = build_tb_prompt(safe_tb) or ""
-    else:
-        tb_prompt = "[TB]\nNo thread brain available."
+def build_system_prompt(request: Request) -> str:
+    return f"""
+You are Ovv — a universal product engineer.
+Command Type: {request.command_type}
+User: {request.user_meta.get('user_name')}
+"""
 
-    # -----------------------------------------
-    # 3) TB-Scoring
-    # -----------------------------------------
-    if safe_tb:
-        tb_scoring = build_scoring_prompt(safe_tb) or ""
-    else:
-        tb_scoring = "[TB-Scoring]\nNo summary available. Prioritize clarity."
 
-    # -----------------------------------------
-    # 4) InterfacePacket（Core へ渡す論理データ）
-    # -----------------------------------------
-    iface_packet: Dict[str, Any] = {
-        "input": boundary_packet["text"],              # user_text
-        "memory": runtime_memory,                      # runtime_memory
-        "thread_brain": safe_tb,                       # filtered TB
-        "state": state_hint or {},                     # 決定状態
-        "tb_prompt": tb_prompt,                        # ThreadBrain Prompt
-        "tb_scoring": tb_scoring,                      # TB scoring
-        "context_key": context_key,
-        "session_id": session_id,
-        "is_task": boundary_packet.get("is_task_channel", False),
+def build_user_prompt(request: Request) -> str:
+    return f"""
+User Input:
+{request.payload}
+"""
+
+
+async def handle_request(packet):
+    request = convert_to_request(packet)
+
+    system_prompt = build_system_prompt(request)
+    user_prompt = build_user_prompt(request)
+
+    core_output = await run_ovv_core(system_prompt, user_prompt)
+
+    # notion_ops の生成
+    notion_ops = build_notion_ops(core_output, request)
+
+    # Stabilizer に渡すための統合レスポンス
+    stabilizer = Stabilizer(
+        message_for_user=core_output.get("reply", ""),
+        notion_ops=notion_ops,
+        context_key=request.context_key,
+        user_id=request.user_meta.get("user_id"),
+    )
+
+    return {
+        "stabilizer": stabilizer,
     }
-
-    print(f"[BIS-2] InterfaceBox: iface_packet built (ctx={context_key}, session={session_id})")
-
-    return iface_packet
