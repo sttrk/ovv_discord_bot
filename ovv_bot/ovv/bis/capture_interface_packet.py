@@ -15,7 +15,6 @@
 
 _last_iface_packet = None
 
-
 def capture_interface_packet(packet: dict):
     """
     Interface_Box → Core の直前で、最終的な InterfacePacket を一時保存する。
@@ -23,8 +22,7 @@ def capture_interface_packet(packet: dict):
     global _last_iface_packet
     _last_iface_packet = packet
 
-
-def capture_last_iface_packet():
+def get_last_interface_packet() -> dict:
     """
     debug_commands から参照するためのゲッター。
     """
