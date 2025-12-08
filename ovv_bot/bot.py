@@ -20,6 +20,7 @@
 #
 # DEPENDENCY:
 #   - debug_router
+#   - debug_commands.register_debug_commands
 #   - boundary_gate.build_input_packet
 #   - pipeline.run_ovv_pipeline_from_boundary
 # ============================================================
@@ -28,13 +29,15 @@ import discord
 from discord.ext import commands
 
 # ============================================================
-# [REMOVE] 旧型 debug_boot は BIS 違反のため削除
+# [DEBUG BOOT REMOVED]
+# BIS 違反の旧 inject_debug_context は廃止
 # ============================================================
-# from debug.debug_boot import inject_debug_context
-# inject_debug_context()
 
 # Debug router
 from debug.debug_router import route_debug_message
+
+# Debug commands registration
+from debug.debug_commands import register_debug_commands
 
 # Boundary Gate
 from ovv.bis.boundary_gate import build_input_packet
@@ -48,6 +51,9 @@ from ovv.bis.pipeline import run_ovv_pipeline_from_boundary
 # ============================================================
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Debug Commands registration (MUST be after bot instance)
+register_debug_commands(bot)
 
 
 # ============================================================
@@ -69,7 +75,7 @@ async def on_message(message: discord.Message):
         return
 
     # -----------------------------------------
-    # [GATE] Debug Router (最優先)
+    # [GATE] Debug Router（最優先判定）
     # -----------------------------------------
     handled = await route_debug_message(bot, message)
     if handled:
@@ -98,7 +104,7 @@ async def on_message(message: discord.Message):
         final_text = f"Ovv の処理中に予期しないエラーが発生しました: {e}"
 
     # -----------------------------------------
-    # [IO] Discord 出力
+    # [IO] Discord へ最終出力
     # -----------------------------------------
     if final_text:
         await message.channel.send(final_text)
