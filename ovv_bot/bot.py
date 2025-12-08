@@ -20,12 +20,19 @@
 #
 # DEPENDENCY:
 #   - debug_router
+#   - debug_boot
 #   - boundary_gate.build_input_packet
 #   - pipeline.run_ovv_pipeline_from_boundary
 # ============================================================
 
 import discord
 from discord.ext import commands
+
+# ============================================================
+# [DEBUG BOOT] Debug context を必ず最初に注入
+# ============================================================
+from debug.debug_boot import inject_debug_context
+inject_debug_context()
 
 # Debug router
 from debug.debug_router import route_debug_message
@@ -51,19 +58,19 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_message(message: discord.Message):
 
     # -----------------------------------------
-    # [GATE] Bot 自身のメッセージを無視
+    # [GATE] Bot 自身
     # -----------------------------------------
     if message.author.bot:
         return
 
     # -----------------------------------------
-    # [GATE] Discord system メッセージは除外
+    # [GATE] System メッセージ除外
     # -----------------------------------------
     if getattr(message, "type", discord.MessageType.default) is not discord.MessageType.default:
         return
 
     # -----------------------------------------
-    # [GATE] Debug Router
+    # [GATE] Debug Router (最優先)
     # -----------------------------------------
     handled = await route_debug_message(bot, message)
     if handled:
@@ -77,14 +84,14 @@ async def on_message(message: discord.Message):
         return
 
     # -----------------------------------------
-    # [GATE] Boundary InputPacket 生成
+    # [GATE] BoundaryPacket 生成
     # -----------------------------------------
     boundary_packet = build_input_packet(message)
     if boundary_packet is None:
         return
 
     # -----------------------------------------
-    # [PIPELINE] Boundary → Interface → Core → Stabilizer
+    # [PIPELINE] Main Stream Dispatch
     # -----------------------------------------
     try:
         final_text = run_ovv_pipeline_from_boundary(boundary_packet)
@@ -92,18 +99,18 @@ async def on_message(message: discord.Message):
         final_text = f"Ovv の処理中に予期しないエラーが発生しました: {e}"
 
     # -----------------------------------------
-    # [IO] Discord へ最終出力
+    # [IO] Discord 出力
     # -----------------------------------------
     if final_text:
         await message.channel.send(final_text)
 
 
 # ============================================================
-# [ENTRYPOINT] 起動
+# [ENTRYPOINT]
 # ============================================================
 if __name__ == "__main__":
     import os
 
     TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-    print("=== Booting Discord Ovv ===")
+    print("=== Booting Discord Ovv (BIS v1.1) ===")
     bot.run(TOKEN)
