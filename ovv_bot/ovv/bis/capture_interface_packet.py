@@ -1,110 +1,90 @@
+# ovv/bis/capture_interface_packet.py
 # ============================================================
 # MODULE CONTRACT: BIS / Capture Interface Packet
-# NAME: capture_interface_packet
-# LAYER: BIS-2 (Interface Box 内部ユニット)
-#
 # ROLE:
-#   - Boundary_Gate が生成した InputPacket（境界パケット）を
-#     BIS 内部で扱う「標準パケット(dict)」に変換する唯一のモジュール。
+#   - Boundary_Gate から渡された InputPacket / dict を
+#     BIS 標準 packet(dict) に正規化する。
 #
 # INPUT:
-#   - raw_input: InputPacket
-#       - Boundary_Gate（または ovv.bis.types）で定義された dataclass を想定
+#   - raw_input: InputPacket or dict
 #
 # OUTPUT:
-#   - packet: dict
-#       - BIS 全体で扱う標準構造
+#   - packet: dict (BIS 標準パケット)
 #
-# MUST:
-#   - InputPacket のフィールドを欠損なく dict にマッピングする
-#   - Core, DB, Notion など他レイヤの責務を一切持たない
-#
-# MUST NOT:
-#   - discord.Message を直接扱わない（それは Boundary_Gate の責務）
-#   - LLM 呼び出し・外部 API 呼び出しを行わない
-#   - 永続化や監査ログの書き込みを行わない
-#
-# RESPONSIBILITY TAG:
-#   - Interface Packet Normalizer (InputPacket → BIS Packet)
+# CONSTRAINT:
+#   - Discord の生 I/O はここで完結させ、下層には渡さない。
+#   - Core / external_services への依存は持たない。
 # ============================================================
 
-from dataclasses import asdict, is_dataclass
 from typing import Any, Dict
 
 
-def _to_dict(raw_input: Any) -> Dict[str, Any]:
-    """
-    InputPacket を dict に変換する内部ユーティリティ。
-    - dataclass であれば asdict()
-    - dict であればそのままコピー
-    - それ以外であれば __dict__ をベースに best-effort で変換
-    """
-    if isinstance(raw_input, dict):
-        return dict(raw_input)
-
-    if is_dataclass(raw_input):
-        return asdict(raw_input)
-
-    # 最後の手段として __dict__ を見る（dataclass ではないクラスの互換用）
-    if hasattr(raw_input, "__dict__"):
-        return dict(raw_input.__dict__)
-
-    raise TypeError(
-        f"capture_interface_packet: unsupported raw_input type {type(raw_input)!r}"
-    )
+def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
+    return getattr(obj, name, default)
 
 
-# ------------------------------------------------------------
-# RESPONSIBILITY TAG: Interface Packet Normalizer
-# ------------------------------------------------------------
 def capture_packet(raw_input: Any) -> Dict[str, Any]:
     """
-    Boundary_Gate から渡される InputPacket を、
-    BIS 内部で扱う標準パケット(dict)に正規化する。
-
-    期待するフィールド（InputPacket 側）例:
-      - context_key: int
-      - session_id: str
-      - guild_id: Optional[int]
-      - channel_id: int
-      - thread_id: Optional[int]
-      - author_id: int
-      - author_name: str
-      - text: str
-      - is_task_channel: bool
-      - created_at: str or datetime
-      - attachments_count: int
+    Boundary_Gate の InputPacket もしくは dict から
+    BIS 標準 packet(dict) を生成する。
     """
-    base = _to_dict(raw_input)
 
-    packet: Dict[str, Any] = {
-        # 入力ソース種別（現状は Discord 固定）
-        "source": "discord",
+    # --------------------------------------------------------
+    # ケース1: Boundary_Gate.InputPacket オブジェクト
+    # --------------------------------------------------------
+    if hasattr(raw_input, "raw_message"):
+        # InputPacket の属性
+        context_key = _safe_getattr(raw_input, "context_key")
+        command_type = _safe_getattr(raw_input, "command_type")
+        payload = _safe_getattr(raw_input, "payload")
+        user_meta = _safe_getattr(raw_input, "user_meta")
+        message = _safe_getattr(raw_input, "raw_message")
 
-        # セッション／コンテキスト管理用
-        "context_key": base.get("context_key"),
-        "session_id": base.get("session_id"),
+        # Discord message オブジェクトから必要情報を抽出
+        content = _safe_getattr(message, "content")
+        channel = _safe_getattr(message, "channel")
+        guild = _safe_getattr(message, "guild")
+        author = _safe_getattr(message, "author")
 
-        # Discord 側メタデータ
-        "guild_id": base.get("guild_id"),
-        "channel_id": base.get("channel_id"),
-        "thread_id": base.get("thread_id"),
+        channel_id = _safe_getattr(channel, "id")
+        guild_id = _safe_getattr(guild, "id")
+        user_id = _safe_getattr(author, "id")
+        username = _safe_getattr(author, "name") or _safe_getattr(
+            author, "display_name"
+        )
 
-        "author_id": base.get("author_id"),
-        "author_name": base.get("author_name"),
+        packet: Dict[str, Any] = {
+            # 入力メタ
+            "source": "discord",
+            "context_key": context_key,
+            "command_type": command_type,
+            "payload": payload,
+            "user_meta": user_meta,
+            # Discord 生情報（必要最低限）
+            "raw_content": content,
+            "channel_id": channel_id,
+            "guild_id": guild_id,
+            "user_id": user_id,
+            "username": username,
+        }
+        return packet
 
-        # 実際のテキスト内容（BIS 内では content に統一）
-        "content": base.get("text") or "",
+    # --------------------------------------------------------
+    # ケース2: すでに dict で渡された場合（後方互換用）
+    # --------------------------------------------------------
+    if isinstance(raw_input, dict):
+        packet = dict(raw_input)  # 浅いコピー
+        packet.setdefault("source", "discord")
+        return packet
 
-        # チャンネル属性
-        "is_task_channel": base.get("is_task_channel", False),
-
-        # 付帯情報
-        "created_at": base.get("created_at"),
-        "attachments_count": base.get("attachments_count", 0),
-
-        # デバッグ・トレース用に元の InputPacket を保持
-        "raw": raw_input,
+    # --------------------------------------------------------
+    # フォールバック: 想定外の型
+    # --------------------------------------------------------
+    return {
+        "source": "unknown",
+        "raw_input_repr": repr(raw_input),
+        "context_key": None,
+        "command_type": None,
+        "payload": None,
+        "user_meta": None,
     }
-
-    return packet
