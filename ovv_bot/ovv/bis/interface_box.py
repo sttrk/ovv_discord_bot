@@ -1,69 +1,42 @@
 # ovv/bis/interface_box.py
-# ---------------------------------------------------------------------
-# Interface Box Layer
-# ・InputPacket → Request
-# ・Core I/O（system/user prompt の整流）
-# ・Core 実行
-# ・NotionOps（builders）生成
-# ・Response 構築
-# ---------------------------------------------------------------------
+# Interface Box — BISアーキテクチャの中間層（Boundary → Core の翻訳を担当）
 
+from ovv.external_services.notion.ops.builders import build_notion_ops
 from ovv.core.ovv_core import run_ovv_core
-from external_services.notion.ops.builders import build_notion_ops
-from ovv.bis.stabilizer import Stabilizer
+from .capture_interface_packet import capture_packet
+from .pipeline import build_pipeline
+from .state_manager import StateManager
+from .constraint_filter import apply_constraint_filter
 
 
-class Request:
-    def __init__(self, *, context_key, command_type, payload, user_meta):
-        self.context_key = context_key
-        self.command_type = command_type
-        self.payload = payload
-        self.user_meta = user_meta
+def handle_request(raw_input: dict):
+    """
+    Boundary_Gate から渡された raw_input を受け取り、
+    Ovv Core が扱える packet に変換して実行し、Stabilizer に渡せる形で返す。
+    """
 
+    # 1. Interface Packet の生成
+    packet = capture_packet(raw_input)
 
-def convert_to_request(packet):
-    return Request(
-        context_key=packet.context_key,
-        command_type=packet.command_type,
-        payload=packet.payload,
-        user_meta=packet.user_meta,
-    )
+    # 2. Constraint Filter の適用（入力検査 / 例外化）
+    packet = apply_constraint_filter(packet)
 
+    # 3. Notion Ops（必要であれば pipeline に統合）
+    notion_ops = build_notion_ops()
+    state = StateManager()
 
-def build_system_prompt(request: Request) -> str:
-    return f"""
-You are Ovv — a universal product engineer.
-Command Type: {request.command_type}
-User: {request.user_meta.get('user_name')}
-"""
+    # 4. Core 実行用 pipeline を組み立て
+    pipeline = build_pipeline(core_fn=run_ovv_core, notion_ops=notion_ops, state=state)
 
+    # 5. Core を実行
+    core_result = pipeline(packet)
 
-def build_user_prompt(request: Request) -> str:
-    return f"""
-User Input:
-{request.payload}
-"""
-
-
-async def handle_request(packet):
-    request = convert_to_request(packet)
-
-    system_prompt = build_system_prompt(request)
-    user_prompt = build_user_prompt(request)
-
-    core_output = await run_ovv_core(system_prompt, user_prompt)
-
-    # notion_ops の生成
-    notion_ops = build_notion_ops(core_output, request)
-
-    # Stabilizer に渡すための統合レスポンス
-    stabilizer = Stabilizer(
-        message_for_user=core_output.get("reply", ""),
-        notion_ops=notion_ops,
-        context_key=request.context_key,
-        user_id=request.user_meta.get("user_id"),
-    )
-
+    # 6. Boundary → IFACE → CORE の trace を戻り値に付与（Stabilizer が使う）
     return {
-        "stabilizer": stabilizer,
+        "packet": packet,
+        "core_result": core_result,
+        "trace": {
+            "iface": "interface_box",
+            "pipeline": pipeline.__name__ if hasattr(pipeline, "__name__") else "pipeline",
+        },
     }
