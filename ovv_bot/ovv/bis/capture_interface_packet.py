@@ -13,17 +13,16 @@
 #   - Ovv Core ロジックに干渉しない
 # ============================================================
 
-_last_iface_packet = None
-
-def capture_interface_packet(packet: dict):
+def capture_packet(raw_input: dict):
     """
-    Interface_Box → Core の直前で、最終的な InterfacePacket を一時保存する。
+    Discord Boundary から受け取った raw_input を
+    BIS が扱う Interface Packet に変換する最低限の実装。
+    後で拡張可能。
     """
-    global _last_iface_packet
-    _last_iface_packet = packet
-
-def get_last_interface_packet() -> dict:
-    """
-    debug_commands から参照するためのゲッター。
-    """
-    return _last_iface_packet
+    return {
+        "source": "discord",
+        "raw": raw_input,
+        "command": raw_input.get("command"),
+        "content": raw_input.get("content"),
+        "author_id": raw_input.get("author_id"),
+    }
