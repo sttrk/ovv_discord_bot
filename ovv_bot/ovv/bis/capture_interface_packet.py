@@ -1,6 +1,7 @@
 # ovv/bis/capture_interface_packet.py
 # ============================================================
 # MODULE CONTRACT: BIS / Capture Interface Packet
+#
 # ROLE:
 #   - Boundary_Gate から渡された InputPacket / dict を
 #     BIS 標準 packet(dict) に正規化する。
