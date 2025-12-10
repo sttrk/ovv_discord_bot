@@ -38,6 +38,8 @@ def capture_packet(raw_input: Any) -> Dict[str, Any]:
         command_type = _safe_getattr(raw_input, "command_type")
         payload = _safe_getattr(raw_input, "payload")
         user_meta = _safe_getattr(raw_input, "user_meta")
+        task_id = _safe_getattr(raw_input, "task_id")
+
         message = _safe_getattr(raw_input, "raw_message")
 
         # Discord message オブジェクトから必要情報を抽出
@@ -60,6 +62,7 @@ def capture_packet(raw_input: Any) -> Dict[str, Any]:
             "command_type": command_type,
             "payload": payload,
             "user_meta": user_meta,
+            "task_id": task_id,
             # Discord 生情報（必要最低限）
             "raw_content": content,
             "channel_id": channel_id,
@@ -75,6 +78,8 @@ def capture_packet(raw_input: Any) -> Dict[str, Any]:
     if isinstance(raw_input, dict):
         packet = dict(raw_input)  # 浅いコピー
         packet.setdefault("source", "discord")
+        # Persist v3.0 以降の task_id が dict 側にあればそのまま使う
+        packet.setdefault("task_id", packet.get("task_id"))
         return packet
 
     # --------------------------------------------------------
@@ -87,4 +92,5 @@ def capture_packet(raw_input: Any) -> Dict[str, Any]:
         "command_type": None,
         "payload": None,
         "user_meta": None,
+        "task_id": None,
     }
