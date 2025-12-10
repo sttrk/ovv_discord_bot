@@ -57,7 +57,7 @@ def _extract_message_for_user(core_result: Any) -> str:
 
 
 # ------------------------------------------------------------
-# RESPONSIBILITY TAG: Interface Entry Point
+# RESPONSIBILITY TAG: BIS-INTERFACE-ENTRYPOINT
 # ------------------------------------------------------------
 async def handle_request(raw_input: Any) -> Dict[str, Any]:
     """
@@ -100,7 +100,7 @@ async def handle_request(raw_input: Any) -> Dict[str, Any]:
         notion_ops=notion_ops,
         context_key=packet.get("context_key"),
         user_id=str(packet.get("user_id") or ""),
-        task_id=str(packet.get("task_id") or None),
+        task_id=str(packet.get("task_id") or "") or None,
     )
 
     # 9. 上位（Boundary_Gate）に返却するペイロード
