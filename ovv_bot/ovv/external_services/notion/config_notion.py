@@ -7,7 +7,7 @@ import os
 
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 
-# タスク管理DB（Persist v3.0 と連動）
+# タスク管理DB（Discord タスク = Notion タスク）
 NOTION_TASK_DB_ID = os.getenv("NOTION_TASK_DB_ID")
 
 # 今後の拡張用（Knowledge Base / WBS 等）
