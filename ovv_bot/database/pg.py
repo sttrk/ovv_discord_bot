@@ -1,6 +1,6 @@
-# ============================================================
 # database/pg.py
-# Persist v3.0 仕様完全対応版
+# ============================================================
+# Persist v3.0 仕様完全対応版 + Duration Sync Helper
 # ============================================================
 
 import os
@@ -116,10 +116,16 @@ def insert_task_session_start(task_id: str, user_id: str, started_at: datetime):
 # END SESSION: update ended_at + duration
 # ============================================================
 
-def insert_task_session_end_and_duration(task_id: str, ended_at: datetime):
+def insert_task_session_end_and_duration(task_id: str, ended_at: datetime) -> int | None:
     """
     task_end で呼ばれる。
     SESSION の duration を計算して更新する。
+
+    Returns
+    -------
+    duration_seconds : int | None
+        更新後の duration_seconds を返す。
+        started_at が存在しない場合は None。
     """
 
     # 現在の started_at を取得
@@ -128,7 +134,7 @@ def insert_task_session_end_and_duration(task_id: str, ended_at: datetime):
     """
     rows = _execute(sql_select, (task_id,))
     if not rows or not rows[0].get("started_at"):
-        return  # スタートしていないタスク
+        return None  # スタートしていないタスク
 
     started_at = rows[0]["started_at"]
     duration_seconds = int((ended_at - started_at).total_seconds())
@@ -140,6 +146,8 @@ def insert_task_session_end_and_duration(task_id: str, ended_at: datetime):
         WHERE task_id = %s;
     """
     _execute(sql_update, (ended_at, duration_seconds, task_id))
+
+    return duration_seconds
 
 
 # 初回ロード時にテーブルを作成
