@@ -1,91 +1,134 @@
 # ovv/bis/interface_box.py
-"""
-Interface_Box
-Boundary_Gate から受け取った InputPacket を Core に渡し、
-Core の出力を Stabilizer に転送する中間レイヤ。
+# ============================================================
+# MODULE CONTRACT: BIS / Interface_Box v3.3
+#
+# ROLE:
+#   - Boundary_Gate が構築した envelope(dict) を受け取り、
+#     Core → NotionOps Builder → Stabilizer のパイプラインを構築する。
+#
+# INPUT:
+#   envelope: dict
+#       {
+#           "command_type": str,
+#           "raw_text": str,
+#           "arg_text": str,
+#           "context_key": str,
+#           "user_id": str,
+#       }
+#
+# OUTPUT:
+#   str（Discord に返すメッセージ）
+#
+# CONSTRAINTS:
+#   - Core / Stabilizer とは一方向参照のみ
+#   - Persist / Notion へは Stabilizer 経由でのみ触る
+#   - task_id = context_key（TEXT）で統一
+# ============================================================
 
-責務：
-- 入力の正規化（軽度）
-- task_id / user_meta の受け渡し
-- Core との I/O 接続
-- Stabilizer へのブリッジ
+from __future__ import annotations
 
-禁止事項：
-- Core ロジックの混入
-- Notion API への直接アクセス
-- DB 永続化ロジックの混入
-"""
-
-from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from ovv.core.ovv_core import run_core
+from ovv.external_services.notion.ops.builders import build_notion_ops
 from .stabilizer import Stabilizer
 
 
-# ------------------------------------------------------------
-# InputPacket（BIS 正式仕様）
-# ------------------------------------------------------------
+# ============================================================
+# Public entry
+# ============================================================
 
-@dataclass
-class InputPacket:
-    context_key: str                # Discord thread_id
-    user_input: str                 # ユーザーのメッセージ内容（正規化後）
-    task_id: Optional[str] = None   # Persist v3.0 用 task_id
-    user_meta: Dict[str, Any] = field(default_factory=dict)
-    raw_event: Any = None           # Boundary の生イベント（監査用に保持）
-
-
-# ------------------------------------------------------------
-# Packet Builder（Boundary_Gate から呼ばれる）
-# ------------------------------------------------------------
-
-def capture_interface_packet(context_key: str,
-                             user_input: str,
-                             task_id: Optional[str],
-                             user_meta: Dict[str, Any],
-                             raw_event: Any = None) -> InputPacket:
+async def handle_request(envelope: Dict[str, Any]) -> str:
     """
-    Boundary_Gate → Interface_Box の入口。
-    BIS InputPacket を生成する。
+    Boundary_Gate から渡された envelope(dict) を処理し、
+    Core → Stabilizer → 最終出力 を構築する。
     """
-    return InputPacket(
+
+    # --------------------------------------------------------
+    # 1. envelope 正規化
+    # --------------------------------------------------------
+    command_type = envelope.get("command_type", "free_chat")
+    raw_text = envelope.get("raw_text", "")
+    arg_text = envelope.get("arg_text", "")
+
+    context_key = envelope.get("context_key")
+    user_id = envelope.get("user_id")
+
+    # task_id は context_key と同義（TEXT）
+    task_id = str(context_key) if context_key is not None else None
+
+    # --------------------------------------------------------
+    # 2. Core に委譲（すべての意思決定は Core）
+    # --------------------------------------------------------
+    core_input = {
+        "command_type": command_type,
+        "raw_text": raw_text,
+        "arg_text": arg_text,
+        "task_id": task_id,
+        "context_key": context_key,
+        "user_id": user_id,
+    }
+
+    core_output: Dict[str, Any] = run_core(core_input)
+
+    # Core 出力例：
+    # {
+    #   "message_for_user": "Task started.",
+    #   "mode": "task_start",   ← builders.py で op に変換するキー
+    #   ...
+    # }
+
+    message_for_user: str = core_output.get("message_for_user", "")
+
+    # --------------------------------------------------------
+    # 3. NotionOps Builder
+    # --------------------------------------------------------
+    notion_ops = build_notion_ops(core_output, request=_EnvelopeProxy(envelope))
+
+    # --------------------------------------------------------
+    # 4. Stabilizer（Persist + NotionOps + Final Message）
+    # --------------------------------------------------------
+    stabilizer = Stabilizer(
+        message_for_user=message_for_user,
+        notion_ops=notion_ops,
         context_key=context_key,
-        user_input=user_input,
+        user_id=user_id,
         task_id=task_id,
-        user_meta=user_meta or {},
-        raw_event=raw_event,
+        command_type=core_output.get("mode"),
+        core_output=core_output,
+        thread_state=None,   # 将来 ThreadBrain 実装時に使用
     )
 
+    final_message = await stabilizer.finalize()
+    return final_message
 
+
+# ============================================================
+# Envelope Proxy for NotionOps Builder
 # ------------------------------------------------------------
-# メイン処理
-# ------------------------------------------------------------
+# build_notion_ops は request.task_id / request.user_meta を参照するため
+# envelope(dict) を最低限の属性があるオブジェクト化する。
+# ============================================================
 
-async def handle_request(packet: InputPacket) -> Dict[str, Any]:
+class _EnvelopeProxy:
     """
-    Interface_Box の中心メソッド。
-    Core へ packet を渡し、戻り値を Stabilizer に送る。
-
-    戻り値：
-        dict（Stabilizer が整形した Discord 向け最終レスポンス）
+    builders.py の request 引数に対応する最低限の Proxy。
+    - .task_id
+    - .user_meta
     """
 
-    # 1) Core 実行（同期 or 非同期は Core 内で吸収）
-    core_result = run_core(
-        context_key=packet.context_key,
-        user_input=packet.user_input,
-        task_id=packet.task_id,
-        user_meta=packet.user_meta,
-    )
+    def __init__(self, envelope: Dict[str, Any]):
+        self._envelope = envelope
 
-    # 2) Stabilizer に転送
-    stabilizer = Stabilizer()
-    final_output = await stabilizer.process(
-        context_key=packet.context_key,
-        core_output=core_result,
-        user_id=packet.user_meta.get("user_id"),
-        task_id=packet.task_id,
-    )
+        # task_id = context_key
+        self.task_id = str(envelope.get("context_key")) if envelope.get("context_key") else None
 
-    return final_output
+        # user_meta を最低限生成
+        user_id = envelope.get("user_id")
+        self.user_meta = {
+            "user_id": user_id,
+            "user_name": user_id,  # Discord ユーザー名を渡したい場合はここで変更可能
+        }
+
+    def __repr__(self):
+        return f"<EnvelopeProxy task_id={self.task_id}>"
