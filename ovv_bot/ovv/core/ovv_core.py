@@ -10,7 +10,8 @@ Core は BIS packet(dict) を受け取り、BIS 標準 CoreOutput(dict) を返�
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Literal, TypedDict
+
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 
 # ============================================================
@@ -21,17 +22,20 @@ ModeLiteral = Literal["free_chat", "task_create", "task_start", "task_end"]
 
 
 class CoreInput(TypedDict, total=False):
-    packet: Dict[str, Any]          # BIS packet
-    input_packet: Dict[str, Any]    # pipeline 互換
-    notion_ops: Any
-    state: Dict[str, Any]
+    """pipeline → Core に渡される入力ペイロード"""
+
+    input_packet: Dict[str, Any]      # BIS packet
+    notion_ops: Any                   # ここでは使わない（将来拡張用）
+    state: Dict[str, Any]             # thread-state（dict 想定）
 
 
 class CoreOutput(TypedDict, total=False):
+    """Interface_Box / Stabilizer が受け取る標準 Core 出力"""
+
     ok: bool
     message_for_user: str
-    notion_ops: Any
-    core_mode: str
+    notion_ops: Any                   # Core では None 固定（NotionOps builder が担当）
+    core_mode: str                    # 実際に処理したモード名（command_type ベース）
     new_state: Dict[str, Any]
     debug_log: List[str]
 
@@ -42,92 +46,102 @@ class CoreOutput(TypedDict, total=False):
 
 def run_ovv_core(core_payload: Dict[str, Any]) -> CoreOutput:
     """
-    Interface_Box → Pipeline → ここ（Core）という流れで呼ばれる。
+    Interface_Box → Pipeline → Core という流れで呼ばれる唯一の入口。
 
     期待される core_payload:
       {
-        "input_packet": BIS packet(dict),
+        "input_packet": <BIS packet dict>,
         "notion_ops": None,
-        "state": StateManager
+        "state": <thread-state dict or None>,
       }
-
-    Core の責務:
-      - command_type に応じた最低限の処理
-      - message_for_user の生成
-      - new_state の返却
-      - notion_ops は builder に任せる前提なのでここでは生成しない
     """
 
     debug: List[str] = ["[core] enter run_ovv_core"]
 
-    packet = core_payload.get("input_packet", {})
-    state = core_payload.get("state") or {}
+    packet: Dict[str, Any] = core_payload.get("input_packet") or {}
+    state: Dict[str, Any] = core_payload.get("state") or {}
 
-    command_type: str = packet.get("command_type", "free_chat")
-    user_message: str = packet.get("raw_content") or ""
-    task_id: str | None = packet.get("task_id")
+    command_type: str = str(packet.get("command_type") or "free_chat")
+    user_message: str = str(packet.get("raw_content") or "")
+    task_id: Optional[str] = packet.get("task_id")
 
     debug.append(f"[core] command_type = {command_type}")
-    debug.append(f"[core] user_message = {user_message}")
+    debug.append(f"[core] user_message_len = {len(user_message)}")
     debug.append(f"[core] task_id = {task_id}")
 
-    # ------------------------------------------------------------
-    # モード分岐
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # モード分岐（command_type ベース）
+    # --------------------------------------------------------
     if command_type == "free_chat":
         return _core_free_chat(user_message, state, debug)
 
-    elif command_type == "task_create":
+    if command_type == "task_create":
         return _core_task_create(user_message, state, debug)
 
-    elif command_type == "task_start":
+    if command_type == "task_start":
         return _core_task_start(state, debug)
 
-    elif command_type == "task_end":
+    if command_type == "task_end":
         return _core_task_end(state, debug)
 
-    # フォールバック（未知モード）
-    debug.append("[core] unknown mode fallback")
+    # 未知のコマンド種別はフォールバック
+    debug.append("[core] unknown command_type fallback")
+
     return {
         "ok": False,
-        "message_for_user": "内部エラー: 未知のコマンド種別を受信しました。",
-        "new_state": state,
+        "message_for_user": (
+            "内部エラー: 未知のコマンド種別を受信しました。\n"
+            "開発者に 'unknown_core_command_type' と伝えてください。"
+        ),
         "notion_ops": None,
         "core_mode": command_type,
+        "new_state": state,
         "debug_log": debug,
     }
+
+
+# 旧呼び出し互換（念のため）
+call_core = run_ovv_core
+run_core = run_ovv_core
 
 
 # ============================================================
 # モード別ハンドラ
 # ============================================================
 
-def _core_free_chat(message: str, state: Dict[str, Any], debug: List[str]) -> CoreOutput:
-    debug.append("[core.free_chat]")
+def _core_free_chat(
+    message: str,
+    state: Dict[str, Any],
+    debug: List[str],
+) -> CoreOutput:
+    debug.append("[core.free_chat] entered")
 
     new_state = dict(state)
     new_state["last_message"] = message
 
-    # Echo（最小応答）
     reply = message if message else "メッセージを受信しました。"
 
     return {
         "ok": True,
         "message_for_user": reply,
-        "new_state": new_state,
         "notion_ops": None,
         "core_mode": "free_chat",
+        "new_state": new_state,
         "debug_log": debug,
     }
 
 
-def _core_task_create(message: str, state: Dict[str, Any], debug: List[str]) -> CoreOutput:
-    debug.append("[core.task_create]")
+def _core_task_create(
+    message: str,
+    state: Dict[str, Any],
+    debug: List[str],
+) -> CoreOutput:
+    debug.append("[core.task_create] entered")
 
-    # ここでは NotionOps を Core で生成しない
-    # builder 側の fallback が title → create_task op を構築する
+    # Core では NotionOps を生成しない。タイトルだけ決めておき、
+    # builders.build_notion_ops 側のフォールバックで create_task を組み立てる想定。
+    title = message.strip() or "(無題タスク)"
 
-    title = message or "(無題タスク)"
     reply = f"タスクを作成します: {title}"
 
     new_state = dict(state)
@@ -136,17 +150,20 @@ def _core_task_create(message: str, state: Dict[str, Any], debug: List[str]) -> 
     return {
         "ok": True,
         "message_for_user": reply,
-        "new_state": new_state,
         "notion_ops": None,
         "core_mode": "task_create",
+        "new_state": new_state,
         "debug_log": debug,
     }
 
 
-def _core_task_start(state: Dict[str, Any], debug: List[str]) -> CoreOutput:
-    debug.append("[core.task_start]")
+def _core_task_start(
+    state: Dict[str, Any],
+    debug: List[str],
+) -> CoreOutput:
+    debug.append("[core.task_start] entered")
 
-    # Persist v3.0 の session_start は Stabilizer が行う
+    # 実際の Persist（session_start）は Stabilizer 側が担当
     reply = "タスクを開始しました。"
 
     new_state = dict(state)
@@ -155,15 +172,18 @@ def _core_task_start(state: Dict[str, Any], debug: List[str]) -> CoreOutput:
     return {
         "ok": True,
         "message_for_user": reply,
-        "new_state": new_state,
         "notion_ops": None,
         "core_mode": "task_start",
+        "new_state": new_state,
         "debug_log": debug,
     }
 
 
-def _core_task_end(state: Dict[str, Any], debug: List[str]) -> CoreOutput:
-    debug.append("[core.task_end]")
+def _core_task_end(
+    state: Dict[str, Any],
+    debug: List[str],
+) -> CoreOutput:
+    debug.append("[core.task_end] entered")
 
     reply = "タスクを終了しました。"
 
@@ -173,8 +193,8 @@ def _core_task_end(state: Dict[str, Any], debug: List[str]) -> CoreOutput:
     return {
         "ok": True,
         "message_for_user": reply,
-        "new_state": new_state,
         "notion_ops": None,
         "core_mode": "task_end",
+        "new_state": new_state,
         "debug_log": debug,
     }
