@@ -1,126 +1,132 @@
-# ovv/external_services/notion/ops/executor.py
-from typing import Any, Dict, List, Optional
+"""
+NotionOps Executor
+Notion DB に書き込みを行う唯一の層。
+"""
 
-from notion_client import Client
+from typing import Dict, Any, Optional
 
-from config_notion import NOTION_API_KEY, NOTION_TASK_DB_ID
+from ..notion_client import get_notion_client
+from ..config_notion import NOTION_TASK_DB_ID
 
-notion = Client(auth=NOTION_API_KEY)
 
-
-async def execute_notion_ops(
-    ops: List[Dict[str, Any]],
-    context_key: Optional[str] = None,
-    user_id: Optional[str] = None,
-) -> None:
+# ------------------------------------------------------------
+# Public entry
+# ------------------------------------------------------------
+async def execute_notion_ops(ops: Dict[str, Any], context_key: str, user_id: str):
     """
-    NotionOps 実行エントリポイント。
-
-    ops 例:
-      - {"type": "create_task", "payload": {...}}
-      - {"type": "update_task_status", "task_id": "...", "status": "..."}
-      - {"type": "update_task_duration", "task_id": "...", "duration_seconds": 123}
+    NotionOps(dict) を Notion API に適用する。
+    Core / BIS からはここだけ呼ばれる。
     """
-    if not ops:
+
+    notion = get_notion_client()
+    if notion is None:
+        print("[NotionOps] Notion client is None → Skipped.")
         return
 
-    for op in ops:
-        if not isinstance(op, dict):
-            continue
+    if NOTION_TASK_DB_ID is None:
+        print("[NotionOps] NOTION_TASK_DB_ID missing → Skip all task ops.")
+        return
 
-        op_type = op.get("type")
+    op = ops.get("op")
 
-        try:
-            if op_type == "create_task":
-                await _op_create_task(op)
-            elif op_type == "update_task_status":
-                await _op_update_task_status(op)
-            elif op_type == "update_task_duration":
-                await _op_update_task_duration(op)
-            else:
-                print("[NotionOps] unknown op type:", op_type)
-        except Exception as e:
-            # ここでは落とさずログだけ
-            print("[NotionOps] error executing op:", op_type, repr(e))
+    if op == "task_create":
+        await _create_task_item(notion, ops)
+
+    elif op == "task_start":
+        await _update_task_status(notion, ops, status="in_progress")
+
+    elif op == "task_end":
+        await _update_task_status(notion, ops, status="completed")
+
+    else:
+        print(f"[NotionOps] Unknown op: {op}")
 
 
 # ------------------------------------------------------------
-# Helper: Task Page 検索
+# Task DB operations
 # ------------------------------------------------------------
 
-def _find_task_page_id_by_task_id(task_id: str) -> Optional[str]:
+async def _create_task_item(notion, ops: Dict[str, Any]):
+    task_id = ops["task_id"]
+    created_by = ops["created_by"]
+    msg = ops.get("core_message", "")
+
+    try:
+        notion.pages.create(
+            parent={"database_id": NOTION_TASK_DB_ID},
+            properties={
+                "task_id": {"rich_text": [{"text": {"content": task_id}}]},
+                "name": {"title": [{"text": {"content": f"Task {task_id}"}}]},
+                "status": {"select": {"name": "not_started"}},
+                "created_by": {"rich_text": [{"text": {"content": created_by}}]},
+                "created_at": {"date": {"start": _now()}},
+                "message": {"rich_text": [{"text": {"content": msg}}]},
+            }
+        )
+        print(f"[NotionOps] task_create {task_id}")
+
+    except Exception as e:
+        print("[NotionOps] create_task_item error:", repr(e))
+
+
+async def _update_task_status(notion, ops: Dict[str, Any], status: str):
     """
-    Notion TaskDB 内で、task_id プロパティが一致するページIDを返す。
-    - TaskDB のプロパティキーは "task_id" を想定。
+    status ∈ {"not_started", "in_progress", "completed"}
     """
-    resp = notion.databases.query(
-        database_id=NOTION_TASK_DB_ID,
-        filter={
-            "property": "task_id",
-            "rich_text": {"equals": task_id},
-        },
-        page_size=1,
-    )
-    results = resp.get("results") or []
-    if not results:
+
+    task_id = ops["task_id"]
+
+    # Notion の item を task_id で検索
+    page = _find_page_by_task_id(notion, task_id)
+    if page is None:
+        print(f"[NotionOps] Task not found in DB → {task_id}")
+        return
+
+    page_id = page["id"]
+
+    try:
+        notion.pages.update(
+            page_id,
+            properties={
+                "status": {"select": {"name": status}},
+            }
+        )
+        print(f"[NotionOps] task_status_update {task_id} → {status}")
+
+    except Exception as e:
+        print("[NotionOps] update_task_status error:", repr(e))
+
+
+# ------------------------------------------------------------
+# Helper: Notion finder
+# ------------------------------------------------------------
+
+def _find_page_by_task_id(notion, task_id: str):
+    """
+    task_id プロパティで一致する Notion ページを検索する。
+    """
+    try:
+        result = notion.databases.query(
+            **{
+                "database_id": NOTION_TASK_DB_ID,
+                "filter": {
+                    "property": "task_id",
+                    "rich_text": {"equals": task_id},
+                },
+            }
+        )
+        results = result.get("results", [])
+        return results[0] if results else None
+
+    except Exception as e:
+        print("[NotionOps] find_page_by_task_id error:", repr(e))
         return None
-    return results[0]["id"]
 
 
 # ------------------------------------------------------------
-# OP: update_task_duration
+# Utils
 # ------------------------------------------------------------
+from datetime import datetime, timezone
 
-async def _op_update_task_duration(op: Dict[str, Any]) -> None:
-    """
-    duration_seconds を Notion TaskDB の duration_time プロパティに同期する。
-    """
-    task_id = op.get("task_id")
-    duration_seconds = op.get("duration_seconds")
-
-    if not task_id or duration_seconds is None:
-        return
-
-    page_id = _find_task_page_id_by_task_id(str(task_id))
-    if not page_id:
-        print("[NotionOps] task page not found for task_id:", task_id)
-        return
-
-    # duration_time は「数値プロパティ」として定義している想定
-    notion.pages.update(
-        page_id=page_id,
-        properties={
-            "duration_time": {
-                "number": int(duration_seconds),
-            }
-        },
-    )
-
-
-# ------------------------------------------------------------
-# 既存の create_task / update_task_status などはそのまま
-# ------------------------------------------------------------
-
-async def _op_create_task(op: Dict[str, Any]) -> None:
-    # ここは既存実装を残す想定
-    payload = op.get("payload") or {}
-    notion.pages.create(
-        parent={"database_id": NOTION_TASK_DB_ID},
-        properties=payload,
-    )
-
-
-async def _op_update_task_status(op: Dict[str, Any]) -> None:
-    page_id = op.get("page_id")
-    status = op.get("status")
-    if not page_id or not status:
-        return
-
-    notion.pages.update(
-        page_id=page_id,
-        properties={
-            "status": {
-                "status": {"name": status},
-            }
-        },
-    )
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
