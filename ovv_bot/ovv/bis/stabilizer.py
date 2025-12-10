@@ -1,22 +1,22 @@
 # ovv/bis/stabilizer.py
 # ============================================================
-# MODULE CONTRACT: BIS / Stabilizer
+# MODULE CONTRACT: BIS / Stabilizer v3.2
 #
 # ROLE:
 #   - Core / NotionOps / Persist を束ね、最終的に Discord に返す文字列を確定する。
 #   - NotionOps（外部サービス）を実行する。
 #   - Persist v3.0（task_session / task_log）への書き込み起点となる。
+#   - task_end 時に、PG 側で計算した duration_seconds を Notion TaskDB に同期する。
 #
 # INPUT:
 #   - message_for_user : str
-#   - notion_ops       : dict | None
+#   - notion_ops       : dict | list[dict] | None
 #   - context_key      : str | None
 #   - user_id          : str | None
 #   - task_id          : str | None   # Persist v3.0 の主キー（thread_id ベース TEXT）
 #   - command_type     : str | None   # "task_create" / "task_start" / "task_end" / "free_chat" 等
-#   - core_output      : dict | None  # Core v2.0 の生出力（dbg_flow 用）
-#   - thread_state     : dict | None  # StateManager.get(...) の戻り値（dbg_flow 用）
-#   - packet           : dict | None  # BIS 標準パケット（dbg_flow 用）
+#   - core_output      : dict | None  # Core v2.0 の生出力（将来拡張用）
+#   - thread_state     : dict | None  # StateManager が保持していた thread-state（将来拡張用）
 #
 # OUTPUT:
 #   - str（Discord に返す最終メッセージ）
@@ -27,7 +27,7 @@
 #   - task_id は TEXT として扱い、数値への変換・丸め込みを行わない。
 # ============================================================
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import datetime
 
 from ovv.external_services.notion.ops.executor import execute_notion_ops
@@ -44,61 +44,58 @@ class Stabilizer:
 
     責務:
       - Discord に返すメッセージを確定する
-      - NotionOps を実行する（副作用）
       - Persist v3.0（task_session / task_log）への書き込みを行う
-
-    Persist 書き込み方針:
-      - task_id を TEXT としてそのまま保持する（丸め込み禁止）
-      - command_type に応じて task_session / task_log の挙動を分岐する
-
-    dbg_flow:
-      - コマンド "!dbg_flow" が来た場合は、Notion / Persist を一切叩かず、
-        packet / core_output / thread_state などの内部状態をまとめて返す。
+      - NotionOps を実行する（副作用）
+      - task_end 時に duration_seconds を Notion に同期する
     """
 
     def __init__(
         self,
         message_for_user: str,
-        notion_ops: Optional[Dict[str, Any]],
+        notion_ops: Optional[Any],
         context_key: Optional[str],
         user_id: Optional[str],
         task_id: Optional[str] = None,
         command_type: Optional[str] = None,
         core_output: Optional[Dict[str, Any]] = None,
         thread_state: Optional[Dict[str, Any]] = None,
-        packet: Optional[Dict[str, Any]] = None,
     ):
-        self.message_for_user = message_for_user
-        self.notion_ops = notion_ops
+        self.message_for_user = message_for_user or ""
+        self.notion_ops: List[Dict[str, Any]] = self._normalize_ops(notion_ops)
         self.context_key = context_key
         self.user_id = user_id
         # task_id は TEXT として扱う（DB 側も TEXT 前提）
         self.task_id = str(task_id) if task_id is not None else None
         self.command_type = command_type
 
-        # dbg_flow 用内部情報
+        # 将来拡張用（今はほぼ保持のみ）
         self.core_output = core_output or {}
         self.thread_state = thread_state or {}
-        self.packet = packet or {}
+
+        # Persist 実行結果としての duration_seconds（task_end のみ）
+        self._last_duration_seconds: Optional[int] = None
 
     # ------------------------------------------------------------
-    # Internal: 判定系
+    # Internal: NotionOps 正規化
     # ------------------------------------------------------------
-    def _is_debug_flow(self) -> bool:
+    @staticmethod
+    def _normalize_ops(raw: Any) -> List[Dict[str, Any]]:
         """
-        dbg_flow コマンドかどうかを判定する。
-
-        優先順:
-          1. command_type == "dbg_flow"
-          2. message_for_user が "!dbg_flow"（Core がエコーしているケース）
+        notion_ops の型ゆれを吸収して list[dict] に正規化する。
+        - None → []
+        - dict → [dict]
+        - list[dict] → そのまま
+        それ以外は捨てる（ログのみ）。
         """
-        if self.command_type == "dbg_flow":
-            return True
-
-        if isinstance(self.message_for_user, str) and self.message_for_user.strip() == "!dbg_flow":
-            return True
-
-        return False
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            # dict 以外が混じっていた場合はフィルタ
+            return [op for op in raw if isinstance(op, dict)]
+        if isinstance(raw, dict):
+            return [raw]
+        print("[Stabilizer] unexpected notion_ops type:", type(raw))
+        return []
 
     # ------------------------------------------------------------
     # Internal: Persist Writer
@@ -109,8 +106,8 @@ class Stabilizer:
 
         - task_log : すべてのコマンドで 1 レコード追記
         - task_session :
-            - task_start : セッション開始（なければ INSERT / あれば更新ポリシーは pg 側）
-            - task_end   : セッション終了 + duration 更新
+            - task_start : セッション開始（なければ INSERT / あれば更新）
+            - task_end   : セッション終了 + duration_seconds 更新
         """
 
         if not self.task_id:
@@ -137,62 +134,46 @@ class Stabilizer:
             )
 
         elif self.command_type == "task_end":
-            insert_task_session_end_and_duration(
+            # duration_seconds を計算 → 保持（Notion 同期用）
+            self._last_duration_seconds = insert_task_session_end_and_duration(
                 task_id=self.task_id,
                 ended_at=now,
             )
 
-        # "task_create" / "free_chat" / その他 は session の開始・終了は変更しない
+        # "task_create" / "free_chat" 等は session の開始・終了は変更しない
         # （log のみ残す）
 
     # ------------------------------------------------------------
-    # Internal: dbg_flow 用フォーマッタ
+    # Internal: NotionOps 拡張（duration 同期）
     # ------------------------------------------------------------
-    @staticmethod
-    def _short_repr(value: Any, max_len: int = 700) -> str:
+    def _augment_notion_ops_with_duration(self) -> List[Dict[str, Any]]:
         """
-        repr を安全に縮約する。Discord 2000 文字制限対策。
+        task_end かつ duration_seconds が取れている場合、
+        Notion TaskDB の duration_time を更新するための ops を追加する。
+
+        形式（例）:
+            {
+                "type": "update_task_duration",
+                "task_id": "<thread_id as text>",
+                "duration_seconds": 1234,
+            }
         """
-        try:
-            text = repr(value)
-        except Exception:
-            text = str(value)
+        ops: List[Dict[str, Any]] = list(self.notion_ops)
 
-        if len(text) > max_len:
-            return text[:max_len] + "... (truncated)"
+        if (
+            self.command_type == "task_end"
+            and self.task_id
+            and self._last_duration_seconds is not None
+        ):
+            ops.append(
+                {
+                    "type": "update_task_duration",
+                    "task_id": self.task_id,
+                    "duration_seconds": self._last_duration_seconds,
+                }
+            )
 
-        return text
-
-    def _format_debug_flow(self) -> str:
-        """
-        dbg_flow 用の最終メッセージを構築する。
-
-        - packet
-        - core_output
-        - thread_state
-        をまとめて、人間が読める形で返す。
-        """
-        lines = []
-
-        lines.append("[dbg_flow] packet:")
-        lines.append(self._short_repr(self.packet))
-        lines.append("")
-
-        lines.append("[dbg_flow] core_output:")
-        lines.append(self._short_repr(self.core_output))
-        lines.append("")
-
-        lines.append("[dbg_flow] thread_state:")
-        lines.append(self._short_repr(self.thread_state))
-        lines.append("")
-
-        text = "\n".join(lines)
-
-        # Discord の 2000 文字制限に収まるよう、最後に全体をトリム
-        if len(text) > 1900:
-            text = text[:1900] + "\n... (overall truncated)"
-
-        return text
+        return ops
 
     # ------------------------------------------------------------
     # FINALIZER
@@ -201,33 +182,25 @@ class Stabilizer:
         """
         Final 出力フェーズ。
 
-        dbg_flow の場合:
-          - NotionOps 実行なし
-          - Persist 書き込みなし
-          - 内部状態ダンプを返す
-
-        通常の場合:
-          1. NotionOps 実行
-          2. Persist v3.0 書き込み
-          3. Discord に返す文字列を返却
+        新しい順序:
+          1. Persist v3.0 書き込み（task_log / task_session / duration_seconds）
+          2. duration_seconds を含んだ NotionOps を構築
+          3. NotionOps 実行
+          4. Discord に返す文字列を返却
         """
 
-        # ---------- dbg_flow (先に判定して早期 return) ----------
-        if self._is_debug_flow():
-            return self._format_debug_flow()
+        # ---------- 1. Persist 書き込み（同期） ----------
+        # psycopg2 ベースのため、現状は同期 I/O として呼び出す。
+        self._write_persist()
 
-        # ---------- 1. NotionOps ----------
-        if self.notion_ops:
+        # ---------- 2. NotionOps（duration 同期込み） ----------
+        notion_ops = self._augment_notion_ops_with_duration()
+        if notion_ops:
             await execute_notion_ops(
-                self.notion_ops,
+                notion_ops,
                 context_key=self.context_key,
                 user_id=self.user_id,
             )
-
-        # ---------- 2. Persist 書き込み（同期） ----------
-        # psycopg2 ベースのため、現状は同期 I/O として呼び出す。
-        # トラフィック / 負荷的に問題が出る場合は、将来 to_thread 化などで非同期化する。
-        self._write_persist()
 
         # ---------- 3. Discord に返す文字列 ----------
         return self.message_for_user
