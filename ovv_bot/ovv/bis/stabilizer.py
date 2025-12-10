@@ -1,3 +1,4 @@
+# ovv/bis/stabilizer.py
 # ============================================================
 # MODULE CONTRACT: BIS / Stabilizer
 #
@@ -11,14 +12,16 @@
 #   - notion_ops       : dict | None
 #   - context_key      : str | None
 #   - user_id          : str | None
-#   - task_id          : str | None   # Persist v3.0 の主キー（thread_id）
+#   - task_id          : str | None   # Persist v3.0 の主キー（thread_id ベース TEXT）
+#   - command_type     : str | None   # "task_create" / "task_start" / "task_end" / "free_chat" 等
 #
 # OUTPUT:
 #   - str（Discord に返す最終メッセージ）
 #
 # CONSTRAINT:
-#   - Discord API を直接叩かない。
-#   - Core / Boundary_Gate / Interface_Box へ逆参照しない。
+#   - Discord API を直接叩かない（呼び出し元が行う）。
+#   - Core / Boundary_Gate / Interface_Box を逆参照しない。
+#   - task_id は TEXT として扱い、数値への変換・丸め込みを行わない。
 # ============================================================
 
 from typing import Any, Dict, Optional
@@ -42,8 +45,8 @@ class Stabilizer:
       - Persist v3.0（task_session / task_log）への書き込みを行う
 
     Persist 書き込み方針:
-      - task_id を TEXT としてそのまま保つ（丸め込み禁止）
-      - コマンド種別により task_session / task_log の振る舞いを分岐
+      - task_id を TEXT としてそのまま保持する（丸め込み禁止）
+      - command_type に応じて task_session / task_log の挙動を分岐する
     """
 
     def __init__(
@@ -53,52 +56,60 @@ class Stabilizer:
         context_key: Optional[str],
         user_id: Optional[str],
         task_id: Optional[str] = None,
+        command_type: Optional[str] = None,
     ):
         self.message_for_user = message_for_user
         self.notion_ops = notion_ops
         self.context_key = context_key
         self.user_id = user_id
-        self.task_id = task_id  # Persist v3.0 のキー（thread_id ベース TEXT）
+        # task_id は TEXT として扱う（DB 側も TEXT 前提）
+        self.task_id = str(task_id) if task_id is not None else None
+        self.command_type = command_type
 
     # ------------------------------------------------------------
     # Internal: Persist Writer
     # ------------------------------------------------------------
-    async def _write_persist(self, command_type: Optional[str]):
+    def _write_persist(self) -> None:
         """
         Persist v3.0 書き込みユニット。
-        Boundary_Gate → InterfaceBox → Stabilizer で渡された情報を元に、
-        task_session / task_log を更新する。
+
+        - task_log : すべてのコマンドで 1 レコード追記
+        - task_session :
+            - task_start : セッション開始（なければ INSERT / あれば更新ポリシーは pg 側）
+            - task_end   : セッション終了 + duration 更新
         """
 
         if not self.task_id:
-            # スレッド外（DM や guild チャット）では Persist 書き込みを行わない
+            # スレッド外（DM や guild 共通チャンネル等）では Persist 書き込みを行わない
             return
 
         now = datetime.datetime.utcnow()
+        event_type = self.command_type or "unknown"
 
-        # task_log（全コマンド共通）
-        await insert_task_log(
+        # --- task_log 追記 ---
+        insert_task_log(
             task_id=self.task_id,
-            event_type=command_type or "unknown",
+            event_type=event_type,
             content=self.message_for_user or "",
             created_at=now,
         )
 
-        # task_session（開始・終了のみ）
-        if command_type == "task_start":
-            await insert_task_session_start(
+        # --- task_session 更新 ---
+        if self.command_type == "task_start":
+            insert_task_session_start(
                 task_id=self.task_id,
                 user_id=self.user_id,
                 started_at=now,
             )
 
-        elif command_type == "task_end":
-            await insert_task_session_end_and_duration(
+        elif self.command_type == "task_end":
+            insert_task_session_end_and_duration(
                 task_id=self.task_id,
                 ended_at=now,
             )
 
-        # free_chat / task_create は session を変更しない（log のみ）
+        # "task_create" / "free_chat" 等は session の開始・終了は変更しない
+        # （log のみ残す）
 
     # ------------------------------------------------------------
     # FINALIZER
@@ -121,16 +132,10 @@ class Stabilizer:
                 user_id=self.user_id,
             )
 
-        # ---------- 2. Persist 書き込み ----------
-        # context_key には command_type が含まれていないため、
-        # InterfaceBox の packet から command_type を取得し Stabilizer 初期化時に渡すよう仕様化するか？
-        # 現行設計では Stabilizer に command_type が渡っていないため、改修が必要。
-        #
-        # Persist v3.0 を正しく動作させるため、Stabilizer に command_type を追加で渡す必要がある。
-        # 一時措置として context_key からは判別できないため "free_chat" として扱う。
-        # 次ステップで InterfaceBox → Stabilizer に command_type を正式追加する。
-
-        await self._write_persist(command_type="free_chat")
+        # ---------- 2. Persist 書き込み（同期） ----------
+        # psycopg2 ベースのため、現状は同期 I/O として呼び出す。
+        # トラフィック / 負荷的に問題が出る場合は、将来 to_thread 化などで非同期化する。
+        self._write_persist()
 
         # ---------- 3. Discord に返す文字列 ----------
         return self.message_for_user
