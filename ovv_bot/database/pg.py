@@ -1,255 +1,149 @@
+# ============================================================
 # database/pg.py
+# Persist v3.0 仕様完全対応版
 # ============================================================
-# [MODULE CONTRACT]
-# NAME: pg
-# LAYER: PERSIST (Layer-5)
-#
-# ROLE:
-#   - runtime_memory / thread_brain / audit_log の永続化を一手に引き受ける。
-#
-# MUST:
-#   - DB I/O のみを担当する（BIS/Gate/Core/Stab に依存しない）
-#   - 全ての永続化はここを経由する
-#
-# MUST NOT:
-#   - Discord / Notion / LLM を呼ばない
-#   - Interface_Box / Pipeline / Core を import しない
-# ============================================================
-
-from __future__ import annotations
 
 import os
-import json
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
-
 import psycopg2
 import psycopg2.extras
+from datetime import datetime, timedelta
 
-from ovv.bis.memory_kind import classify_memory_kind
-from ovv.brain.threadbrain_generator import generate_tb_summary
-
+# ============================================================
+# DB接続
+# ============================================================
 
 PG_URL = os.getenv("POSTGRES_URL")
-conn = None  # type: ignore
 
+_conn = None
 
-# ============================================================
-# INIT
-# ============================================================
 
 def init_db():
-    """Initialize PostgreSQL connection and create tables if not exist."""
-    global conn
-    conn = psycopg2.connect(PG_URL)
-    conn.autocommit = True
+    global _conn
 
-    with conn.cursor() as cur:
-        # runtime_memory
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS runtime_memory (
-                session_id TEXT PRIMARY KEY,
-                memory_json JSONB NOT NULL
-            );
-            """
-        )
+    if _conn is not None:
+        return _conn
 
-        # thread_brain
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS thread_brain (
-                context_key BIGINT PRIMARY KEY,
-                tb_json JSONB NOT NULL
-            );
-            """
-        )
+    if not PG_URL:
+        raise RuntimeError("POSTGRES_URL が設定されていません。")
 
-        # audit_log（簡易）
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id SERIAL PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                payload JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """
-        )
-
-    print("[PERSIST] init_db OK")
+    _conn = psycopg2.connect(PG_URL)
+    _conn.autocommit = True
+    return _conn
 
 
 # ============================================================
-# RUNTIME MEMORY
+# SQL ヘルパ
 # ============================================================
 
-def load_runtime_memory(session_id: str) -> List[dict]:
-    if conn is None:
-        return []
-
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        cur.execute(
-            "SELECT memory_json FROM runtime_memory WHERE session_id = %s;",
-            (session_id,),
-        )
-        row = cur.fetchone()
-        if row:
-            mem = row["memory_json"]
-            print(f"[PERSIST] load_runtime_memory: session={session_id}, len={len(mem)}")
-            return mem
-    print(f"[PERSIST] load_runtime_memory: session={session_id}, (empty)")
-    return []
-
-
-def save_runtime_memory(session_id: str, mem: List[dict]) -> None:
-    if conn is None:
-        return
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO runtime_memory (session_id, memory_json)
-            VALUES (%s, %s)
-            ON CONFLICT (session_id)
-            DO UPDATE SET memory_json = EXCLUDED.memory_json;
-            """,
-            (session_id, json.dumps(mem)),
-        )
-    print(f"[PERSIST] save_runtime_memory: session={session_id}, len={len(mem)}")
-
-
-def append_runtime_memory(
-    session_id: str,
-    role: str,
-    content: str,
-    limit: int = 40,
-    kind: str = "auto",
-) -> None:
-    mem = load_runtime_memory(session_id)
-
-    if kind == "auto":
-        kind_value = classify_memory_kind(role=role, content=content)
-    else:
-        kind_value = kind
-
-    mem.append(
-        {
-            "role": role,
-            "content": content,
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "kind": kind_value,
-        }
-    )
-
-    if len(mem) > limit:
-        mem = mem[-limit:]
-
-    save_runtime_memory(session_id, mem)
+def _execute(sql: str, params=None):
+    conn = init_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        try:
+            return cur.fetchall()
+        except psycopg2.ProgrammingError:
+            return None
 
 
 # ============================================================
-# THREAD BRAIN
+# Persist v3.0 テーブル
+#   task_session
+#   task_log
 # ============================================================
 
-def load_thread_brain(context_key: int) -> Optional[dict]:
-    if conn is None:
-        return None
+CREATE_TABLE_TASK_SESSION = """
+CREATE TABLE IF NOT EXISTS task_session (
+    task_id TEXT PRIMARY KEY,
+    user_id TEXT,
+    started_at TIMESTAMP,
+    ended_at TIMESTAMP,
+    duration_seconds INTEGER
+);
+"""
 
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        cur.execute(
-            "SELECT tb_json FROM thread_brain WHERE context_key = %s;",
-            (context_key,),
-        )
-        row = cur.fetchone()
-        if row:
-            tb = row["tb_json"]
-            print(f"[PERSIST] load_thread_brain: ctx={context_key}, exists=True")
-            return tb
-    print(f"[PERSIST] load_thread_brain: ctx={context_key}, exists=False")
-    return None
-
-
-def save_thread_brain(context_key: int, tb_json: dict) -> None:
-    if conn is None:
-        return
-
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO thread_brain (context_key, tb_json)
-            VALUES (%s, %s)
-            ON CONFLICT (context_key)
-            DO UPDATE SET tb_json = EXCLUDED.tb_json;
-            """,
-            (context_key, json.dumps(tb_json)),
-        )
-    print(f"[PERSIST] save_thread_brain: ctx={context_key}")
+CREATE_TABLE_TASK_LOG = """
+CREATE TABLE IF NOT EXISTS task_log (
+    id SERIAL PRIMARY KEY,
+    task_id TEXT,
+    event_type TEXT,
+    content TEXT,
+    created_at TIMESTAMP
+);
+"""
 
 
-def generate_thread_brain(context_key: int, mem: list) -> Optional[dict]:
-    if not mem:
-        print(f"[PERSIST] generate_thread_brain: ctx={context_key}, mem empty")
-        return None
-
-    try:
-        summary = generate_tb_summary(context_key, mem)
-        print(f"[PERSIST] generate_thread_brain: ctx={context_key}, ok={bool(summary)}")
-        return summary
-    except Exception as e:
-        print("[PERSIST] generate_thread_brain ERROR:", repr(e))
-        return None
+def migrate_persist_v3():
+    _execute(CREATE_TABLE_TASK_SESSION)
+    _execute(CREATE_TABLE_TASK_LOG)
 
 
 # ============================================================
-# REPAIR UTILITIES
+# INSERT: task_log
 # ============================================================
 
-def wipe_runtime_memory(session_id: str):
-    if conn is None:
-        return
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM runtime_memory WHERE session_id = %s;", (session_id,))
-    print(f"[PERSIST] wipe_runtime_memory: session={session_id}")
-
-
-def wipe_thread_brain(context_key: int):
-    if conn is None:
-        return
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM thread_brain WHERE context_key = %s;", (context_key,))
-    print(f"[PERSIST] wipe_thread_brain: ctx={context_key}")
-
-
-def wipe_all():
-    if conn is None:
-        return
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM runtime_memory;")
-        cur.execute("DELETE FROM thread_brain;")
-    print("[PERSIST] wipe_all: runtime_memory + thread_brain cleared")
+def insert_task_log(task_id: str, event_type: str, content: str, created_at: datetime):
+    sql = """
+        INSERT INTO task_log (task_id, event_type, content, created_at)
+        VALUES (%s, %s, %s, %s);
+    """
+    _execute(sql, (task_id, event_type, content, created_at))
 
 
 # ============================================================
-# AUDIT LOG
+# INSERT: task_session_start
 # ============================================================
 
-def log_audit(event_type: str, payload: Dict[str, Any]) -> None:
-    if conn is None:
-        return
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO audit_log (event_type, payload)
-            VALUES (%s, %s);
-            """,
-            (event_type, json.dumps(payload)),
-        )
-    print(f"[PERSIST] log_audit: {event_type}")
+def insert_task_session_start(task_id: str, user_id: str, started_at: datetime):
+    """
+    task_start が押された時に呼ばれる。
+    既にセッションが存在する場合は started_at を上書きする。
+    """
+
+    sql = """
+        INSERT INTO task_session (task_id, user_id, started_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (task_id)
+        DO UPDATE SET
+            user_id = EXCLUDED.user_id,
+            started_at = EXCLUDED.started_at,
+            ended_at = NULL,
+            duration_seconds = NULL;
+    """
+    _execute(sql, (task_id, user_id, started_at))
 
 
 # ============================================================
-# INIT
+# END SESSION: update ended_at + duration
 # ============================================================
 
-init_db()
+def insert_task_session_end_and_duration(task_id: str, ended_at: datetime):
+    """
+    task_end で呼ばれる。
+    SESSION の duration を計算して更新する。
+    """
+
+    # 現在の started_at を取得
+    sql_select = """
+        SELECT started_at FROM task_session WHERE task_id = %s;
+    """
+    rows = _execute(sql_select, (task_id,))
+    if not rows or not rows[0].get("started_at"):
+        return  # スタートしていないタスク
+
+    started_at = rows[0]["started_at"]
+    duration_seconds = int((ended_at - started_at).total_seconds())
+
+    sql_update = """
+        UPDATE task_session
+        SET ended_at = %s,
+            duration_seconds = %s
+        WHERE task_id = %s;
+    """
+    _execute(sql_update, (ended_at, duration_seconds, task_id))
+
+
+# 初回ロード時にテーブルを作成
+try:
+    migrate_persist_v3()
+except Exception as e:
+    print("[Persist] Migration failed:", e)
