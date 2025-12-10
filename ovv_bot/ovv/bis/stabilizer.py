@@ -14,8 +14,9 @@
 #   - user_id          : str | None
 #   - task_id          : str | None   # Persist v3.0 の主キー（thread_id ベース TEXT）
 #   - command_type     : str | None   # "task_create" / "task_start" / "task_end" / "free_chat" 等
-#   - core_output      : dict | None  # Core v2.0 の生出力（デバッグ／将来拡張用）
-#   - thread_state     : dict | None  # StateManager から取得した thread-state snapshot
+#   - core_output      : dict | None  # Core v2.0 の生出力（dbg_flow 用）
+#   - thread_state     : dict | None  # StateManager.get(...) の戻り値（dbg_flow 用）
+#   - packet           : dict | None  # BIS 標準パケット（dbg_flow 用）
 #
 # OUTPUT:
 #   - str（Discord に返す最終メッセージ）
@@ -46,9 +47,13 @@ class Stabilizer:
       - NotionOps を実行する（副作用）
       - Persist v3.0（task_session / task_log）への書き込みを行う
 
-    補足:
-      - core_output / thread_state は現状ログ用だが、
-        将来的なメトリクス・監査・再試行にも利用できるよう保持しておく。
+    Persist 書き込み方針:
+      - task_id を TEXT としてそのまま保持する（丸め込み禁止）
+      - command_type に応じて task_session / task_log の挙動を分岐する
+
+    dbg_flow:
+      - コマンド "!dbg_flow" が来た場合は、Notion / Persist を一切叩かず、
+        packet / core_output / thread_state などの内部状態をまとめて返す。
     """
 
     def __init__(
@@ -61,6 +66,7 @@ class Stabilizer:
         command_type: Optional[str] = None,
         core_output: Optional[Dict[str, Any]] = None,
         thread_state: Optional[Dict[str, Any]] = None,
+        packet: Optional[Dict[str, Any]] = None,
     ):
         self.message_for_user = message_for_user
         self.notion_ops = notion_ops
@@ -69,19 +75,41 @@ class Stabilizer:
         # task_id は TEXT として扱う（DB 側も TEXT 前提）
         self.task_id = str(task_id) if task_id is not None else None
         self.command_type = command_type
+
+        # dbg_flow 用内部情報
         self.core_output = core_output or {}
         self.thread_state = thread_state or {}
+        self.packet = packet or {}
 
-    # --------------------------------------------------------
+    # ------------------------------------------------------------
+    # Internal: 判定系
+    # ------------------------------------------------------------
+    def _is_debug_flow(self) -> bool:
+        """
+        dbg_flow コマンドかどうかを判定する。
+
+        優先順:
+          1. command_type == "dbg_flow"
+          2. message_for_user が "!dbg_flow"（Core がエコーしているケース）
+        """
+        if self.command_type == "dbg_flow":
+            return True
+
+        if isinstance(self.message_for_user, str) and self.message_for_user.strip() == "!dbg_flow":
+            return True
+
+        return False
+
+    # ------------------------------------------------------------
     # Internal: Persist Writer
-    # --------------------------------------------------------
+    # ------------------------------------------------------------
     def _write_persist(self) -> None:
         """
         Persist v3.0 書き込みユニット。
 
         - task_log : すべてのコマンドで 1 レコード追記
         - task_session :
-            - task_start : セッション開始
+            - task_start : セッション開始（なければ INSERT / あれば更新ポリシーは pg 側）
             - task_end   : セッション終了 + duration 更新
         """
 
@@ -93,8 +121,6 @@ class Stabilizer:
         event_type = self.command_type or "unknown"
 
         # --- task_log 追記 ---
-        # 将来的に core_output / thread_state を JSON でメタカラムに載せたい場合は、
-        # ここでシリアライズするだけでよい。
         insert_task_log(
             task_id=self.task_id,
             event_type=event_type,
@@ -116,21 +142,79 @@ class Stabilizer:
                 ended_at=now,
             )
 
-        # "task_create" / "free_chat" 等は session の開始・終了は変更しない
+        # "task_create" / "free_chat" / その他 は session の開始・終了は変更しない
         # （log のみ残す）
 
-    # --------------------------------------------------------
+    # ------------------------------------------------------------
+    # Internal: dbg_flow 用フォーマッタ
+    # ------------------------------------------------------------
+    @staticmethod
+    def _short_repr(value: Any, max_len: int = 700) -> str:
+        """
+        repr を安全に縮約する。Discord 2000 文字制限対策。
+        """
+        try:
+            text = repr(value)
+        except Exception:
+            text = str(value)
+
+        if len(text) > max_len:
+            return text[:max_len] + "... (truncated)"
+
+        return text
+
+    def _format_debug_flow(self) -> str:
+        """
+        dbg_flow 用の最終メッセージを構築する。
+
+        - packet
+        - core_output
+        - thread_state
+        をまとめて、人間が読める形で返す。
+        """
+        lines = []
+
+        lines.append("[dbg_flow] packet:")
+        lines.append(self._short_repr(self.packet))
+        lines.append("")
+
+        lines.append("[dbg_flow] core_output:")
+        lines.append(self._short_repr(self.core_output))
+        lines.append("")
+
+        lines.append("[dbg_flow] thread_state:")
+        lines.append(self._short_repr(self.thread_state))
+        lines.append("")
+
+        text = "\n".join(lines)
+
+        # Discord の 2000 文字制限に収まるよう、最後に全体をトリム
+        if len(text) > 1900:
+            text = text[:1900] + "\n... (overall truncated)"
+
+        return text
+
+    # ------------------------------------------------------------
     # FINALIZER
-    # --------------------------------------------------------
+    # ------------------------------------------------------------
     async def finalize(self) -> str:
         """
         Final 出力フェーズ。
 
-        順序:
+        dbg_flow の場合:
+          - NotionOps 実行なし
+          - Persist 書き込みなし
+          - 内部状態ダンプを返す
+
+        通常の場合:
           1. NotionOps 実行
           2. Persist v3.0 書き込み
           3. Discord に返す文字列を返却
         """
+
+        # ---------- dbg_flow (先に判定して早期 return) ----------
+        if self._is_debug_flow():
+            return self._format_debug_flow()
 
         # ---------- 1. NotionOps ----------
         if self.notion_ops:
@@ -141,6 +225,8 @@ class Stabilizer:
             )
 
         # ---------- 2. Persist 書き込み（同期） ----------
+        # psycopg2 ベースのため、現状は同期 I/O として呼び出す。
+        # トラフィック / 負荷的に問題が出る場合は、将来 to_thread 化などで非同期化する。
         self._write_persist()
 
         # ---------- 3. Discord に返す文字列 ----------
