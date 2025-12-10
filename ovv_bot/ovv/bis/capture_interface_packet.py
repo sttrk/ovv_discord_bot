@@ -1,97 +1,80 @@
-# ovv/bis/capture_interface_packet.py
 # ============================================================
-# MODULE CONTRACT: BIS / Capture Interface Packet
-#
-# ROLE:
-#   - Boundary_Gate から渡された InputPacket / dict を
-#     BIS 標準 packet(dict) に正規化する。
-#
-# INPUT:
-#   - raw_input: InputPacket or dict
-#
-# OUTPUT:
-#   - packet: dict (BIS 標準パケット)
-#
-# CONSTRAINT:
-#   - Discord の生 I/O はここで完結させ、下層には渡さない。
-#   - Core / external_services への依存は持たない。
+# capture_interface_packet.py
+# Minimal Task Command Edition (t / ts / tp / tc)
+# BIS v3.x / Persist v3.0 対応
 # ============================================================
 
-from typing import Any, Dict
+import re
+from .capture_interface_packet import InputPacket  # 同ファイル内なら不要
+
+# ------------------------------------------------------------
+# コマンドマッピング
+# ------------------------------------------------------------
+
+COMMAND_MAP = {
+    "!t":  "task_create",
+    "!ts": "task_start",
+    "!tp": "task_pause",      # 実質 task_end として扱う
+    "!tc": "task_completed",  # 実質 task_end として扱う
+}
 
 
-def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
-    return getattr(obj, name, default)
-
-
-def capture_packet(raw_input: Any) -> Dict[str, Any]:
+def detect_command(message_content: str):
     """
-    Boundary_Gate の InputPacket もしくは dict から
-    BIS 標準 packet(dict) を生成する。
+    "!t" "!ts" "!tp" "!tc" を検出して command_type を返す。
+    None → free_chat として処理される。
+    """
+    msg = message_content.strip().lower()
+
+    if msg in COMMAND_MAP:
+        return COMMAND_MAP[msg]
+
+    return None
+
+
+# ------------------------------------------------------------
+# Main function: Discord Message → InputPacket
+# ------------------------------------------------------------
+
+def capture_interface_packet(discord_message) -> InputPacket:
+    """
+    Discord メッセージから InputPacket を構築する入口。
+    Boundary_Gate からのみ呼ばれる。
     """
 
-    # --------------------------------------------------------
-    # ケース1: Boundary_Gate.InputPacket オブジェクト
-    # --------------------------------------------------------
-    if hasattr(raw_input, "raw_message"):
-        # InputPacket の属性
-        context_key = _safe_getattr(raw_input, "context_key")
-        command_type = _safe_getattr(raw_input, "command_type")
-        payload = _safe_getattr(raw_input, "payload")
-        user_meta = _safe_getattr(raw_input, "user_meta")
-        task_id = _safe_getattr(raw_input, "task_id")
+    # メッセージ本文
+    user_input = discord_message.content
 
-        message = _safe_getattr(raw_input, "raw_message")
+    # Discord thread_id（None のケースもある）
+    context_key = (
+        str(discord_message.channel.id)
+        if hasattr(discord_message, "channel") else None
+    )
 
-        # Discord message オブジェクトから必要情報を抽出
-        content = _safe_getattr(message, "content")
-        channel = _safe_getattr(message, "channel")
-        guild = _safe_getattr(message, "guild")
-        author = _safe_getattr(message, "author")
+    # task_id は context_key と同一
+    task_id = context_key
 
-        channel_id = _safe_getattr(channel, "id")
-        guild_id = _safe_getattr(guild, "id")
-        user_id = _safe_getattr(author, "id")
-        username = _safe_getattr(author, "name") or _safe_getattr(
-            author, "display_name"
-        )
+    # User 情報
+    user_id = str(discord_message.author.id)
+    user_name = str(discord_message.author.display_name)
 
-        packet: Dict[str, Any] = {
-            # 入力メタ
-            "source": "discord",
-            "context_key": context_key,
-            "command_type": command_type,
-            "payload": payload,
-            "user_meta": user_meta,
-            "task_id": task_id,
-            # Discord 生情報（必要最低限）
-            "raw_content": content,
-            "channel_id": channel_id,
-            "guild_id": guild_id,
-            "user_id": user_id,
-            "username": username,
-        }
-        return packet
+    # コマンド判定
+    command_type = detect_command(user_input)
 
-    # --------------------------------------------------------
-    # ケース2: すでに dict で渡された場合（後方互換用）
-    # --------------------------------------------------------
-    if isinstance(raw_input, dict):
-        packet = dict(raw_input)  # 浅いコピー
-        packet.setdefault("source", "discord")
-        # Persist v3.0 以降の task_id が dict 側にあればそのまま使う
-        packet.setdefault("task_id", packet.get("task_id"))
-        return packet
+    # Pause / Completed は task_end と同じ Persist オペレーションになる
+    if command_type in ("task_pause", "task_completed"):
+        normalized_command = "task_end"
+    else:
+        normalized_command = command_type
 
-    # --------------------------------------------------------
-    # フォールバック: 想定外の型
-    # --------------------------------------------------------
-    return {
-        "source": "unknown",
-        "raw_input_repr": repr(raw_input),
-        "context_key": None,
-        "command_type": None,
-        "payload": None,
-        "user_meta": None,
-        "task_id": None,
-    }
+    packet = InputPacket(
+        user_input=user_input,
+        context_key=context_key,
+        user_id=user_id,
+        user_name=user_name,
+        command_type=normalized_command,
+        task_id=task_id,
+        raw_message=discord_message,
+    )
+
+    return packet
