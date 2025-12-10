@@ -4,9 +4,7 @@ Author: Ovv (Universal Product Engineer)
 Status: Hard-Locked Specification  
 Version: 1.1  
 Date: 2025-12-07
-　
 ---
-
 # 1. PURPOSE（目的）
 本仕様書は、Discord Ovv のアーキテクチャを **6-Layer Model + BIS 責務モデル + MODULE CONTRACT Standard** の統合思想として定義する。
 
