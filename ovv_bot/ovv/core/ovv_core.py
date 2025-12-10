@@ -1,200 +1,248 @@
-"""
-ovv.core.ovv_core
------------------
-BIS アーキテクチャ用 Core v2.0 (Minimal Stable)
-
-Boundary_Gate → Interface_Box → (Core) → Stabilizer
-
-本モジュールは「1 本の入口 run_ovv_core()」のみ外部公開する。
-Core は BIS packet(dict) を受け取り、BIS 標準 CoreOutput(dict) を返す。
-"""
+# ovv/core/ovv_core.py
+# ============================================================
+# MODULE CONTRACT: Ovv Core v2.1 (Task Persist / Notion A案 対応版)
+#
+# ROLE:
+#   - BIS / Interface_Box から渡された core_input(dict) を解釈し、
+#     「次に Discord ユーザーへ返すメッセージ」と
+#     「モード(mode) = タスク操作種別 or free_chat」を決定する。
+#
+# INPUT (core_input: dict):
+#   {
+#       "command_type": str,   # "task_create" / "task_start" / "task_paused" / "task_end" / "free_chat"
+#       "raw_text": str,       # Discord メッセージ全文
+#       "arg_text": str,       # コマンド引数部分（先頭トークンを除いた部分）
+#       "task_id": str | None, # context_key と同義（Discord thread_id を TEXT 化）
+#       "context_key": str | None,
+#       "user_id": str | None,
+#   }
+#
+# OUTPUT (dict):
+#   {
+#       "message_for_user": str,   # Discord へ返す最終メッセージ本文
+#       "mode": str,               # "task_create" / "task_start" / "task_paused" / "task_end" / "free_chat"
+#       ...                        # 必要に応じて将来拡張用フィールドを追加
+#   }
+#
+# CONSTRAINTS:
+#   - Notion / Persist / Discord API には直接触れない（BIS / Stabilizer 側の責務）。
+#   - task_id は TEXT（context_key ベース）として扱い、数値変換しない。
+#   - ThreadBrain / RuntimeMemory 等の構造はここでは持たない（将来拡張）。
+# ============================================================
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Any, Dict
 
 
 # ============================================================
-# 型定義
+# Public API
 # ============================================================
 
-ModeLiteral = Literal["free_chat", "task_create", "task_start", "task_end"]
 
-
-class CoreInput(TypedDict, total=False):
-    """pipeline → Core に渡される入力ペイロード"""
-
-    input_packet: Dict[str, Any]      # BIS packet
-    notion_ops: Any                   # ここでは使わない（将来拡張用）
-    state: Dict[str, Any]             # thread-state（dict 想定）
-
-
-class CoreOutput(TypedDict, total=False):
-    """Interface_Box / Stabilizer が受け取る標準 Core 出力"""
-
-    ok: bool
-    message_for_user: str
-    notion_ops: Any                   # Core では None 固定（NotionOps builder が担当）
-    core_mode: str                    # 実際に処理したモード名（command_type ベース）
-    new_state: Dict[str, Any]
-    debug_log: List[str]
-
-
-# ============================================================
-# 公開 API
-# ============================================================
-
-def run_ovv_core(core_payload: Dict[str, Any]) -> CoreOutput:
+def run_core(core_input: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Interface_Box → Pipeline → Core という流れで呼ばれる唯一の入口。
+    BIS / Interface_Box から呼ばれる唯一のエントリ。
 
-    期待される core_payload:
-      {
-        "input_packet": <BIS packet dict>,
-        "notion_ops": None,
-        "state": <thread-state dict or None>,
-      }
+    - command_type に応じて応答メッセージと mode を決定する。
+    - Persist / Notion への書き込みは、mode に基づき BIS / Stabilizer が行う。
     """
 
-    debug: List[str] = ["[core] enter run_ovv_core"]
+    command_type: str = core_input.get("command_type", "free_chat")
+    raw_text: str = core_input.get("raw_text", "") or ""
+    arg_text: str = core_input.get("arg_text", "") or ""
+    task_id: str | None = core_input.get("task_id")
+    context_key: str | None = core_input.get("context_key")
+    user_id: str | None = core_input.get("user_id")
 
-    packet: Dict[str, Any] = core_payload.get("input_packet") or {}
-    state: Dict[str, Any] = core_payload.get("state") or {}
-
-    command_type: str = str(packet.get("command_type") or "free_chat")
-    user_message: str = str(packet.get("raw_content") or "")
-    task_id: Optional[str] = packet.get("task_id")
-
-    debug.append(f"[core] command_type = {command_type}")
-    debug.append(f"[core] user_message_len = {len(user_message)}")
-    debug.append(f"[core] task_id = {task_id}")
+    # safety: task_id は context_key と同義として扱う
+    if task_id is None and context_key is not None:
+        task_id = str(context_key)
 
     # --------------------------------------------------------
-    # モード分岐（command_type ベース）
+    # モード別ディスパッチ
     # --------------------------------------------------------
-    if command_type == "free_chat":
-        return _core_free_chat(user_message, state, debug)
-
     if command_type == "task_create":
-        return _core_task_create(user_message, state, debug)
+        return _handle_task_create(task_id=task_id, arg_text=arg_text, user_id=user_id)
 
     if command_type == "task_start":
-        return _core_task_start(state, debug)
+        return _handle_task_start(task_id=task_id, arg_text=arg_text)
+
+    if command_type == "task_paused":
+        return _handle_task_paused(task_id=task_id)
 
     if command_type == "task_end":
-        return _core_task_end(state, debug)
+        return _handle_task_end(task_id=task_id)
 
-    # 未知のコマンド種別はフォールバック
-    debug.append("[core] unknown command_type fallback")
-
-    return {
-        "ok": False,
-        "message_for_user": (
-            "内部エラー: 未知のコマンド種別を受信しました。\n"
-            "開発者に 'unknown_core_command_type' と伝えてください。"
-        ),
-        "notion_ops": None,
-        "core_mode": command_type,
-        "new_state": state,
-        "debug_log": debug,
-    }
-
-
-# 旧呼び出し互換（念のため）
-call_core = run_ovv_core
-run_core = run_ovv_core
+    # それ以外は free_chat として扱う
+    return _handle_free_chat(raw_text=raw_text, user_id=user_id, context_key=context_key)
 
 
 # ============================================================
-# モード別ハンドラ
+# Handlers: Task Operations
 # ============================================================
 
-def _core_free_chat(
-    message: str,
-    state: Dict[str, Any],
-    debug: List[str],
-) -> CoreOutput:
-    debug.append("[core.free_chat] entered")
 
-    new_state = dict(state)
-    new_state["last_message"] = message
+def _handle_task_create(task_id: str | None, arg_text: str, user_id: str | None) -> Dict[str, Any]:
+    """
+    !t（task_create）に対応。
+    - タスクの「名前」を arg_text から決める。
+    - Persist/Notion には Stabilizer / NotionOps が書き込む。
+    """
 
-    reply = message if message else "メッセージを受信しました。"
+    if task_id is None:
+        # スレッド外で実行された場合
+        msg = (
+            "[task_create] このコマンドは Discord スレッド内でのみ使用できます。\n"
+            "スレッドを作成した上で再度 `!t <タスク名>` を実行してください。"
+        )
+        return {
+            "message_for_user": msg,
+            "mode": "free_chat",  # Persist/Notion には書き込ませない
+        }
+
+    title = arg_text.strip() or f"Task {task_id}"
+    user_label = user_id or "unknown"
+
+    msg = (
+        "[task_create] 新しいタスクを登録しました。\n"
+        f"- task_id : {task_id}\n"
+        f"- name    : {title}\n"
+        f"- created_by : {user_label}"
+    )
 
     return {
-        "ok": True,
-        "message_for_user": reply,
-        "notion_ops": None,
-        "core_mode": "free_chat",
-        "new_state": new_state,
-        "debug_log": debug,
+        "message_for_user": msg,
+        "mode": "task_create",
+        "task_name": title,
+        "task_id": task_id,
     }
 
 
-def _core_task_create(
-    message: str,
-    state: Dict[str, Any],
-    debug: List[str],
-) -> CoreOutput:
-    debug.append("[core.task_create] entered")
+def _handle_task_start(task_id: str | None, arg_text: str) -> Dict[str, Any]:
+    """
+    !ts（task_start）に対応。
+    - Persist 側では task_session.start を記録。
+    - Notion 側では status=in_progress / started_at を更新。
+    """
 
-    # Core では NotionOps を生成しない。タイトルだけ決めておき、
-    # builders.build_notion_ops 側のフォールバックで create_task を組み立てる想定。
-    title = message.strip() or "(無題タスク)"
+    if task_id is None:
+        msg = (
+            "[task_start] このコマンドは Discord スレッド内でのみ使用できます。\n"
+            "スレッドを作成した上で再度 `!ts` を実行してください。"
+        )
+        return {
+            "message_for_user": msg,
+            "mode": "free_chat",
+        }
 
-    reply = f"タスクを作成します: {title}"
+    memo = arg_text.strip()
+    memo_line = f"- memo   : {memo}\n" if memo else ""
 
-    new_state = dict(state)
-    new_state["last_created_title"] = title
+    msg = (
+        "[task_start] 学習セッションを開始しました。\n"
+        f"- task_id: {task_id}\n"
+        f"{memo_line}"
+        "※ この時点から task_end までの経過時間が task_session に記録されます。"
+    )
 
     return {
-        "ok": True,
-        "message_for_user": reply,
-        "notion_ops": None,
-        "core_mode": "task_create",
-        "new_state": new_state,
-        "debug_log": debug,
+        "message_for_user": msg,
+        "mode": "task_start",
+        "task_id": task_id,
+        "memo": memo,
     }
 
 
-def _core_task_start(
-    state: Dict[str, Any],
-    debug: List[str],
-) -> CoreOutput:
-    debug.append("[core.task_start] entered")
+def _handle_task_paused(task_id: str | None) -> Dict[str, Any]:
+    """
+    !tp（task_paused）に対応。
+    - Persist 側では「イベントログのみ」を残す（session の終了処理はしない）。
+    - Notion 側では status=paused に更新。
+    """
 
-    # 実際の Persist（session_start）は Stabilizer 側が担当
-    reply = "タスクを開始しました。"
+    if task_id is None:
+        msg = (
+            "[task_paused] このコマンドは Discord スレッド内でのみ使用できます。\n"
+            "スレッドを作成した上で再度 `!tp` を実行してください。"
+        )
+        return {
+            "message_for_user": msg,
+            "mode": "free_chat",
+        }
 
-    new_state = dict(state)
-    new_state["task_active"] = True
+    msg = (
+        "[task_paused] 学習を一時停止しました。\n"
+        f"- task_id: {task_id}\n"
+        "※ Persist 上の duration_seconds は、task_end 実行時に計算されます。"
+    )
 
     return {
-        "ok": True,
-        "message_for_user": reply,
-        "notion_ops": None,
-        "core_mode": "task_start",
-        "new_state": new_state,
-        "debug_log": debug,
+        "message_for_user": msg,
+        "mode": "task_paused",
+        "task_id": task_id,
     }
 
 
-def _core_task_end(
-    state: Dict[str, Any],
-    debug: List[str],
-) -> CoreOutput:
-    debug.append("[core.task_end] entered")
+def _handle_task_end(task_id: str | None) -> Dict[str, Any]:
+    """
+    !tc（task_end/completed）に対応。
+    - Persist 側では started_at からの duration_seconds を計算して更新。
+    - Stabilizer が取得した duration_seconds を NotionOps に連結し、
+      Notion 側の duration_time（または相当プロパティ）に同期可能とする。
+    """
 
-    reply = "タスクを終了しました。"
+    if task_id is None:
+        msg = (
+            "[task_end] このコマンドは Discord スレッド内でのみ使用できます。\n"
+            "スレッドを作成した上で再度 `!tc` を実行してください。"
+        )
+        return {
+            "message_for_user": msg,
+            "mode": "free_chat",
+        }
 
-    new_state = dict(state)
-    new_state["task_active"] = False
+    msg = (
+        "[task_end] 学習セッションを終了しました。\n"
+        f"- task_id: {task_id}\n"
+        "※ 実測された duration_seconds は DB に記録され、"
+        "後続の NotionOps により TaskDB に同期されます。"
+    )
 
     return {
-        "ok": True,
-        "message_for_user": reply,
-        "notion_ops": None,
-        "core_mode": "task_end",
-        "new_state": new_state,
-        "debug_log": debug,
+        "message_for_user": msg,
+        "mode": "task_end",
+        "task_id": task_id,
+    }
+
+
+# ============================================================
+# Handler: Free Chat（暫定版）
+# ============================================================
+
+
+def _handle_free_chat(raw_text: str, user_id: str | None, context_key: str | None) -> Dict[str, Any]:
+    """
+    free_chat モード。
+    現フェーズでは Persist/Notion 実装を優先し、応答は簡易なエコーに留める。
+    （LLM 応答統合は後続フェーズで ThreadBrain / 推論コアとともに実装する前提）
+    """
+
+    base = raw_text.strip() or "(empty)"
+
+    msg_lines = [
+        "[free_chat] 現フェーズではタスク管理機能（Persist v3.0 / Notion 連携）の実装を優先しています。",
+        "このメッセージは簡易エコー応答です。",
+        "",
+        f"- user_id    : {user_id or 'unknown'}",
+        f"- context_key: {context_key or 'none'}",
+        "",
+        "---- Echo ----",
+        base,
+    ]
+    msg = "\n".join(msg_lines)
+
+    return {
+        "message_for_user": msg,
+        "mode": "free_chat",
     }
