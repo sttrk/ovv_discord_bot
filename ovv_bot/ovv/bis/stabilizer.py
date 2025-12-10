@@ -1,6 +1,6 @@
 # ovv/bis/stabilizer.py
 # ============================================================
-# MODULE CONTRACT: BIS / Stabilizer v3.2
+# MODULE CONTRACT: BIS / Stabilizer v3.2 (Pause/Resume 対応)
 #
 # ROLE:
 #   - Core / NotionOps / Persist を束ね、最終的に Discord に返す文字列を確定する。
@@ -13,7 +13,7 @@
 #   - context_key      : str | None
 #   - user_id          : str | None
 #   - task_id          : str | None   # Persist v3.0 の主キー（thread_id ベース TEXT）
-#   - command_type     : str | None   # "task_create" / "task_start" / "task_end" / "free_chat" 等
+#   - command_type     : str | None   # "task_create" / "task_start" / "task_paused" / "task_end" / "free_chat" 等
 #   - core_output      : dict | None  # Core v2.0 の生出力（将来拡張用）
 #   - thread_state     : dict | None  # StateManager が保持していた thread-state（将来拡張用）
 #
@@ -26,12 +26,13 @@
 #   - task_id は TEXT として扱い、数値への変換・丸め込みを行わない。
 # ============================================================
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 import datetime
 
 from ovv.external_services.notion.ops.executor import execute_notion_ops
 from database.pg import (
     insert_task_session_start,
+    insert_task_session_pause_and_duration,
     insert_task_session_end_and_duration,
     insert_task_log,
 )
@@ -59,15 +60,14 @@ class Stabilizer:
         thread_state: Optional[Dict[str, Any]] = None,
     ):
         self.message_for_user = message_for_user or ""
-        # NotionOps は単一 dict を前提に正規化（list が来た場合は先頭のみ使用）
-        self.notion_ops: Optional[Dict[str, Any]] = self._normalize_ops(notion_ops)
+        self.notion_ops: List[Dict[str, Any]] = self._normalize_ops(notion_ops)
         self.context_key = context_key
         self.user_id = user_id
         # task_id は TEXT として扱う（DB 側も TEXT 前提）
         self.task_id = str(task_id) if task_id is not None else None
         self.command_type = command_type
 
-        # 将来拡張用（今はほぼ保持のみ）
+        # 将来拡張用（今は保持のみ）
         self.core_output = core_output or {}
         self.thread_state = thread_state or {}
 
@@ -75,28 +75,22 @@ class Stabilizer:
     # Internal: NotionOps 正規化
     # ------------------------------------------------------------
     @staticmethod
-    def _normalize_ops(raw: Any) -> Optional[Dict[str, Any]]:
+    def _normalize_ops(raw: Any) -> List[Dict[str, Any]]:
         """
-        notion_ops の型ゆれを吸収して dict に正規化する。
-
-        - None           → None
-        - dict           → dict
-        - list[dict]     → 先頭の dict のみ採用
-        - それ以外       → None（ログのみ）
+        notion_ops の型ゆれを吸収して list[dict] に正規化する。
+        - None → []
+        - dict → [dict]
+        - list[dict] → そのまま
+        それ以外は捨てる（ログのみ）。
         """
         if raw is None:
-            return None
-        if isinstance(raw, dict):
-            return raw
+            return []
         if isinstance(raw, list):
-            for item in raw:
-                if isinstance(item, dict):
-                    return item
-            print("[Stabilizer] notion_ops list に dict が含まれていません。→ 無視します。")
-            return None
-
+            return [op for op in raw if isinstance(op, dict)]
+        if isinstance(raw, dict):
+            return [raw]
         print("[Stabilizer] unexpected notion_ops type:", type(raw))
-        return None
+        return []
 
     # ------------------------------------------------------------
     # Internal: Persist Writer
@@ -107,8 +101,9 @@ class Stabilizer:
 
         - task_log : すべてのコマンドで 1 レコード追記
         - task_session :
-            - task_start : セッション開始（なければ INSERT / あれば更新）
-            - task_end   : セッション終了 + duration_seconds 更新
+            - task_start  : セッション開始 or 再開
+            - task_paused : pause → duration_seconds に加算
+            - task_end    : 終了 → duration_seconds を確定
         """
 
         if not self.task_id:
@@ -134,8 +129,13 @@ class Stabilizer:
                 started_at=now,
             )
 
+        elif self.command_type == "task_paused":
+            insert_task_session_pause_and_duration(
+                task_id=self.task_id,
+                paused_at=now,
+            )
+
         elif self.command_type == "task_end":
-            # duration_seconds を計算して DB に反映（戻り値は現在は使用しない）
             insert_task_session_end_and_duration(
                 task_id=self.task_id,
                 ended_at=now,
@@ -158,15 +158,14 @@ class Stabilizer:
         """
 
         # ---------- 1. Persist 書き込み（同期） ----------
-        # psycopg2 ベースのため、現状は同期 I/O として呼び出す。
         self._write_persist()
 
         # ---------- 2. NotionOps ----------
-        if self.notion_ops is not None:
+        if self.notion_ops:
             await execute_notion_ops(
                 self.notion_ops,
-                context_key=self.context_key or "",
-                user_id=self.user_id or "",
+                context_key=self.context_key,
+                user_id=self.user_id,
             )
 
         # ---------- 3. Discord に返す文字列 ----------
