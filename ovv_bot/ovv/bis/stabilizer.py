@@ -3,24 +3,23 @@
 # MODULE CONTRACT: BIS / Stabilizer
 #
 # ROLE:
-#   - Core から返されたメッセージを Discord へ安全に出すための
-#     最終安定化レイヤ。
-#   - NotionOps を Executor に渡すタイミングを制御する。
-#   - Persist 層（PostgreSQL / v3.0）への書き込みフックを持つ。
+#   - Core / NotionOps / Persist を束ね、最終的に Discord に返す文字列を確定する。
+#   - NotionOps の実行（副作用）を行う。
+#   - Persist v3.0（PostgreSQL）へのタスクログ書き込みは、このレイヤに集約する。
 #
 # INPUT:
 #   - message_for_user: str
-#   - notion_ops: dict | None
-#   - context_key: str | None
-#   - user_id: str | None
-#   - task_id: str | None  # ← v3.0 追加
+#   - notion_ops     : dict | None
+#   - context_key    : str | None
+#   - user_id        : str | None
+#   - task_id        : str | None  # Persist v3.0 用（thread_id ベース）
 #
 # OUTPUT:
-#   - finalize() -> str  （Discord に送るメッセージ）
+#   - str（Discord へ送信する最終メッセージ）
 #
 # CONSTRAINT:
-#   - Discord API を直接叩かない（Boundary_Gate の責務）。
-#   - Notion / PG への具体的 I/O は external_services / database に委譲。
+#   - Discord API を直接叩かない（呼び出し元が行う）。
+#   - Core / Boundary_Gate / Interface_Box を逆参照しない。
 # ============================================================
 
 from typing import Any, Dict, Optional
@@ -30,61 +29,46 @@ from ovv.external_services.notion.ops.executor import execute_notion_ops
 
 class Stabilizer:
     """
-    RESPONSIBILITY TAG: BIS-STABILIZER
-    - Core / NotionOps / Persist の間を調停しつつ、
-      Discord に返すメッセージを最終確定する。
+    BIS 最終出力レイヤ。
+    - Discord への返信メッセージを確定する
+    - 必要に応じて NotionOps を実行する
+    - Persist v3.0（PostgreSQL）への書き込み起点となる（現時点では未実装）
     """
 
     def __init__(
         self,
-        *,
         message_for_user: str,
         notion_ops: Optional[Dict[str, Any]],
         context_key: Optional[str],
-        user_id: str,
+        user_id: Optional[str],
         task_id: Optional[str] = None,
     ):
-        self._message_for_user = message_for_user
-        self._notion_ops = notion_ops
-        self._context_key = context_key
-        self._user_id = user_id
-        self._task_id = task_id  # Persist v3.0 用
+        self.message_for_user = message_for_user
+        self.notion_ops = notion_ops
+        self.context_key = context_key
+        self.user_id = user_id
+        self.task_id = task_id  # 将来の Persist v3.0 ログ書き込みで使用
 
-    # --------------------------------------------------------
-    # internal: Persist v3.0 フック（現時点ではダミー）
-    # --------------------------------------------------------
-    async def _persist_v3(self) -> None:
-        """
-        Persist v3.0（PostgreSQL）への書き込みフック。
-
-        いまはまだスキーマ v3.0 の導線のみを確保し、
-        実際の INSERT / UPDATE ロジックは後続ステップで実装する。
-        """
-        # TODO:
-        # - command_type / packet / state から task_session / task_log を更新
-        # - database.pg / migrate_persist_v3.py で定義済みテーブルに合わせる
-        return
-
-    # --------------------------------------------------------
-    # public: 最終出力
-    # --------------------------------------------------------
     async def finalize(self) -> str:
         """
-        1. Persist v3.0 への書き込み（将来）
-        2. NotionOps があれば非同期で実行
-        3. Discord に返すメッセージ文字列を返却
+        最終出力フェーズ。
+        順序:
+          1. NotionOps 実行（副作用）
+          2. 将来: PostgreSQL Persist への書き込み
+          3. Discord へ返すメッセージ文字列を確定
         """
 
-        # 1. Persist v3.0（将来的に有効化）
-        await self._persist_v3()
-
-        # 2. NotionOps 実行
-        if self._notion_ops:
+        # 1. NotionOps 実行（あれば）
+        if self.notion_ops:
             await execute_notion_ops(
-                self._notion_ops,
-                context_key=self._context_key,
-                user_id=self._user_id,
+                self.notion_ops,
+                context_key=self.context_key,
+                user_id=self.user_id,
             )
 
-        # 3. Discord へ返す文面
-        return self._message_for_user
+        # 2. 将来: PostgreSQL Persist への書き込み（タスクログなど）
+        #    - task_id（= thread_id）をキーとして task_session / task_log に書き込む。
+        #    - 実装は Persist v3.0 のヘルパ関数確定後に追加する。
+
+        # 3. Discord へ返す文字列を確定
+        return self.message_for_user
