@@ -105,6 +105,7 @@ async def handle_request(raw_input: Any) -> Dict[str, Any]:
 
     # ------------------------------
     # 7. Stabilizer 構築
+    #    - dbg_flow 用に packet / core_output / thread_state も渡す
     # ------------------------------
     stabilizer = Stabilizer(
         message_for_user=message_for_user,
@@ -115,6 +116,7 @@ async def handle_request(raw_input: Any) -> Dict[str, Any]:
         command_type=packet.get("command_type"),
         core_output=core_result,
         thread_state=thread_state,
+        packet=packet,
     )
 
     # ------------------------------
