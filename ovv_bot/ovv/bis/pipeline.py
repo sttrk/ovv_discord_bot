@@ -1,51 +1,42 @@
+# ovv/bis/pipeline.py
 # ============================================================
 # MODULE CONTRACT: BIS / Pipeline
-# ROLE: Interface → Core の橋渡し（補助モジュール）
-# RESPONSIBILITY:
-#   - BIS 標準 packet(dict) を Core 呼び出し payload に変換する
-#   - Core の実行を一元化する
-#   - 外部依存（Notion / State）を payload に同梱する
-# INBOUND:
-#   - packet (dict) — capture_interface_packet が生成した BIS packet
-#   - core_fn — ovv.core.ovv_core.run_ovv_core
-# OUTBOUND:
-#   - core_result — Core が返す dict
-# CONSTRAINT:
-#   - Boundary_Gate への逆依存は禁止（BIS上の逆流禁止）
-#   - Core を直接 import せず、core_fn として注入される前提
+#
+# ROLE:
+#   - Interface_Box と Core v2.0 のあいだの薄いアダプタ
+#   - Core の呼び出し方法を 1 箇所に閉じ込めておく
+#
+# IN:
+#   - core_fn : callable (run_ovv_core)
+#   - notion_ops : Any (現状 None 想定 / 将来拡張用)
+#   - state : dict | None （thread-state）
+#
+# OUT:
+#   - pipeline(packet: dict) -> core_result(dict)
 # ============================================================
 
 from typing import Any, Callable, Dict
 
 
 def build_pipeline(
-    core_fn: Callable[[Dict[str, Any]], Any],
+    core_fn: Callable[[Dict[str, Any]], Dict[str, Any]],
     notion_ops: Any,
-    state: Any,
-) -> Callable[[Dict[str, Any]], Any]:
+    state: Dict[str, Any] | None,
+):
     """
-    Pipeline Builder
-    Interface_Box が Core を呼ぶ際に使うパイプラインを構築する。
+    Interface_Box から呼ばれるビルダ。
+
+    ここで CoreInput を組み立て、Core v2.0 を 1 パターンに固定する。
     """
 
-    # --------------------------------------------------------
-    # RESPONSIBILITY TAG: Pipeline Execution Unit
-    # --------------------------------------------------------
-    def pipeline(packet: Dict[str, Any]) -> Any:
-        """
-        1. Boundary／InterfaceBox から渡された dict(packet) を受け取る
-        2. Core に渡す payload を組成する
-        3. Core 実行を行う
-        """
-        core_payload: Dict[str, Any] = {
+    thread_state: Dict[str, Any] = state or {}
+
+    def pipeline(packet: Dict[str, Any]) -> Dict[str, Any]:
+        core_input: Dict[str, Any] = {
             "input_packet": packet,
             "notion_ops": notion_ops,
-            "state": state,
+            "state": thread_state,
         }
-
-        # Core を実行（run_ovv_core など）
-        core_result = core_fn(core_payload)
-
-        return core_result
+        return core_fn(core_input)
 
     return pipeline
