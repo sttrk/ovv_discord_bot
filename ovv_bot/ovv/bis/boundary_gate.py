@@ -1,23 +1,31 @@
-# ovv/bis/boundary_gate.py
-# ---------------------------------------------------------------------
-# Boundary Gate Layer
-# ・Discord 生 I/O を受け取り InputPacket を生成
-# ・コマンド分類
-# ・InterfaceBox への委譲
+# ============================================================
+# MODULE CONTRACT: BIS / Boundary Gate
+# LAYER: BIS-1 (Boundary_Gate)
 #
-# NOTE:
-#   - 1タスク = 1スレッド という Persist v3.0 の前提に合わせ、
-#     task_id として Discord の channel.id（= スレッドID を含む）を採用する。
-# ---------------------------------------------------------------------
+# ROLE:
+#   - Discord 生 I/O を受け取り InputPacket を生成する唯一の入口層
+#   - コマンド分類（Command Classification）
+#   - task_id = thread_id(channel.id) の付与（Persist v3.0 要件）
+#   - Interface_Box に処理を委譲
+#
+# MUST:
+#   - Discord 生オブジェクトはこの層で完結させる
+#   - Core / Persist / External Services / Stabilizer のロジックを混在させない
+#
+# RESPONSIBILITY TAG:
+#   BIS-BOUNDARY-GATE
+# ============================================================
 
 from ovv.bis.interface_box import handle_request
 
 
+# ------------------------------------------------------------
+# InputPacket（Boundary → InterfaceBox の専用コンテナ）
+# ------------------------------------------------------------
 class InputPacket:
     """
     RESPONSIBILITY TAG: BIS-BOUNDARY-GATE-INPUTPACKET
-
-    Boundary_Gate → Interface_Box 間でのみ使用される入力コンテナ。
+    Boundary_Gate → Interface_Box 専用の入力データ構造。
 
     ATTRIBUTES:
         context_key : str
@@ -25,7 +33,7 @@ class InputPacket:
         command_type: str
         payload     : dict
         user_meta   : dict
-        task_id     : str | None   # Persist v3.0 用（thread_id ベース）
+        task_id     : str | None
     """
 
     def __init__(
@@ -46,10 +54,12 @@ class InputPacket:
         self.task_id = task_id
 
 
+# ------------------------------------------------------------
+# Command Classification
+# ------------------------------------------------------------
 def classify_command(raw: str):
     """
     Discord メッセージ文字列から Ovv コマンド種別を判定する。
-    将来的にコマンドが増える場合はここに集約する。
     """
     raw = raw.strip()
 
@@ -62,36 +72,60 @@ def classify_command(raw: str):
     if raw.startswith("!Task_e"):
         return "task_end", {}
 
-    # fallback（通常のチャット）
+    # fallback（通常チャット）
     return "free_chat", {"text": raw}
 
 
+# ------------------------------------------------------------
+# 軽量エラー応答（Boundary 層のみで使う）
+# ------------------------------------------------------------
+async def safe_reply(message, text: str):
+    try:
+        await message.channel.send(text)
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------
+# Main Entry: handle_discord_input
+# ------------------------------------------------------------
 async def handle_discord_input(message):
     """
-    Discord on_message から直接呼び出されるエントリポイント。
+    Discord on_message → BoundaryGate のエントリポイント。
 
     RESPONSIBILITY:
-        - Discord.Message から InputPacket を組み立てる
-        - task_id = thread_id（実体としては channel.id）を付与する
-        - Interface_Box に処理を委譲する
-        - Stabilizer が整形したメッセージを Discord に送信する
+        - Discord 生オブジェクトから安全に InputPacket を構築
+        - task_id = channel.id（1タスク = 1スレッド）を付与
+        - Interface_Box に委譲し、Stabilizer.finalize の結果を送信
     """
 
-    # 元のメッセージ文字列
-    raw = message.content
+    # --------------------------------------------------------
+    # Input Firewall（Boundary 版）
+    # --------------------------------------------------------
+    if message.author.bot:
+        return
 
+    raw = message.content or ""
+    if raw.strip() == "":
+        return  # 空文字は無視
+
+    # --------------------------------------------------------
     # コマンド種別判定
+    # --------------------------------------------------------
     command_type, payload = classify_command(raw)
 
-    # context_key は従来どおり channel.id ベース
-    context_key = f"discord-{message.channel.id}"
-
-    # 1タスク = 1スレッド:
-    # task_id として channel.id（スレッドID を含む）をそのまま文字列化して使う。
+    # context_key（従来仕様）— channel.id ベース
     channel_id = getattr(message.channel, "id", None)
+    context_key = f"discord-{channel_id}"
+
+    # --------------------------------------------------------
+    # Persist v3.0：task_id = thread_id = channel.id
+    # --------------------------------------------------------
     task_id = str(channel_id) if channel_id is not None else None
 
-    # ユーザメタ
+    # --------------------------------------------------------
+    # User meta
+    # --------------------------------------------------------
     user_meta = {
         "user_id": str(message.author.id),
         "user_name": getattr(message.author, "name", None)
@@ -99,7 +133,9 @@ async def handle_discord_input(message):
         or str(message.author.id),
     }
 
-    # InputPacket を生成（raw_message は Discord.Message オブジェクト）
+    # --------------------------------------------------------
+    # InputPacket 生成
+    # --------------------------------------------------------
     packet = InputPacket(
         context_key=context_key,
         raw_message=message,
@@ -109,9 +145,21 @@ async def handle_discord_input(message):
         task_id=task_id,
     )
 
-    # Interface_Box に処理委譲
-    response = await handle_request(packet)
+    # --------------------------------------------------------
+    # Interface_Box に委譲
+    # --------------------------------------------------------
+    try:
+        response = await handle_request(packet)
+    except Exception as exc:
+        await safe_reply(message, f"[Boundary Error] {exc}")
+        return
 
-    # 最終出力は Stabilizer が行う
-    formatted = await response["stabilizer"].finalize()
-    await message.channel.send(formatted)
+    # --------------------------------------------------------
+    # Stabilizer が安定化したメッセージを Discord に送信
+    # --------------------------------------------------------
+    try:
+        formatted = await response["stabilizer"].finalize()
+        await message.channel.send(formatted)
+    except Exception as exc:
+        await safe_reply(message, f"[Stabilizer Error] {exc}")
+        return
