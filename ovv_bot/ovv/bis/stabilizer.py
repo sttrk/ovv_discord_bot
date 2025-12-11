@@ -1,29 +1,31 @@
 # ovv/bis/stabilizer.py
 # ============================================================
-# MODULE CONTRACT: BIS / Stabilizer v3.7
-#   (Persist + NotionOps + Duration + TaskSummary + DebugTrace)
+# MODULE CONTRACT: BIS / Stabilizer v3.8
+#   (Persist v3.0 + NotionOps + Duration + TaskSummary + DebugTrace)
 #
 # ROLE:
 #   - BIS の最終統合レイヤ。
-#   - Core の出力をもとに：
+#   - Core 出力をもとに：
 #         [1] Persist v3.0 への書き込み
-#         [2] NotionOps の実行（duration / summary 拡張含む）
-#         [3] Discord へ返す最終メッセージの確定
-#   を一方向パイプラインで行う。
+#         [2] NotionOps の拡張（duration / summary）
+#         [3] Notion API の逐次実行
+#         [4] Discord へ返す最終メッセージ確定
 #
 # RESPONSIBILITY TAGS:
-#   [PERSIST]   task_log / task_session への書き込み
-#   [BUILD_OPS] NotionOps の拡張（duration / summary 追加）
-#   [EXEC_OPS]  Notion API 呼び出し実行
-#   [FINAL]     Discord へ返すレスポンス確定
-#   [DEBUG]     NotionOps / Persist の内部状態を追跡
+#   [PERSIST]   task_log / task_session
+#   [BUILD_OPS] duration / summary の ops 構築
+#   [EXEC_OPS]  Notion Executor 呼び出し
+#   [FINAL]     Discord 出力確定
+#   [DEBUG]     pipeline 全体の状態追跡
 #
 # CONSTRAINTS:
-#   - Core → Stabilizer → 外部I/O のみ。逆参照禁止。
-#   - Notion API エラーは握り潰さずログ出力。
-#   - duration_seconds は DB の正を唯一の真実とする。
-#   - summary_text は Core 出力があればそれを優先し、なければ安全なフォールバックのみ行う。
+#   - Core → Stabilizer → Executor の一方向のみ
+#   - Notion API エラーはログ出力し、実行は継続
+#   - duration_seconds の唯一の真は DB（Persist）
+#   - summary_text は Core が生成したものを最優先
 # ============================================================
+
+from __future__ import annotations
 
 from typing import Any, Dict, Optional, List
 import datetime
@@ -38,14 +40,14 @@ from database.pg import (
 
 
 # ------------------------------------------------------------
-# Stabilizer Class
+# Stabilizer (Final Layer of BIS)
 # ------------------------------------------------------------
 
 class Stabilizer:
     """
-    BIS 最終レイヤ：
-        Persist → NotionOps → Discord 出力
-    を統合的に制御する。
+    BIS Final Layer:
+        Persist → NotionOps → Discord Response
+    を責務分離に基づいて統合的に制御する。
     """
 
     def __init__(
@@ -59,13 +61,17 @@ class Stabilizer:
         core_output: Optional[Dict[str, Any]] = None,
         thread_state: Optional[Dict[str, Any]] = None,
     ):
+        # Discord 向け最終メッセージ
         self.message_for_user = message_for_user or ""
+
+        # Builder → Stabilizer（list[dict] 化）
         self.notion_ops = self._normalize_ops(notion_ops)
 
         self.context_key = context_key
         self.user_id = user_id
         self.task_id = str(task_id) if task_id is not None else None
-        # Core が返す mode（"task_create" / "task_start" / "task_paused" / "task_end" 等）
+
+        # Core の mode（例: "task_start", "task_end"）
         self.command_type = command_type
 
         self.core_output = core_output or {}
@@ -74,7 +80,7 @@ class Stabilizer:
         self._last_duration_seconds: Optional[int] = None
 
     # ========================================================
-    # [BUILD_OPS] normalize
+    # [BUILD_OPS] NotionOps normalize
     # ========================================================
     @staticmethod
     def _normalize_ops(raw: Any) -> List[Dict[str, Any]]:
@@ -98,40 +104,43 @@ class Stabilizer:
         event = self.command_type or "unknown"
 
         # task_log
-        insert_task_log(
-            task_id=self.task_id,
-            event_type=event,
-            content=self.message_for_user or "",
-            created_at=now,
-        )
-
-        # task_session_start / end
-        if event == "task_start":
-            insert_task_session_start(
+        try:
+            insert_task_log(
                 task_id=self.task_id,
-                user_id=self.user_id,
-                started_at=now,
+                event_type=event,
+                content=self.message_for_user or "",
+                created_at=now,
             )
+        except Exception as e:
+            print("[Stabilizer:ERROR] task_log failed:", repr(e))
+            traceback.print_exc()
 
-        elif event == "task_end":
-            self._last_duration_seconds = insert_task_session_end_and_duration(
-                task_id=self.task_id,
-                ended_at=now,
-            )
+        # task_session start / end
+        try:
+            if event == "task_start":
+                insert_task_session_start(
+                    task_id=self.task_id,
+                    user_id=self.user_id,
+                    started_at=now,
+                )
+
+            elif event == "task_end":
+                self._last_duration_seconds = insert_task_session_end_and_duration(
+                    task_id=self.task_id,
+                    ended_at=now,
+                )
+        except Exception as e:
+            print("[Stabilizer:ERROR] task_session failed:", repr(e))
+            traceback.print_exc()
 
     # ========================================================
-    # [BUILD_OPS] duration ops を NotionOps に連結
+    # [BUILD_OPS] duration ops の付与
     # ========================================================
-    def _augment_notion_ops_with_duration(
-        self,
-        base_ops: Optional[List[Dict[str, Any]]] = None,
-    ) -> List[Dict[str, Any]]:
-        ops = list(base_ops if base_ops is not None else self.notion_ops)
-
+    def _augment_duration(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if (
             self.command_type == "task_end"
             and self._last_duration_seconds is not None
-            and self.task_id is not None
+            and self.task_id
         ):
             ops.append(
                 {
@@ -140,68 +149,47 @@ class Stabilizer:
                     "duration_seconds": self._last_duration_seconds,
                 }
             )
-
         return ops
 
     # ========================================================
-    # [BUILD_OPS] summary ops を NotionOps に連結
+    # [BUILD_OPS] summary text 構築
     # ========================================================
     def _build_summary_text(self) -> str:
-        """
-        TaskSummary 用テキストを構築する。
-
-        優先順位:
-            1. core_output["task_summary"] (str)
-            2. core_output["summary_text"] (str)
-            3. core_output["task_summary_text"] (str)
-            4. self.message_for_user（フォールバック）
-        """
-        # Core 側で明示的にサマリを生成している場合
+        # Core で明示生成していれば最優先
         for key in ("task_summary", "summary_text", "task_summary_text"):
-            val = self.core_output.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
+            v = self.core_output.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
 
-        # 暫定フォールバック：ユーザー向けメッセージをそのまま記録
-        if isinstance(self.message_for_user, str) and self.message_for_user.strip():
-            return self.message_for_user.strip()
+        # 次善策：Discord メッセージ
+        msg = self.message_for_user.strip()
+        if msg:
+            return msg
 
         return ""
 
-    def _augment_notion_ops_with_summary(
-        self,
-        base_ops: Optional[List[Dict[str, Any]]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        対象イベント:
-            - task_paused (!tp)
-            - task_end    (!tc)
-        のタイミングで、Notion Task DB の summary を更新する OP を追加する。
-        """
-        ops = list(base_ops if base_ops is not None else self.notion_ops)
-
-        if self.task_id is None:
-            return ops
-
+    # ========================================================
+    # [BUILD_OPS] summary ops の付与
+    # ========================================================
+    def _augment_summary(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self.command_type not in ("task_paused", "task_end"):
             return ops
 
-        summary_text = self._build_summary_text()
-        if not summary_text:
-            print(
-                "[Stabilizer:DEBUG] no summary_text built "
-                f"(task_id={self.task_id}, command_type={self.command_type})"
-            )
+        if not self.task_id:
+            return ops
+
+        summary = self._build_summary_text()
+        if not summary:
+            print(f"[Stabilizer:DEBUG] No summary_text generated (task_id={self.task_id})")
             return ops
 
         ops.append(
             {
                 "op": "update_task_summary",
                 "task_id": self.task_id,
-                "summary_text": summary_text,
+                "summary_text": summary,
             }
         )
-
         return ops
 
     # ========================================================
@@ -210,7 +198,7 @@ class Stabilizer:
     async def finalize(self) -> str:
 
         # -----------------------------------------
-        # 1. Persist 書き込み
+        # 1. Persist（DB 永続化）
         # -----------------------------------------
         try:
             self._write_persist()
@@ -219,25 +207,25 @@ class Stabilizer:
             traceback.print_exc()
 
         # -----------------------------------------
-        # 2. NotionOps 実行（duration / summary 拡張 + デバッグ）
+        # 2. NotionOps（duration → summary → execute）
         # -----------------------------------------
-        # 2-1. duration 付与
-        notion_ops = self._augment_notion_ops_with_duration()
+        ops = list(self.notion_ops)
+        ops = self._augment_duration(ops)
+        ops = self._augment_summary(ops)
 
-        # 2-2. summary 付与（!tp / !tc）
-        notion_ops = self._augment_notion_ops_with_summary(notion_ops)
-
-        if notion_ops:
+        if ops:
             print("==== Stabilizer: EXEC_OPS (debug) ====")
-            print("context_key:", self.context_key)
-            print("task_id:", self.task_id)
-            print("command_type:", self.command_type)
-            print("ops:", notion_ops)
+            print(" context_key :", self.context_key)
+            print(" task_id     :", self.task_id)
+            print(" command_type:", self.command_type)
+            print(" ops:")
+            for op in ops:
+                print("   ", op)
             print("======================================")
 
             try:
                 await execute_notion_ops(
-                    notion_ops,
+                    ops,
                     context_key=self.context_key,
                     user_id=self.user_id,
                 )
@@ -246,6 +234,6 @@ class Stabilizer:
                 traceback.print_exc()
 
         # -----------------------------------------
-        # 3. Discord に返すメッセージ
+        # 3. Discord 出力を返す
         # -----------------------------------------
         return self.message_for_user
