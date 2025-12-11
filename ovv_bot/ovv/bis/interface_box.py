@@ -1,11 +1,21 @@
 # ovv/bis/interface_box.py
 # ============================================================
-# MODULE CONTRACT: BIS / Interface_Box v3.4 (InputPacket 対応版)
+# MODULE CONTRACT: BIS / Interface_Box v3.6 (Responsibility Complete)
+#
+# ROLE:
+#   - Boundary_Gate から渡された InputPacket を受け取り、
+#     Core → NotionOps Builder → Stabilizer の実行順序を保証する。
+#   - PacketCapture / DebugLayer と構造整合性を保つ。
+#
+# RESPONSIBILITY TAGS:
+#   [ENTRY_IFACE]  handle_request の入口
+#   [DISPATCH]     Core へのディスパッチ
+#   [BUILD_OPS]    NotionOps Builder 呼び出し
+#   [FINALIZE]     Stabilizer 最終フェーズ接続
 # ============================================================
 
 from __future__ import annotations
-
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from ovv.core.ovv_core import run_core
 from ovv.external_services.notion.ops.builders import build_notion_ops
@@ -14,30 +24,28 @@ from .types import InputPacket
 
 
 # ============================================================
-# Public entry
+# [ENTRY_IFACE]
+# Public Entry
 # ============================================================
 
 async def handle_request(packet: InputPacket) -> str:
     """
-    Boundary_Gate から渡された InputPacket を処理し、
-    Core → NotionOps Builder → Stabilizer → 最終出力 を組み立てる。
+    [ENTRY_IFACE]
+    BIS パイプライン第二段階。
     """
 
     # --------------------------------------------------------
-    # 1. packet から必要要素を抽出（dict は使わない）
+    # 1. InputPacket 属性抽出（型安全）
     # --------------------------------------------------------
     command_type = packet.command
     raw_text = packet.raw
     arg_text = packet.content
-
     context_key = packet.context_key
+    task_id = packet.task_id
     user_id = packet.author_id
 
-    # task_id = context_key（TEXT）
-    task_id = packet.task_id
-
     # --------------------------------------------------------
-    # 2. Core に委譲
+    # [DISPATCH] Core 呼び出し
     # --------------------------------------------------------
     core_input = {
         "command_type": command_type,
@@ -48,16 +56,16 @@ async def handle_request(packet: InputPacket) -> str:
         "user_id": user_id,
     }
 
-    core_output: Dict[str, Any] = run_core(core_input)
-    message_for_user: str = core_output.get("message_for_user", "")
+    core_output = run_core(core_input)
+    message_for_user = core_output.get("message_for_user", "")
 
     # --------------------------------------------------------
-    # 3. NotionOps Builder
+    # [BUILD_OPS] NotionOps Builder
     # --------------------------------------------------------
     notion_ops = build_notion_ops(core_output, request=_PacketProxy(packet))
 
     # --------------------------------------------------------
-    # 4. Stabilizer（Persist + NotionOps + Final Message）
+    # [FINALIZE] Stabilizer 呼び出し
     # --------------------------------------------------------
     stabilizer = Stabilizer(
         message_for_user=message_for_user,
@@ -70,25 +78,23 @@ async def handle_request(packet: InputPacket) -> str:
         thread_state=None,
     )
 
-    final_message = await stabilizer.finalize()
-    return final_message
+    return await stabilizer.finalize()
 
 
 # ============================================================
-# Packet Proxy for NotionOps Builder
+# Packet Proxy（Builder 専用）
 # ============================================================
 
 class _PacketProxy:
     """
-    builders.py 用 proxy
-    必要最小限：
-        - task_id
-        - user_meta
+    NotionOps Builder が要求する最小 API を提供。
     """
 
     def __init__(self, packet: InputPacket):
         self.task_id = packet.task_id
         self.user_meta = packet.user_meta
+        self.context_key = packet.context_key
+        self.meta = packet.meta
 
     def __repr__(self):
         return f"<PacketProxy task_id={self.task_id}>"
