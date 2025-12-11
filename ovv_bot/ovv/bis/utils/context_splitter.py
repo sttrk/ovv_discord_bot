@@ -1,21 +1,27 @@
 # ============================================================
-# MODULE CONTRACT: context_splitter v1.1
+# MODULE CONTRACT: BIS / context_splitter v1.2
 #
 # ROLE:
-#   - LLM 向け指示文（≠ドメイン情報）を検出・除去し、
-#     domain_clean / llm_control の 2 系統に分離する。
+#   - LLM が生成した自然文（TaskSummary / ThreadBrain summary）から、
+#     「LLM向け指示文（control語）」を分離し、
+#     Domain（タスク内容・因果）部分だけを安全に残す。
+#
+# USE CASES:
+#   - Stabilizer → Notion Task Summary 同期前
+#   - ThreadBrain summary（LLM出力）sanitizing 前処理
 #
 # RESPONSIBILITY TAGS:
-#   [PARSE]       テキスト分解（行レベル）
-#   [DETECT]      LLM 指示文の検出（パターン / 形式 / 行頭語彙）
-#   [SPLIT]       domain / llm_control への振り分け
-#   [RECONSTRUCT] domain_clean テキストの再構築
+#   [SCAN]     テキストの行単位スキャン
+#   [DETECT]   control 語（JSONで返せ / マークダウン禁止 等）の検出
+#   [SPLIT]    domain_text / control_text の二分割
+#   [RETURN]   安全な domain_text を返却
 #
 # CONSTRAINTS:
-#   - ThreadBrain / NotionSummary どちらにも適用可能
-#   - LLM を呼ばない（純ロジック）
-#   - DB / BIS / Core から独立したユーティリティ
-#   - semantic を変更しない（除去以外の書き換え禁止）
+#   - LLM を呼ばない（pure local filter）
+#   - 判定は deterministic
+#   - Domain（タスク内容）を破壊しない（control 過剰検出禁止）
+#   - ファイル単独で完結し、BIS の他層へ依存しない
+#   - output は常に (domain_text, control_text)
 # ============================================================
 
 from __future__ import annotations
@@ -23,102 +29,101 @@ from typing import Tuple, List
 
 
 # ============================================================
-# [DETECT] 指示文パターン定義
+# [DETECT] Control keyword patterns
+#   - threadbrain_adapter / constraint_classifier と整合を取った制御語
+#   - LLM向けの「形式指示」「越境指示」「メタ命令」を中心に検出
 # ============================================================
 
-# 行頭トリガ（system / instruction / imperative）
-INSTRUCTION_PREFIXES = [
-    "you are", "as an ai", "as a model",
-    "as ovv", "あなたは", "システムとして",
-    "必ず", "以降", "次の形式で", "以下の形式で",
-    "jsonで返", "json で返", "json形式", "markdown禁止",
+CONTROL_KEYWORDS = [
+    # 出力形式強制
+    "jsonで返", "json で返", "json形式", "json 形式",
+    "yaml", "xml",
+    "markdown禁止", "マークダウン禁止", "markdown で返すな",
+    "構造化データで返", "構造化データのみ", "オブジェクトのみ",
+
+    # 越境・プロンプト改変
+    "ignore the system prompt",
+    "override the system prompt",
+    "jailbreak",
+
+    # role 指示
+    "あなたは", "として振る舞", "として動作しろ", "you are now",
+
+    # 出力制御
+    "のみで答え", "only respond", "output only",
+    "説明文を含めない", "含めない", "禁止",
 ]
 
-# 文中トリガ（出力形式・越境指示）
-MID_CONSTRAINT_PATTERNS = [
-    "jsonで返", "json形式", "json 形式",
-    "markdownを含めない", "マークダウンを含めない",
-    "構造化データ", "フォーマット", "のみで返", "only return",
-    "system prompt", "ignore the system prompt",
-    "出力形式", "書式", "フォーマット指定",
+# より高速な prefix チェック
+CONTROL_PREFIX = [
+    "[CONTROL]", "[PROMPT]", "[SYS]", "[META]",
 ]
 
 
 # ============================================================
-# [DETECT] 行が LLM 指示文かを判定する
+# [SCAN] detect routine
 # ============================================================
 
-def _is_instruction_line(line: str) -> bool:
-    """LLM 向け指示語を含むか判定する。"""
-    if not line.strip():
+def _is_control_line(line: str) -> bool:
+    """1 行が control かどうかを判定する（責務: [DETECT]）"""
+    t = line.strip()
+    if not t:
         return False
 
-    lower = line.lower()
-
-    # 行頭チェック
-    for p in INSTRUCTION_PREFIXES:
-        if lower.startswith(p):
+    # prefix 判定（最も強力）
+    for pref in CONTROL_PREFIX:
+        if t.startswith(pref):
             return True
 
-    # 文中パターン
-    for p in MID_CONSTRAINT_PATTERNS:
-        if p in lower:
+    lower = t.lower()
+
+    # keyword 判定
+    for kw in CONTROL_KEYWORDS:
+        if kw.lower() in lower:
             return True
 
     return False
 
 
 # ============================================================
-# [PARSE] multi-line 文字列を行単位へ
+# [SPLIT] domain/control の分離
 # ============================================================
 
-def _split_lines(text: str) -> List[str]:
-    return text.splitlines()
+def split_context_text(text: str) -> Tuple[str, str]:
+    """
+    自然文テキストから domain/control を分離する。
+    返り値: (domain_text, control_text)
 
+    - domain_text: タスク内容・因果・説明など純粋な自然文
+    - control_text: LLM 指示文・越境命令・フォーマット制御など
+    """
+    if not isinstance(text, str):
+        return "", ""
 
-# ============================================================
-# [SPLIT] domain/control 振り分け
-# ============================================================
+    domain_lines: List[str] = []
+    control_lines: List[str] = []
 
-def _split_lines_by_kind(lines: List[str]) -> Tuple[List[str], List[str]]:
-    domain: List[str] = []
-    control: List[str] = []
-
-    for ln in lines:
-        if _is_instruction_line(ln):
-            control.append(ln)
+    for line in text.split("\n"):
+        if _is_control_line(line):
+            control_lines.append(line)
         else:
-            domain.append(ln)
+            domain_lines.append(line)
 
-    return domain, control
+    domain_text = "\n".join([x for x in domain_lines if x.strip()])
+    control_text = "\n".join([x for x in control_lines if x.strip()])
 
-
-# ============================================================
-# [RECONSTRUCT] domain_clean を構築
-# ============================================================
-
-def _reconstruct_domain(domain_lines: List[str]) -> str:
-    cleaned = "\n".join([ln for ln in domain_lines if ln.strip()])
-    return cleaned.strip()
+    return domain_text, control_text
 
 
 # ============================================================
-# Public API
+# [RETURN] 便利ヘルパ
 # ============================================================
 
-def split_context(text: str) -> Tuple[str, List[str]]:
+def extract_domain_only(text: str) -> str:
     """
-    text → (domain_clean, llm_control_lines)
+    Domain のみを返すショートカット。
 
-    OUTPUT:
-        domain_clean: 指示語を除いたユーザードメイン
-        llm_control_lines: 検出された LLM 指示文のリスト
+    - control が大量でも domain が空なら text 全体を返す（フェールセーフ）
     """
-    if not text:
-        return "", []
-
-    lines = _split_lines(text)
-    domain_lines, control_lines = _split_lines_by_kind(lines)
-
-    domain_clean = _reconstruct_domain(domain_lines)
-    return domain_clean, control_lines
+    domain, control = split_context_text(text)
+    return domain if domain.strip() else text
