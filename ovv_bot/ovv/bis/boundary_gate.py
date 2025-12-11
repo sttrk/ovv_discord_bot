@@ -1,17 +1,16 @@
 # ovv/bis/boundary_gate.py
 # ============================================================
-# MODULE CONTRACT: BIS / Boundary_Gate v3.2 (Debug Enabled)
+# MODULE CONTRACT: BIS / Boundary_Gate v3.3 (Debug + PacketCapture Enabled)
 #
 # ROLE:
-#   - Discord on_message からの入力を受け取り、BIS パイプラインへの
-#     エントリポイントとして動作する。
-#   - Discord メッセージ → InputPacket への変換を一元管理する。
-#   - 例外発生時には、開発用にスタックトレースを出力しつつ
-#     Discord 側には境界エラーを返す。
+#   - Discord on_message → BIS パイプラインへの入口。
+#   - Discord メッセージ → InputPacket 変換を一元管理。
+#   - パイプライン開始前に InputPacket を capture し、dbg_packet が参照可能にする。
+#   - 例外発生時は、Render ログには詳細（traceback）、Discord には境界エラーを返す。
 #
 # CONSTRAINT:
 #   - Core / Persist / Notion には直接触れない。
-#   - BIS パイプライン（interface_box.handle_request）のみを呼び出す。
+#   - BIS の interface_box.handle_request() だけを呼び出す。
 # ============================================================
 
 from __future__ import annotations
@@ -21,16 +20,14 @@ import traceback
 
 from .types import InputPacket
 from .interface_box import handle_request
+from .capture_interface_packet import capture  # ★追加：dbg_packet 用
 
 
 # ------------------------------------------------------------
 # Debug Flag
 # ------------------------------------------------------------
 
-# True の間は、BIS パイプライン内で発生した例外のスタックトレースを
-# stdout（Render ログ）に出力する。
-# 本番安定後に False へ切り替える前提。
-DEBUG_BIS = True
+DEBUG_BIS = True  # スタックトレースを Render ログに出す
 
 
 # ------------------------------------------------------------
@@ -39,22 +36,20 @@ DEBUG_BIS = True
 
 def _detect_command_type(raw: str) -> Optional[str]:
     """
-    Discord メッセージから Ovv コマンド種別を判定する。
-
-    戻り値:
-      - "task_create" / "task_start" / "task_paused" / "task_end"
-      - None → Ovv 管理対象外（無視）
+    Discord メッセージの先頭トークンから Ovv のコマンド種別を判定する。
     """
     if not raw:
         return None
 
     head = raw.strip().split()[0].lower()
+
     mapping = {
         # 新コマンド
         "!t": "task_create",
         "!ts": "task_start",
         "!tp": "task_paused",
         "!tc": "task_end",
+
         # 旧互換コマンド（必要に応じて残す）
         "!task": "task_create",
         "!task_s": "task_start",
@@ -66,13 +61,14 @@ def _detect_command_type(raw: str) -> Optional[str]:
         "!task_c": "task_end",
         "!task_completed": "task_end",
     }
+
     return mapping.get(head)
 
 
 def _strip_head_token(raw: str) -> str:
     """
-    先頭トークン（!t など）を除いた残りを返す。
-    先頭トークンのみ or 空の場合は "" を返す。
+    "!t hoge" → "hoge"
+    "!ts   memo memo" → "memo memo"
     """
     if not raw:
         return ""
@@ -86,29 +82,26 @@ def _strip_head_token(raw: str) -> str:
 
 async def handle_discord_input(message) -> None:
     """
-    bot.py から直接呼ばれる唯一のエントリポイント。
-
-    - Discord Message から InputPacket を構築
-    - interface_box.handle_request() を呼び出し
-    - 戻り値の文字列を Discord に送信する
+    bot.py → ONLY ENTRY.
+    Discord message → InputPacket → BIS pipeline.
     """
 
-    # Bot 自身のメッセージは無視
+    # Bot 自身は無視
     if getattr(message.author, "bot", False):
         return
 
     raw_content = message.content or ""
     command_type = _detect_command_type(raw_content)
 
-    # 対象外メッセージは無視（将来 free_chat を解禁する場合はここを拡張）
+    # コマンド以外は現フェーズでは無視
     if command_type is None:
         return
 
+    # Discord context
     channel_id = str(getattr(message.channel, "id", ""))
     author_id = str(getattr(message.author, "id", ""))
 
-    # Discord Thread = task_id = context_key として扱う
-    context_key = channel_id
+    context_key = channel_id        # Discord Thread = task_id = context_key
     task_id = context_key
 
     user_name = getattr(message.author, "display_name", None) or getattr(
@@ -119,7 +112,9 @@ async def handle_discord_input(message) -> None:
         "user_name": user_name,
     }
 
-    # Core に渡す InputPacket 構築
+    # --------------------------------------------------------
+    # InputPacket 構築
+    # --------------------------------------------------------
     packet = InputPacket(
         raw=raw_content,
         source="discord",
@@ -137,21 +132,26 @@ async def handle_discord_input(message) -> None:
     )
 
     # --------------------------------------------------------
-    # BIS パイプライン実行 + デバッグ用例外ログ
+    # ★ 重要：dbg_packet 用 Packet Capture
+    # --------------------------------------------------------
+    capture(packet)
+
+    # --------------------------------------------------------
+    # BIS パイプライン（Interface_Box → Core → Stabilizer）
     # --------------------------------------------------------
     try:
         final_message = await handle_request(packet)
 
-    except Exception as e:  # 例外時も Discord には必ず通知する
+    except Exception as e:
+        # デバッグ：Render ログに詳細
         if DEBUG_BIS:
             print("==== BIS PIPELINE EXCEPTION ====")
             print("Exception in Boundary_Gate.handle_discord_input:", repr(e))
             print("-- InputPacket --")
             try:
-                # dataclass / pydantic いずれでも最低限の可視化を行う
-                print("packet:", packet)
-            except Exception as _:
-                print("packet: <unprintable>")
+                print(packet)
+            except Exception:
+                print("<unprintable packet>")
             print("-- Traceback --")
             traceback.print_exc()
             print("================================")
