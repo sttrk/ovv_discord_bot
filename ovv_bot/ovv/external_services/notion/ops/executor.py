@@ -1,20 +1,20 @@
 # ovv/external_services/notion/ops/executor.py
 # ============================================================
-# MODULE CONTRACT: External / NotionOps Executor v2.1
+# MODULE CONTRACT: External / NotionOps Executor v2.1 (Summary + Duration)
 #
 # ROLE:
 #   - BIS / Stabilizer から渡された NotionOps(list[dict]) を
 #     Task DB（NOTION_TASK_DB_ID）に順序通り適用する。
 #
 # RESPONSIBILITY TAGS:
-#   [EXEC_OPS]  NotionOps の逐次実行
-#   [TASK_DB]   TaskDB(name/title, status, duration, summary) への反映
-#   [GUARD]     Notion 無効時・設定不備時のガードとログ出力
+#   [EXEC_OPS]   NotionOps の逐次実行
+#   [TASK_DB]    TaskDB(name/title, status, duration, summary) への反映
+#   [GUARD]      Notion 無効時・設定不備時のガードとログ出力
 #
 # CONSTRAINTS:
 #   - 呼び出し元は BIS / Stabilizer のみ（Core/BIS から直接呼ばない）
 #   - ops は論理的に list[dict] とみなす（dict 単体は互換のため内部で list 化）
-#   - 1 op 失敗時も他 op の実行は継続（ログ出力のみ）
+#   - 1 op 単位で例外を握りつぶし、残りの ops は継続実行。
 # ============================================================
 
 from __future__ import annotations
@@ -146,8 +146,7 @@ def _create_task_item(notion, ops: Dict[str, Any]) -> None:
                 "started_at": {"date": None},
                 "ended_at": {"date": None},
                 "duration": {"number": 0},
-                # TaskSummary 用フィールド（Notion 側で "summary" rich_text を用意）
-                "summary": {"rich_text": []},
+                # summary は後続の update_task_summary で設定
             },
         )
         print(f"[NotionOps] task_create {task_id}")
@@ -223,15 +222,21 @@ def _update_task_duration(notion, ops: Dict[str, Any]) -> None:
 
 
 # ============================================================
-# TaskSummary 更新（task_paused / task_end → Stabilizer が ops 追加）
+# Summary 更新（task_paused / task_end）
 # ============================================================
 
 def _update_task_summary(notion, ops: Dict[str, Any]) -> None:
+    """
+    Task のサマリテキストを更新する。
+
+    前提：
+      - Notion DB 側に "summary" (rich_text) プロパティが存在すること。
+    """
     task_id = ops["task_id"]
     summary_text = ops.get("summary_text", "")
 
-    if not isinstance(summary_text, str) or not summary_text.strip():
-        print(f"[NotionOps] empty summary_text for task_id={task_id!r} → skip")
+    if not summary_text:
+        print(f"[NotionOps] empty summary_text for task {task_id} → skip")
         return
 
     page = _find_page_by_task_id(notion, task_id)
@@ -245,11 +250,7 @@ def _update_task_summary(notion, ops: Dict[str, Any]) -> None:
             properties={
                 "summary": {
                     "rich_text": [
-                        {
-                            "text": {
-                                "content": summary_text,
-                            }
-                        }
+                        {"text": {"content": summary_text}}
                     ]
                 }
             },
