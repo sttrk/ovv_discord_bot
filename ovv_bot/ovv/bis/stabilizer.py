@@ -1,6 +1,6 @@
 # ovv/bis/stabilizer.py
 # ============================================================
-# Stabilizer v3.3 — paused / duration / Persist v3.0 完全対応
+# MODULE CONTRACT: BIS / Stabilizer v3.3 (duration sync)
 # ============================================================
 
 from typing import Any, Dict, Optional, List
@@ -15,6 +15,9 @@ from database.pg import (
 
 
 class Stabilizer:
+    """
+    BIS 最終出力レイヤ：Persist → NotionOps → Discord への応答を統合する
+    """
 
     def __init__(
         self,
@@ -27,12 +30,11 @@ class Stabilizer:
         core_output: Optional[Dict[str, Any]] = None,
         thread_state: Optional[Dict[str, Any]] = None,
     ):
-
         self.message_for_user = message_for_user or ""
-        self.notion_ops: List[Dict[str, Any]] = self._normalize_ops(notion_ops)
+        self.notion_ops = self._normalize_ops(notion_ops)
         self.context_key = context_key
         self.user_id = user_id
-        self.task_id = str(task_id) if task_id else None
+        self.task_id = str(task_id) if task_id is not None else None
         self.command_type = command_type
 
         self.core_output = core_output or {}
@@ -40,6 +42,7 @@ class Stabilizer:
 
         self._last_duration_seconds: Optional[int] = None
 
+    # 正規化
     @staticmethod
     def _normalize_ops(raw: Any) -> List[Dict[str, Any]]:
         if raw is None:
@@ -48,15 +51,10 @@ class Stabilizer:
             return [x for x in raw if isinstance(x, dict)]
         if isinstance(raw, dict):
             return [raw]
-        print("[Stabilizer] invalid notion_ops type:", type(raw))
         return []
 
-    # ------------------------------------------------------------
-    # Persist Writer
-    # ------------------------------------------------------------
-
+    # Persist 書き込み
     def _write_persist(self):
-
         if not self.task_id:
             return
 
@@ -66,55 +64,51 @@ class Stabilizer:
         insert_task_log(
             task_id=self.task_id,
             event_type=event,
-            content=self.message_for_user,
+            content=self.message_for_user or "",
             created_at=now,
         )
 
-        if self.command_type == "task_start":
+        if event == "task_start":
             insert_task_session_start(
                 task_id=self.task_id,
                 user_id=self.user_id,
                 started_at=now,
             )
 
-        elif self.command_type in ("task_paused", "task_end"):
+        elif event == "task_end":
             self._last_duration_seconds = insert_task_session_end_and_duration(
                 task_id=self.task_id,
                 ended_at=now,
             )
 
-    # ------------------------------------------------------------
-    # NotionOps Augmentation
-    # ------------------------------------------------------------
-
-    def _augment_notion_ops(self):
-
+    # Notion duration 同期
+    def _augment_notion_ops_with_duration(self) -> List[Dict[str, Any]]:
         ops = list(self.notion_ops)
 
         if (
-            self.command_type in ("task_paused", "task_end")
-            and self.task_id
+            self.command_type == "task_end"
             and self._last_duration_seconds is not None
         ):
-            ops.append({
-                "op": "update_duration",
-                "task_id": self.task_id,
-                "duration_seconds": self._last_duration_seconds,
-            })
+            ops.append(
+                {
+                    "op": "update_task_duration",
+                    "task_id": self.task_id,
+                    "duration_seconds": self._last_duration_seconds,
+                }
+            )
 
         return ops
 
-    # ------------------------------------------------------------
-    # FINAL
-    # ------------------------------------------------------------
-
+    # finalize
     async def finalize(self) -> str:
         self._write_persist()
 
-        ops = self._augment_notion_ops()
-
-        if ops:
-            for op in ops:
-                await execute_notion_ops(op, self.context_key, self.user_id)
+        notion_ops = self._augment_notion_ops_with_duration()
+        if notion_ops:
+            await execute_notion_ops(
+                notion_ops,
+                context_key=self.context_key,
+                user_id=self.user_id,
+            )
 
         return self.message_for_user
