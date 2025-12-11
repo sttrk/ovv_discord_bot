@@ -1,64 +1,43 @@
 # ovv/bis/interface_box.py
 # ============================================================
-# MODULE CONTRACT: BIS / Interface_Box v3.4
-#
-# ROLE:
-#   - Boundary_Gate が構築した envelope(dict) を受け取り、
-#     Core → NotionOps Builder → Stabilizer のパイプラインを構築する。
-#
-# INPUT:
-#   envelope: dict
-#       {
-#           "command_type": str,
-#           "raw_text": str,
-#           "arg_text": str,
-#           "context_key": str,
-#           "user_id": str,
-#       }
-#
-# OUTPUT:
-#   str（Discord に返す最終メッセージ）
-#
-# CONSTRAINTS:
-#   - Core / Stabilizer とは一方向参照のみ
-#   - Persist / Notion は Stabilizer 経由でのみ触れる
-#   - task_id = context_key（TEXT）で統一
+# MODULE CONTRACT: BIS / Interface_Box v3.4 (InputPacket 対応版)
 # ============================================================
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ovv.core.ovv_core import run_core
 from ovv.external_services.notion.ops.builders import build_notion_ops
 from .stabilizer import Stabilizer
+from .types import InputPacket
 
 
 # ============================================================
 # Public entry
 # ============================================================
 
-async def handle_request(envelope: Dict[str, Any]) -> str:
+async def handle_request(packet: InputPacket) -> str:
     """
-    Boundary_Gate → Interface_Box のメイン処理。
-    Core → NotionOpsBuilder → Stabilizer の順に処理する。
+    Boundary_Gate から渡された InputPacket を処理し、
+    Core → NotionOps Builder → Stabilizer → 最終出力 を組み立てる。
     """
 
     # --------------------------------------------------------
-    # 1. envelope 正規化
+    # 1. packet から必要要素を抽出（dict は使わない）
     # --------------------------------------------------------
-    command_type: str = envelope.get("command_type", "free_chat")
-    raw_text: str = envelope.get("raw_text", "")
-    arg_text: str = envelope.get("arg_text", "")
+    command_type = packet.command
+    raw_text = packet.raw
+    arg_text = packet.content
 
-    context_key = envelope.get("context_key")
-    user_id = envelope.get("user_id")
+    context_key = packet.context_key
+    user_id = packet.author_id
 
-    # task_id = context_key と同義（TEXT）
-    task_id = str(context_key) if context_key is not None else None
+    # task_id = context_key（TEXT）
+    task_id = packet.task_id
 
     # --------------------------------------------------------
-    # 2. Core v2.1 に委譲
+    # 2. Core に委譲
     # --------------------------------------------------------
     core_input = {
         "command_type": command_type,
@@ -70,15 +49,12 @@ async def handle_request(envelope: Dict[str, Any]) -> str:
     }
 
     core_output: Dict[str, Any] = run_core(core_input)
-
     message_for_user: str = core_output.get("message_for_user", "")
-    mode: str = core_output.get("mode", "free_chat")
 
     # --------------------------------------------------------
     # 3. NotionOps Builder
     # --------------------------------------------------------
-    proxy_request = _EnvelopeProxy(envelope)
-    notion_ops = build_notion_ops(core_output, request=proxy_request)
+    notion_ops = build_notion_ops(core_output, request=_PacketProxy(packet))
 
     # --------------------------------------------------------
     # 4. Stabilizer（Persist + NotionOps + Final Message）
@@ -89,9 +65,9 @@ async def handle_request(envelope: Dict[str, Any]) -> str:
         context_key=context_key,
         user_id=user_id,
         task_id=task_id,
-        command_type=mode,
+        command_type=core_output.get("mode"),
         core_output=core_output,
-        thread_state=None,  # ThreadBrain フェーズで活用予定
+        thread_state=None,
     )
 
     final_message = await stabilizer.finalize()
@@ -99,34 +75,20 @@ async def handle_request(envelope: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# Envelope Proxy for NotionOps Builder
+# Packet Proxy for NotionOps Builder
 # ============================================================
 
-class _EnvelopeProxy:
+class _PacketProxy:
     """
-    build_notion_ops が参照する最小限の request オブジェクト互換。
-    - task_id
-    - user_meta
-    - raw_text / arg_text（将来拡張を考慮して保持）
+    builders.py 用 proxy
+    必要最小限：
+        - task_id
+        - user_meta
     """
 
-    def __init__(self, envelope: Dict[str, Any]):
-        self._envelope = envelope
-
-        # --- 主要フィールド ---
-        context_key = envelope.get("context_key")
-        self.task_id = str(context_key) if context_key is not None else None
-
-        # --- user_meta ---
-        user_id = envelope.get("user_id")
-        self.user_meta = {
-            "user_id": user_id,
-            "user_name": user_id,  # Discord の表示名を使うならここで置き換え可能
-        }
-
-        # --- 拡張用（現時点で builders から参照されないが安全のため保持） ---
-        self.raw_text = envelope.get("raw_text", "")
-        self.arg_text = envelope.get("arg_text", "")
+    def __init__(self, packet: InputPacket):
+        self.task_id = packet.task_id
+        self.user_meta = packet.user_meta
 
     def __repr__(self):
-        return f"<EnvelopeProxy task_id={self.task_id}>"
+        return f"<PacketProxy task_id={self.task_id}>"
