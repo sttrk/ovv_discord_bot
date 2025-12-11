@@ -1,29 +1,52 @@
-# ovv/bis/types.py
-# BISレイヤ共通の型定義
+from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 
 @dataclass
 class InputPacket:
     """
-    Discord から入ってくる1メッセージを、BISレイヤで扱いやすい形に正規化したもの。
+    BIS → Core に渡す標準入力パケット。
 
-    - raw: 元の辞書（Boundary_Gateで組み立て）
-    - source: 入力元（基本は "discord"）
-    - command: "!dbg_flow" などのコマンド名（接頭の "!" を除いたものを想定）
-    - content: メッセージ生テキスト
-    - author_id: 送信者ID
-    - channel_id: チャンネルID
+    互換性維持のため、旧実装で使用していたフィールド名も保持する。
+    - raw, source, command, content, author_id, channel_id
+      （元の simple InputPacket）
+    に加えて、task_id / context_key / user_meta / meta を拡張している。
     """
-    raw: Dict[str, Any]
-    source: str = "discord"
-    command: Optional[str] = None
-    content: Optional[str] = None
-    author_id: Optional[str] = None
-    channel_id: Optional[str] = None
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Core に渡しやすいように dict 化するヘルパ。"""
-        return asdict(self)
+    raw: str
+    source: str
+    command: str
+    content: str
+    author_id: str
+    channel_id: str
+
+    # Persist v3.0 / BIS 用の拡張フィールド
+    context_key: Optional[str] = None
+    task_id: Optional[str] = None
+    user_meta: Dict[str, Any] = field(default_factory=dict)
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def user_input(self) -> str:
+        """
+        一部の旧コードが参照している互換用プロパティ。
+        content と同一。
+        """
+        return self.content
+
+
+@dataclass
+class BISEnvelope:
+    """
+    Discord などのフロントから BIS 入口までの薄いラッパー。
+    現行実装では必須ではないが、他モジュールからの import 互換のため定義しておく。
+    """
+
+    message: Any
+    content: str
+    author_id: str
+    channel_id: str
+    context_key: Optional[str] = None
+    command: Optional[str] = None
