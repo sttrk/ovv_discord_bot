@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS thread_wbs (
+    thread_id TEXT PRIMARY KEY,
+    wbs_json  TEXT NOT NULL,
+    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL
+);
