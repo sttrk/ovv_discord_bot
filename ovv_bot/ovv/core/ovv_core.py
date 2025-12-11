@@ -1,11 +1,29 @@
 # ovv/core/ovv_core.py
 # ============================================================
-# Ovv Core v2.1 — Task A案完全対応（name / duration / status）
+# Ovv Core v2.2 — Task A案 + TaskSummary A案(min) 対応版
+#
+# ROLE:
+#   - BIS / Interface_Box から受け取った core_input(dict) を解釈し、
+#     Task 系コマンド（create / start / paused / end）と free_chat を振り分ける。
+#   - Persist / Notion 用のメタ情報（task_name / task_summary など）を組み立てる。
+#
+# RESPONSIBILITY TAGS:
+#   [DISPATCH]  command_type に応じたハンドラ分岐
+#   [TASK_META] task_name / task_summary など Task 用メタ情報の構築
+#   [USER_MSG]  Discord へ返す message_for_user の生成
+#
+# CONSTRAINTS:
+#   - 外部 I/O（DB / Notion / Discord）は一切行わない（純ロジック層）。
+#   - 戻り値は dict のみ。I/O は上位レイヤ（BIS / Stabilizer）で処理する。
 # ============================================================
 
 from __future__ import annotations
 from typing import Any, Dict
 
+
+# ============================================================
+# Public Entry
+# ============================================================
 
 def run_core(core_input: Dict[str, Any]) -> Dict[str, Any]:
     command_type = core_input.get("command_type", "free_chat")
@@ -15,6 +33,7 @@ def run_core(core_input: Dict[str, Any]) -> Dict[str, Any]:
     context_key = core_input.get("context_key")
     user_id = core_input.get("user_id")
 
+    # task_id がまだない場合は context_key を fallback として採用
     if task_id is None and context_key is not None:
         task_id = str(context_key)
 
@@ -37,7 +56,11 @@ def run_core(core_input: Dict[str, Any]) -> Dict[str, Any]:
 # Handlers
 # ============================================================
 
-def _handle_task_create(task_id: str | None, arg_text: str, user_id: str | None):
+def _handle_task_create(task_id: str | None, arg_text: str, user_id: str | None) -> Dict[str, Any]:
+    """
+    新規タスクの登録。
+    - Notion 側では name/title として反映される。
+    """
     if task_id is None:
         return {
             "message_for_user": (
@@ -51,9 +74,9 @@ def _handle_task_create(task_id: str | None, arg_text: str, user_id: str | None)
 
     msg = (
         "[task_create] 新しいタスクを登録しました。\n"
-        f"- task_id : {task_id}\n"
-        f"- name    : {title}\n"
-        f"- created_by : {user_label}"
+        f"- task_id   : {task_id}\n"
+        f"- name      : {title}\n"
+        f"- created_by: {user_label}"
     )
 
     return {
@@ -64,7 +87,11 @@ def _handle_task_create(task_id: str | None, arg_text: str, user_id: str | None)
     }
 
 
-def _handle_task_start(task_id: str | None, arg_text: str):
+def _handle_task_start(task_id: str | None, arg_text: str) -> Dict[str, Any]:
+    """
+    学習セッション開始。
+    - duration は Persist 側で task_end までの時間として算出される。
+    """
     if task_id is None:
         return {
             "message_for_user": "[task_start] スレッド内で実行してください。",
@@ -89,7 +116,12 @@ def _handle_task_start(task_id: str | None, arg_text: str):
     }
 
 
-def _handle_task_paused(task_id: str | None):
+def _handle_task_paused(task_id: str | None) -> Dict[str, Any]:
+    """
+    学習一時停止。
+    - A案（ミニマム）では、現時点では簡易サマリとして message_for_user をそのまま TaskSummary に流用する。
+    - 将来、ThreadBrain / Persist を用いた高度な要約に差し替え可能なよう、task_summary キーを予約する。
+    """
     if task_id is None:
         return {
             "message_for_user": "[task_paused] スレッド内で実行してください。",
@@ -105,10 +137,17 @@ def _handle_task_paused(task_id: str | None):
         "message_for_user": msg,
         "mode": "task_paused",
         "task_id": task_id,
+        # TaskSummary A案 (min): 現段階では Discord 向けメッセージをそのままサマリとして記録
+        "task_summary": msg,
     }
 
 
-def _handle_task_end(task_id: str | None):
+def _handle_task_end(task_id: str | None) -> Dict[str, Any]:
+    """
+    学習セッション終了。
+    - duration は Persist v3.0 側で算出 → Stabilizer から Notion に同期。
+    - TaskSummary A案（ミニマム）では、終了時点のメッセージを summary として記録する。
+    """
     if task_id is None:
         return {
             "message_for_user": "[task_end] スレッド内で実行してください。",
@@ -124,15 +163,25 @@ def _handle_task_end(task_id: str | None):
         "message_for_user": msg,
         "mode": "task_end",
         "task_id": task_id,
+        # TaskSummary A案 (min): 終了時点の状態をそのまま summary として保存
+        "task_summary": msg,
     }
 
 
-def _handle_free_chat(raw_text: str, user_id: str | None, context_key: str | None):
+def _handle_free_chat(
+    raw_text: str,
+    user_id: str | None,
+    context_key: str | None,
+) -> Dict[str, Any]:
+    """
+    Task 管理コマンド以外の入力を受けた場合の Fallback。
+    - 現フェーズでは、タスク管理モードを優先しつつ、入力をそのまま echo する。
+    """
     base = raw_text.strip() or "(empty)"
 
     msg = (
         "[free_chat] タスク管理モード（Persist / Notion 連携）を優先しています。\n"
-        f"- user_id: {user_id or 'unknown'}\n"
+        f"- user_id    : {user_id or 'unknown'}\n"
         f"- context_key: {context_key or 'none'}\n"
         "\n"
         "---- Echo ----\n"
