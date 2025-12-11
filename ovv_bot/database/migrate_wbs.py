@@ -3,9 +3,9 @@
 import os
 import psycopg2
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+POSTGRES_URL = os.getenv("POSTGRES_URL")
+if not POSTGRES_URL:
+    raise RuntimeError("POSTGRES_URL is not set")
 
 SQL = """
 CREATE TABLE IF NOT EXISTS thread_wbs (
@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS thread_wbs (
 """
 
 def main():
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(POSTGRES_URL)
     try:
         with conn.cursor() as cur:
             cur.execute(SQL)
