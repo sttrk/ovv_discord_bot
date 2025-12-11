@@ -1,26 +1,35 @@
 # ovv/bis/interface_box.py
 # ============================================================
-# MODULE CONTRACT: BIS / Interface_Box v3.6 (Responsibility Complete)
+# MODULE CONTRACT: BIS / Interface_Box v3.7 (ThreadWBS Integrated)
 #
 # ROLE:
 #   - Boundary_Gate から渡された InputPacket を受け取り、
 #     Core → NotionOps Builder → Stabilizer の実行順序を保証する。
+#   - ThreadWBS を「推論前コンテキスト」として Core に渡す。
 #   - PacketCapture / DebugLayer と構造整合性を保つ。
 #
 # RESPONSIBILITY TAGS:
 #   [ENTRY_IFACE]  handle_request の入口
 #   [DISPATCH]     Core へのディスパッチ
+#   [CTX_BUILD]    推論用コンテキスト構築（ThreadWBS）
 #   [BUILD_OPS]    NotionOps Builder 呼び出し
 #   [FINALIZE]     Stabilizer 最終フェーズ接続
+#
+# CONSTRAINTS:
+#   - ThreadWBS を「編集」しない（参照のみ）
+#   - WBS 永続化・更新は別レイヤ（Builder / PG）
 # ============================================================
 
 from __future__ import annotations
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ovv.core.ovv_core import run_core
 from ovv.external_services.notion.ops.builders import build_notion_ops
 from .stabilizer import Stabilizer
 from .types import InputPacket
+
+# ThreadWBS Persistence API（STEP2で実装済前提）
+from ovv.bis.wbs.thread_wbs_persistence import load_thread_wbs
 
 
 # ============================================================
@@ -40,9 +49,22 @@ async def handle_request(packet: InputPacket) -> str:
     command_type = packet.command
     raw_text = packet.raw
     arg_text = packet.content
+
     context_key = packet.context_key
     task_id = packet.task_id
     user_id = packet.author_id
+
+    # --------------------------------------------------------
+    # [CTX_BUILD] ThreadWBS 読み込み（参照専用）
+    # --------------------------------------------------------
+    thread_wbs: Optional[Dict[str, Any]] = None
+    try:
+        if context_key:
+            thread_wbs = load_thread_wbs(context_key)
+    except Exception as e:
+        # WBS 取得失敗は致命ではない（推論継続）
+        print("[Interface_Box:WARN] failed to load ThreadWBS:", repr(e))
+        thread_wbs = None
 
     # --------------------------------------------------------
     # [DISPATCH] Core 呼び出し
@@ -54,6 +76,8 @@ async def handle_request(packet: InputPacket) -> str:
         "task_id": task_id,
         "context_key": context_key,
         "user_id": user_id,
+        # 推論用コンテキストとしてのみ使用
+        "thread_wbs": thread_wbs,
     }
 
     core_output = run_core(core_input)
@@ -75,7 +99,10 @@ async def handle_request(packet: InputPacket) -> str:
         task_id=task_id,
         command_type=core_output.get("mode"),
         core_output=core_output,
-        thread_state=None,
+        # 将来 ThreadWBS 状態を Stabilizer で参照する場合に備える
+        thread_state={
+            "thread_wbs": thread_wbs,
+        } if thread_wbs else None,
     )
 
     return await stabilizer.finalize()
