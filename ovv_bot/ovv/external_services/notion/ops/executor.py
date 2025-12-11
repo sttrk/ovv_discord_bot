@@ -1,24 +1,26 @@
 # ovv/external_services/notion/ops/executor.py
 # ============================================================
-# MODULE CONTRACT: External / NotionOps Executor v3.7
+# MODULE CONTRACT: External / NotionOps Executor v2.0
 #
 # ROLE:
-#   - BIS / Stabilizer から受け取った NotionOps(dict) を
-#     Notion TaskDB に適用する唯一のレイヤ。
+#   - BIS / Stabilizer から渡された NotionOps(list[dict]) を
+#     Task DB（NOTION_TASK_DB_ID）に順序通り適用する。
 #
 # RESPONSIBILITY TAGS:
-#   [EXT_WRITE]  Notion API 書き込みの唯一の実行点
-#   [EXT_TRACE]  NotionOps の入力・出力・エラーを完全に記録
-#   [FUTURE]     DBスキーマ変更に備えた property-safe update
+#   [EXEC_OPS]  NotionOps の逐次実行
+#   [TASK_DB]   TaskDB(name/title, status, duration) への反映
+#   [GUARD]     Notion 無効時・設定不備時のガードとログ出力
 #
 # CONSTRAINTS:
-#   - Core / Persist / BIS と逆参照しない
-#   - 入力された ops を改変しない（Stabilizer の責務）
+#   - 呼び出し元は BIS / Stabilizer のみ（Core/BIS から直接呼ばない）
+#   - ops は論理的に list[dict] とみなす（dict 単体は互換のため内部で list 化）
+#   - 例外は飲み込まずログ出力のみ。Discord へのメッセージは Stabilizer 側が責任を持つ。
 # ============================================================
 
-from typing import Dict, Any, Optional
+from __future__ import annotations
+
+from typing import Dict, Any, Optional, List, Sequence, Union
 from datetime import datetime, timezone
-import traceback
 
 from ..notion_client import get_notion_client
 from ..config_notion import NOTION_TASK_DB_ID
@@ -29,162 +31,188 @@ def _now_iso() -> str:
 
 
 # ============================================================
-# Public Entry
+# Public entry
 # ============================================================
 
-async def execute_notion_ops(ops: Dict[str, Any], context_key: str, user_id: str):
+async def execute_notion_ops(
+    ops: Union[Dict[str, Any], Sequence[Dict[str, Any]]],
+    context_key: str,
+    user_id: str,
+) -> None:
     """
-    [EXT_WRITE] NotionOps を Notion TaskDB に適用する唯一の入口。
+    NotionOps(list[dict]) を Notion DB に適用する唯一のエントリ。
+
+    - 正式仕様としては list[dict] を前提とする。
+    - 後方互換のため、dict 単体や tuple も許容し、内部で list 化する。
     """
 
-    if not ops:
-        print("[NotionOps] skip: ops is empty")
+    ops_list: List[Dict[str, Any]] = _normalize_ops(ops)
+    if not ops_list:
+        # 何もすることがない
         return
-
-    # ---- Debug Trace ----
-    print("==== NotionOps EXEC TRACE ====")
-    print("context_key:", context_key)
-    print("user_id:", user_id)
-    print("ops:", ops)
-    print("==============================")
 
     notion = get_notion_client()
     if notion is None:
-        print("[NotionOps] disabled → client is None")
+        print(f"[NotionOps] Notion disabled → skip (context_key={context_key})")
         return
 
     if NOTION_TASK_DB_ID is None:
         print("[NotionOps] Task DB ID missing → skip")
         return
 
-    op = ops.get("op")
+    # ops を順番に実行
+    for idx, op_dict in enumerate(ops_list):
+        if not isinstance(op_dict, dict):
+            print(f"[NotionOps] skip non-dict op at index {idx}: {op_dict!r}")
+            continue
 
-    try:
-        if op == "task_create":
-            _create_task_item(notion, ops)
+        op_name = op_dict.get("op")
+        if not op_name:
+            print(f"[NotionOps] skip invalid op at index {idx}: no 'op'")
+            continue
 
-        elif op == "task_start":
-            _update_task_status(notion, ops, status="in_progress")
+        try:
+            if op_name == "task_create":
+                _create_task_item(notion, op_dict)
 
-        elif op == "task_paused":
-            _update_task_status(notion, ops, status="paused")
+            elif op_name == "task_start":
+                _update_task_status(notion, op_dict, status="in_progress")
 
-        elif op == "task_end":
-            _update_task_status(notion, ops, status="completed")
+            elif op_name == "task_paused":
+                _update_task_status(notion, op_dict, status="paused")
 
-        elif op == "update_task_duration":
-            _update_task_duration(notion, ops)
+            elif op_name == "task_end":
+                _update_task_status(notion, op_dict, status="completed")
 
-        else:
-            print(f"[NotionOps] Unknown op: {op}")
+            elif op_name == "update_task_duration":
+                _update_task_duration(notion, op_dict)
 
-    except Exception as e:
-        print("[NotionOps] EXEC ERROR:", repr(e))
-        traceback.print_exc()
+            else:
+                print(f"[NotionOps] Unknown op: {op_name!r} (index={idx})")
+
+        except Exception as e:
+            # 1 op ごとに握りつぶし、残りの ops は継続実行
+            print(
+                "[NotionOps] Fatal error at index "
+                f"{idx} (op={op_name!r}, task_id={op_dict.get('task_id')!r}): {e!r}"
+            )
 
 
 # ============================================================
-# Create
+# Normalization
 # ============================================================
 
-def _create_task_item(notion, ops: Dict[str, Any]):
+def _normalize_ops(raw: Union[None, Dict[str, Any], Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    呼び出し側から渡される ops を、内部表現 list[dict] に正規化する。
+    """
+    if raw is None:
+        return []
+
+    if isinstance(raw, dict):
+        return [raw]
+
+    if isinstance(raw, (list, tuple)):
+        return [op for op in raw if isinstance(op, dict)]
+
+    # 想定外の型は無視
+    print(f"[NotionOps] unexpected ops type: {type(raw)!r}")
+    return []
+
+
+# ============================================================
+# Task Create
+# ============================================================
+
+def _create_task_item(notion, ops: Dict[str, Any]) -> None:
     task_id = ops["task_id"]
     created_by = ops.get("created_by", "")
     task_name = ops.get("task_name", f"Task {task_id}")
 
-    props = {
-        "name": {"title": [{"text": {"content": task_name}}]},
-        "task_id": {"rich_text": [{"text": {"content": task_id}}]},
-        "status": {"select": {"name": "not_started"}},
-        "created_by": {"rich_text": [{"text": {"content": created_by}}]},
-        "created_at": {"date": {"start": _now_iso()}},
-        "started_at": {"date": None},
-        "ended_at": {"date": None},
-        "duration": {"number": 0},
-    }
-
-    print("[NotionOps] CREATE props:", props)
-
     try:
-        res = notion.pages.create(
+        notion.pages.create(
             parent={"database_id": NOTION_TASK_DB_ID},
-            properties=props,
+            properties={
+                "name": {"title": [{"text": {"content": task_name}}]},
+                "task_id": {"rich_text": [{"text": {"content": task_id}}]},
+                "status": {"select": {"name": "not_started"}},
+                "created_by": {"rich_text": [{"text": {"content": created_by}}]},
+                "created_at": {"date": {"start": _now_iso()}},
+                "started_at": {"date": None},
+                "ended_at": {"date": None},
+                "duration": {"number": 0},
+            },
         )
-        print(f"[NotionOps] task_create OK: {task_id} → {res.get('id')}")
+        print(f"[NotionOps] task_create {task_id}")
 
     except Exception as e:
-        print("[NotionOps] create_task_item ERROR:", repr(e))
-        traceback.print_exc()
+        print("[NotionOps] create_task_item error:", repr(e))
 
 
 # ============================================================
-# Status Update
+# Status 更新
 # ============================================================
 
-def _update_task_status(notion, ops: Dict[str, Any], status: str):
+def _update_task_status(notion, ops: Dict[str, Any], status: str) -> None:
     task_id = ops["task_id"]
     page = _find_page_by_task_id(notion, task_id)
 
     if page is None:
-        print(f"[NotionOps] status update skip: task not found → {task_id}")
+        print(f"[NotionOps] No such task {task_id}")
         return
 
-    # DBに存在しないプロパティは書かない
     timestamp_prop = {
         "in_progress": "started_at",
-        "completed":  "ended_at",
-        "paused":     None,       # paused_at は DB に存在しない
+        "paused": "paused_at",      # paused_at は DB 上にないので更新しない
+        "completed": "ended_at",
         "not_started": None,
     }.get(status)
 
-    props = {
+    properties: Dict[str, Any] = {
         "status": {"select": {"name": status}},
     }
 
     if timestamp_prop == "started_at":
-        props["started_at"] = {"date": {"start": _now_iso()}}
+        properties["started_at"] = {"date": {"start": _now_iso()}}
 
     elif timestamp_prop == "ended_at":
-        props["ended_at"] = {"date": {"start": _now_iso()}}
-
-    else:
-        # paused → DB に timestamp が無いので更新しない
-        print("[NotionOps] paused: timestamp not updated (property missing)")
-
-    print(f"[NotionOps] UPDATE_STATUS props ({task_id}) →", props)
+        properties["ended_at"] = {"date": {"start": _now_iso()}}
 
     try:
-        notion.pages.update(page_id=page["id"], properties=props)
-        print(f"[NotionOps] status update OK → {status}")
+        notion.pages.update(
+            page_id=page["id"],
+            properties=properties,
+        )
+        print(f"[NotionOps] status → {status} (task_id={task_id})")
 
     except Exception as e:
-        print("[NotionOps] update_status ERROR:", repr(e))
-        traceback.print_exc()
+        print("[NotionOps] update_status error:", repr(e))
 
 
 # ============================================================
-# Duration Update
+# Duration 更新（task_end → Stabilizer が ops 追加）
 # ============================================================
 
-def _update_task_duration(notion, ops: Dict[str, Any]):
+def _update_task_duration(notion, ops: Dict[str, Any]) -> None:
     task_id = ops["task_id"]
     duration_seconds = ops["duration_seconds"]
 
     page = _find_page_by_task_id(notion, task_id)
     if page is None:
-        print(f"[NotionOps] duration update skip: no such task → {task_id}")
+        print(f"[NotionOps] No such task for duration {task_id}")
         return
 
-    props = {"duration": {"number": duration_seconds}}
-    print(f"[NotionOps] UPDATE_DURATION props ({task_id}) →", props)
-
     try:
-        notion.pages.update(page_id=page["id"], properties=props)
-        print(f"[NotionOps] duration update OK → {duration_seconds}")
+        notion.pages.update(
+            page_id=page["id"],
+            properties={
+                "duration": {"number": duration_seconds}
+            },
+        )
+        print(f"[NotionOps] duration update {task_id} = {duration_seconds}")
 
     except Exception as e:
-        print("[NotionOps] duration update ERROR:", repr(e))
-        traceback.print_exc()
+        print("[NotionOps] duration update error:", repr(e))
 
 
 # ============================================================
@@ -201,10 +229,8 @@ def _find_page_by_task_id(notion, task_id: str):
             },
         )
         items = result.get("results", [])
-        print(f"[NotionOps] FIND ({task_id}) → {len(items)} hit(s)")
         return items[0] if items else None
 
     except Exception as e:
-        print("[NotionOps] find ERROR:", repr(e))
-        traceback.print_exc()
+        print("[NotionOps] find error:", repr(e))
         return None
