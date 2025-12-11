@@ -1,129 +1,243 @@
+# ovv/bis/utils/context_splitter.py
 # ============================================================
-# MODULE CONTRACT: BIS / context_splitter v1.2
+# MODULE CONTRACT: BIS / context_splitter v1.0
 #
 # ROLE:
-#   - LLM が生成した自然文（TaskSummary / ThreadBrain summary）から、
-#     「LLM向け指示文（control語）」を分離し、
-#     Domain（タスク内容・因果）部分だけを安全に残す。
-#
-# USE CASES:
-#   - Stabilizer → Notion Task Summary 同期前
-#   - ThreadBrain summary（LLM出力）sanitizing 前処理
+#   - Notion タスクサマリ / ThreadWBS に渡す前に、
+#     テキストから「LLM 向け指示文（制御語）」を除去する。
 #
 # RESPONSIBILITY TAGS:
-#   [SCAN]     テキストの行単位スキャン
-#   [DETECT]   control 語（JSONで返せ / マークダウン禁止 等）の検出
-#   [SPLIT]    domain_text / control_text の二分割
-#   [RETURN]   安全な domain_text を返却
+#   [NORMALIZE] 入力テキストの正規化
+#   [DETECT_CTL] 指示文候補行の検出
+#   [FILTER] 指示文行の除去
+#   [PUBLIC_API] 呼び出し側向けユーティリティ API
 #
 # CONSTRAINTS:
-#   - LLM を呼ばない（pure local filter）
-#   - 判定は deterministic
-#   - Domain（タスク内容）を破壊しない（control 過剰検出禁止）
-#   - ファイル単独で完結し、BIS の他層へ依存しない
-#   - output は常に (domain_text, control_text)
+#   - 意味内容（ドメイン情報）は改変しない。
+#   - LLM を呼ばない（純粋なルールベース）。
+#   - deterministic（同じ入力には常に同じ出力）。
+#   - Discord / Notion / PG など、他レイヤには依存しない。
 # ============================================================
 
 from __future__ import annotations
-from typing import Tuple, List
+
+from typing import Any, Iterable, List
 
 
-# ============================================================
-# [DETECT] Control keyword patterns
-#   - threadbrain_adapter / constraint_classifier と整合を取った制御語
-#   - LLM向けの「形式指示」「越境指示」「メタ命令」を中心に検出
-# ============================================================
+# ------------------------------------------------------------
+# [NORMALIZE] テキスト正規化
+# ------------------------------------------------------------
 
-CONTROL_KEYWORDS = [
-    # 出力形式強制
+def _normalize_text(text: str) -> str:
+    """
+    軽量な正規化のみ行う。
+      - 前後の空白除去
+      - 改行はそのまま維持
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    # 全体の前後だけ strip。行ごとの trim は別で行う。
+    return text.strip()
+
+
+# ------------------------------------------------------------
+# [DETECT_CTL] 指示文候補判定（1行単位）
+# ------------------------------------------------------------
+
+# 出力形式 / フォーマット指示
+_FORMAT_PATTERNS = [
     "jsonで返", "json で返", "json形式", "json 形式",
-    "yaml", "xml",
-    "markdown禁止", "マークダウン禁止", "markdown で返すな",
-    "構造化データで返", "構造化データのみ", "オブジェクトのみ",
+    "yamlで返", "yaml で返", "xmlで返", "xml で返",
+    "マークダウン禁止", "markdown 禁止",
+    "markdownで", "マークダウンで",
+    "表形式で返", "テーブル形式で返", "箇条書きで返",
+    "コードブロックで返", "```",  # コードブロック強制類
+]
 
-    # 越境・プロンプト改変
-    "ignore the system prompt",
-    "override the system prompt",
+# ロール / 人格指示
+_ROLE_PATTERNS = [
+    "として動作しろ", "として動作せよ",
+    "として振る舞え", "として振る舞う",
+    "あなたは", "you are now", "act as",
+]
+
+# システム越境
+_SYSTEM_PATTERNS = [
+    "system prompt", "システムプロンプト",
+    "プロンプトを無視", "prompt を無視",
+    "ignore the system prompt", "override the system prompt",
     "jailbreak",
-
-    # role 指示
-    "あなたは", "として振る舞", "として動作しろ", "you are now",
-
-    # 出力制御
-    "のみで答え", "only respond", "output only",
-    "説明文を含めない", "含めない", "禁止",
 ]
 
-# より高速な prefix チェック
-CONTROL_PREFIX = [
-    "[CONTROL]", "[PROMPT]", "[SYS]", "[META]",
+# LLM 制御・強制語（“だけ返せ”“以降必ず～のみ”など）
+_CONTROL_PATTERNS = [
+    "のみ返す", "だけ返す", "だけを返す", "のみを返す",
+    "以降必ず", "絶対に", "のみで応答", "以外は書かない",
+    "説明文なしで", "説明文は不要", "説明はいらない",
 ]
 
 
-# ============================================================
-# [SCAN] detect routine
-# ============================================================
-
-def _is_control_line(line: str) -> bool:
-    """1 行が control かどうかを判定する（責務: [DETECT]）"""
-    t = line.strip()
-    if not t:
+def _is_likely_instruction_line(line: str) -> bool:
+    """
+    1行が「LLM 向けの指示文」と見なせるかどうかを判定する。
+    ドメイン情報を壊さないよう、やや保守的に判定する。
+    """
+    s = line.strip()
+    if not s:
         return False
 
-    # prefix 判定（最も強力）
-    for pref in CONTROL_PREFIX:
-        if t.startswith(pref):
+    lower = s.lower()
+
+    # 明示的なプレフィクス
+    if s.startswith("[PROMPT]") or s.startswith("[prompt]"):
+        return True
+    if s.startswith("[CONTROL]") or s.startswith("[control]"):
+        return True
+
+    # 単純に「あなたは〜として動作しろ」系
+    for pat in _ROLE_PATTERNS:
+        if pat in s:
             return True
 
-    lower = t.lower()
+    # システム越境系
+    for pat in _SYSTEM_PATTERNS:
+        if pat.lower() in lower:
+            return True
 
-    # keyword 判定
-    for kw in CONTROL_KEYWORDS:
-        if kw.lower() in lower:
+    # 出力形式指定系
+    for pat in _FORMAT_PATTERNS:
+        if pat.lower() in lower:
+            return True
+
+    # 制御系フレーズ
+    for pat in _CONTROL_PATTERNS:
+        if pat in s:
             return True
 
     return False
 
 
-# ============================================================
-# [SPLIT] domain/control の分離
-# ============================================================
+# ------------------------------------------------------------
+# [FILTER] 指示文行の除去ロジック
+# ------------------------------------------------------------
 
-def split_context_text(text: str) -> Tuple[str, str]:
+def strip_llm_instructions_from_text(text: str) -> str:
     """
-    自然文テキストから domain/control を分離する。
-    返り値: (domain_text, control_text)
+    単一テキストから「指示文っぽい行」を除去し、残りを結合して返す。
 
-    - domain_text: タスク内容・因果・説明など純粋な自然文
-    - control_text: LLM 指示文・越境命令・フォーマット制御など
+    - 改行単位で行を判定
+    - 指示文と判定された行は捨てる
+    - 残った行のみを '\n' で再結合
     """
-    if not isinstance(text, str):
-        return "", ""
+    norm = _normalize_text(text)
+    if not norm:
+        return ""
 
-    domain_lines: List[str] = []
-    control_lines: List[str] = []
+    lines = norm.splitlines()
+    kept: List[str] = []
 
-    for line in text.split("\n"):
-        if _is_control_line(line):
-            control_lines.append(line)
+    for raw_line in lines:
+        line = raw_line.rstrip("\r\n")
+        if not line.strip():
+            # 空行はそのまま残しても良いが、ノイズを減らすためにスキップ
+            continue
+
+        if _is_likely_instruction_line(line):
+            # LLM 向け指示行 → discard
+            continue
+
+        kept.append(line)
+
+    return "\n".join(kept).strip()
+
+
+# ------------------------------------------------------------
+# [NORMALIZE] コンテナ入力への対応
+# ------------------------------------------------------------
+
+def _flatten_iterable_text(items: Iterable[Any]) -> str:
+    """
+    list[str] / tuple[str] などをまとめて 1 本のテキストにする。
+    """
+    buf: List[str] = []
+    for v in items:
+        if v is None:
+            continue
+        if isinstance(v, str):
+            t = v.strip()
+            if t:
+                buf.append(t)
         else:
-            domain_lines.append(line)
+            t = str(v).strip()
+            if t:
+                buf.append(t)
+    if not buf:
+        return ""
+    return "\n".join(buf)
 
-    domain_text = "\n".join([x for x in domain_lines if x.strip()])
-    control_text = "\n".join([x for x in control_lines if x.strip()])
 
-    return domain_text, control_text
-
-
-# ============================================================
-# [RETURN] 便利ヘルパ
-# ============================================================
-
-def extract_domain_only(text: str) -> str:
+def _extract_text_from_dict(obj: dict) -> str:
     """
-    Domain のみを返すショートカット。
-
-    - control が大量でも domain が空なら text 全体を返す（フェールセーフ）
+    dict からテキストらしきものを抽出する簡易ロジック。
+    - よくあるキー: "content", "text", "message", "body"
+    - 見つからない場合は、値のうち str のみを連結
     """
-    domain, control = split_context_text(text)
-    return domain if domain.strip() else text
+    # 優先キー
+    for key in ("content", "text", "message", "body"):
+        if key in obj and isinstance(obj[key], str):
+            return obj[key]
+
+    # 値のうち str だけ拾う
+    parts: List[str] = []
+    for v in obj.values():
+        if isinstance(v, str):
+            t = v.strip()
+            if t:
+                parts.append(t)
+
+    if not parts:
+        return ""
+
+    return "\n".join(parts)
+
+
+# ------------------------------------------------------------
+# [PUBLIC_API] 呼び出し側が使うエントリ
+# ------------------------------------------------------------
+
+def clean_context_text(value: Any) -> str:
+    """
+    Notion Task Summary / ThreadWBS work_item / TB などに渡す前の
+    「文脈テキスト」をクリーンアップするための統一 API。
+
+    入力:
+      - str
+      - list/tuple[str or Any]
+      - dict（content/text/message/body などを含むもの）
+      - それ以外: str(value) でテキスト化
+
+    出力:
+      - LLM 指示文を除去した純粋な“意味文脈”テキスト
+    """
+    # str ならそのまま
+    if isinstance(value, str):
+        return strip_llm_instructions_from_text(value)
+
+    # list/tuple 等なら flatten → strip
+    if isinstance(value, (list, tuple)):
+        flat = _flatten_iterable_text(value)
+        return strip_llm_instructions_from_text(flat)
+
+    # dict の場合は「テキストらしき部分」を抽出
+    if isinstance(value, dict):
+        txt = _extract_text_from_dict(value)
+        return strip_llm_instructions_from_text(txt)
+
+    # その他は文字列化して処理
+    return strip_llm_instructions_from_text(str(value))
+
+
+__all__ = [
+    "clean_context_text",
+    "strip_llm_instructions_from_text",
+]
