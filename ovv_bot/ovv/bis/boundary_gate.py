@@ -1,16 +1,16 @@
 # ovv/bis/boundary_gate.py
 # ============================================================
-# MODULE CONTRACT: BIS / Boundary_Gate v3.3 (Debug + PacketCapture Enabled)
+# MODULE CONTRACT: BIS / Boundary_Gate v3.4 (Debug + PacketCapture Enabled)
 #
 # ROLE:
 #   - Discord on_message → BIS パイプラインへの入口。
 #   - Discord メッセージ → InputPacket 変換を一元管理。
-#   - パイプライン開始前に InputPacket を capture し、dbg_packet が参照可能にする。
-#   - 例外発生時は、Render ログには詳細（traceback）、Discord には境界エラーを返す。
+#   - パイプライン開始前に InputPacket を capture（dbg_packet 用）
+#   - 例外発生時は Render ログに詳細、Discord には境界エラーを返す。
 #
 # CONSTRAINT:
 #   - Core / Persist / Notion には直接触れない。
-#   - BIS の interface_box.handle_request() だけを呼び出す。
+#   - interface_box.handle_request() のみを呼ぶ。
 # ============================================================
 
 from __future__ import annotations
@@ -20,14 +20,14 @@ import traceback
 
 from .types import InputPacket
 from .interface_box import handle_request
-from .capture_interface_packet import capture  # ★追加：dbg_packet 用
+from .capture_interface_packet import capture  # dbg_packet 用
 
 
 # ------------------------------------------------------------
 # Debug Flag
 # ------------------------------------------------------------
 
-DEBUG_BIS = True  # スタックトレースを Render ログに出す
+DEBUG_BIS = True  # Render ログに内部スタックトレースを出す
 
 
 # ------------------------------------------------------------
@@ -35,22 +35,18 @@ DEBUG_BIS = True  # スタックトレースを Render ログに出す
 # ------------------------------------------------------------
 
 def _detect_command_type(raw: str) -> Optional[str]:
-    """
-    Discord メッセージの先頭トークンから Ovv のコマンド種別を判定する。
-    """
     if not raw:
         return None
 
     head = raw.strip().split()[0].lower()
 
     mapping = {
-        # 新コマンド
         "!t": "task_create",
         "!ts": "task_start",
         "!tp": "task_paused",
         "!tc": "task_end",
 
-        # 旧互換コマンド（必要に応じて残す）
+        # 旧互換コマンド
         "!task": "task_create",
         "!task_s": "task_start",
         "!task_start": "task_start",
@@ -66,10 +62,6 @@ def _detect_command_type(raw: str) -> Optional[str]:
 
 
 def _strip_head_token(raw: str) -> str:
-    """
-    "!t hoge" → "hoge"
-    "!ts   memo memo" → "memo memo"
-    """
     if not raw:
         return ""
     parts = raw.strip().split(maxsplit=1)
@@ -83,10 +75,10 @@ def _strip_head_token(raw: str) -> str:
 async def handle_discord_input(message) -> None:
     """
     bot.py → ONLY ENTRY.
-    Discord message → InputPacket → BIS pipeline.
+    Discord → InputPacket → BIS Pipeline.
     """
 
-    # Bot 自身は無視
+    # Bot自身の発言は無視
     if getattr(message.author, "bot", False):
         return
 
@@ -97,16 +89,16 @@ async def handle_discord_input(message) -> None:
     if command_type is None:
         return
 
-    # Discord context
+    # Discord context → Ovv context
     channel_id = str(getattr(message.channel, "id", ""))
     author_id = str(getattr(message.author, "id", ""))
-
     context_key = channel_id        # Discord Thread = task_id = context_key
     task_id = context_key
 
     user_name = getattr(message.author, "display_name", None) or getattr(
         message.author, "name", ""
     )
+
     user_meta = {
         "user_id": author_id,
         "user_name": user_name,
@@ -132,18 +124,21 @@ async def handle_discord_input(message) -> None:
     )
 
     # --------------------------------------------------------
-    # ★ 重要：dbg_packet 用 Packet Capture
+    # ★ dbg_packet 用に Packet Capture
     # --------------------------------------------------------
     capture(packet)
 
+    if DEBUG_BIS:
+        print("[Boundary_Gate] Captured InputPacket:", packet)
+
     # --------------------------------------------------------
-    # BIS パイプライン（Interface_Box → Core → Stabilizer）
+    # BIS Pipeline 実行（Interface_Box → Core → Stabilizer）
     # --------------------------------------------------------
     try:
         final_message = await handle_request(packet)
 
     except Exception as e:
-        # デバッグ：Render ログに詳細
+        # デバッグログ
         if DEBUG_BIS:
             print("==== BIS PIPELINE EXCEPTION ====")
             print("Exception in Boundary_Gate.handle_discord_input:", repr(e))
@@ -161,7 +156,7 @@ async def handle_discord_input(message) -> None:
         final_message = "[Boundary Error] internal failure in BIS pipeline."
 
     # --------------------------------------------------------
-    # Discord 返信
+    # Discord に返す
     # --------------------------------------------------------
     if final_message:
         await message.channel.send(final_message)
