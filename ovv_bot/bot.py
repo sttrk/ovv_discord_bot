@@ -1,7 +1,19 @@
 # bot.py
 # ---------------------------------------------------------------------
 # Discord Adapter Layer
-# ＋ Render環境のディレクトリ構造と sys.path をログに出力する仕組みを統合
+#
+# ROLE:
+#   - Discord I/O のみを担当する最外郭レイヤ
+#   - すべての業務ロジックは Boundary_Gate 以下に委譲
+#
+# RESPONSIBILITY TAGS:
+#   [DISCORD_IO]   Discord イベント処理
+#   [DELEGATE]     Boundary_Gate への完全委譲
+#   [DEBUG]        起動時の環境可視化
+#
+# CONSTRAINTS:
+#   - Core / WBS / Persist / Notion を直接触らない
+#   - コマンド解釈は Boundary_Gate に任せる
 # ---------------------------------------------------------------------
 
 import os
@@ -10,7 +22,7 @@ import discord
 from discord.ext import commands
 
 # ================================================================
-# 0.  Render起動時：ディレクトリツリー + sys.path をログ出力
+# [DEBUG] Render 起動時：ディレクトリ構造 / sys.path を可視化
 # ================================================================
 print("=== PROJECT DIR TREE DUMP (from bot.py working directory) ===")
 for root, dirs, files in os.walk(".", topdown=True):
@@ -34,34 +46,45 @@ from ovv.bis.boundary_gate import handle_discord_input
 intents = discord.Intents.default()
 intents.message_content = True
 
+# command_prefix を空にし、全入力を on_message で扱う
 bot = commands.Bot(command_prefix="", intents=intents)
 
 
+# ================================================================
+# Discord Events
+# ================================================================
 @bot.event
 async def on_ready():
-    print(f"Bot logged in as {bot.user}")
+    print(f"[Discord] Bot logged in as {bot.user}")
 
 
 @bot.event
 async def on_message(message: discord.Message):
-    # BOT のメッセージは無視
+    """
+    [DISCORD_IO]
+
+    - Bot 自身の発言は無視
+    - すべて Boundary_Gate に委譲
+    """
     if message.author.bot:
         return
 
-    # BoundaryGate に全て委譲
+    # Boundary_Gate がコマンド種別を判定する
     await handle_discord_input(message)
 
 
+# ================================================================
+# Entry Point
+# ================================================================
 def run(token: str):
+    print("[Discord] starting bot.run()")
     bot.run(token)
 
 
-# Render の Start Command が "python bot.py" の場合、以下が必要。
-# Python モジュールルートが正しく設定されていれば問題なし。
+# Render の Start Command が "python bot.py" の場合に備える
 if __name__ == "__main__":
-    # 必要に応じて環境変数から TOKEN を読み込む形でもOK
     token = os.getenv("DISCORD_BOT_TOKEN")
-    if token:
-        run(token)
+    if not token:
+        print("[ERROR] DISCORD_BOT_TOKEN が設定されていません。")
     else:
-        print("DISCORD_BOT_TOKEN が設定されていません。")
+        run(token)
