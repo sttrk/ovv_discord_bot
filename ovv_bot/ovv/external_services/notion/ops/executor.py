@@ -1,20 +1,22 @@
 # ovv/external_services/notion/ops/executor.py
 # ============================================================
-# MODULE CONTRACT: External / NotionOps Executor v2.1 (Summary + Duration)
+# MODULE CONTRACT: External / NotionOps Executor v2.2
+#   (Duration + Summary + Status + DebugTrace / BIS-Stabilizer 専用)
 #
 # ROLE:
-#   - BIS / Stabilizer から渡された NotionOps(list[dict]) を
-#     Task DB（NOTION_TASK_DB_ID）に順序通り適用する。
+#   - BIS / Stabilizer が構築した NotionOps(list[dict]) を
+#     Task DB（NOTION_TASK_DB_ID）へ逐次適用する。
 #
 # RESPONSIBILITY TAGS:
-#   [EXEC_OPS]   NotionOps の逐次実行
-#   [TASK_DB]    TaskDB(name/title, status, duration, summary) への反映
-#   [GUARD]      Notion 無効時・設定不備時のガードとログ出力
+#   [EXEC_OPS]   ops を順序通り Notion API に適用
+#   [TASK_DB]    Task DB（title / status / duration / summary）更新
+#   [GUARD]      設定不備・Notion無効時の安全ガード
+#   [DEBUG]      実行ステップのログ出力
 #
 # CONSTRAINTS:
-#   - 呼び出し元は BIS / Stabilizer のみ（Core/BIS から直接呼ばない）
-#   - ops は論理的に list[dict] とみなす（dict 単体は互換のため内部で list 化）
-#   - 1 op 単位で例外を握りつぶし、残りの ops は継続実行。
+#   - 呼び出し元は BIS/Stabilizer のみ
+#   - ops は dict または list[dict] を受容し、内部で list 化する
+#   - 1 op 単位で例外 isolation（他の ops は継続）
 # ============================================================
 
 from __future__ import annotations
@@ -26,12 +28,16 @@ from ..notion_client import get_notion_client
 from ..config_notion import NOTION_TASK_DB_ID
 
 
+# ------------------------------------------------------------
+# Utility
+# ------------------------------------------------------------
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 # ============================================================
-# Public entry
+# Public entry (唯一の外部 API)
 # ============================================================
 
 async def execute_notion_ops(
@@ -40,15 +46,13 @@ async def execute_notion_ops(
     user_id: str,
 ) -> None:
     """
-    NotionOps(list[dict]) を Notion DB に適用する唯一のエントリ。
+    BIS / Stabilizer → Executor の唯一の API。
 
-    - 正式仕様としては list[dict] を前提とする。
-    - 後方互換のため、dict 単体や tuple も許容し、内部で list 化する。
+    ops: list[dict] を前提とするが、互換のため dict / tuple も受容。
     """
 
     ops_list: List[Dict[str, Any]] = _normalize_ops(ops)
     if not ops_list:
-        # 何もすることがない
         return
 
     notion = get_notion_client()
@@ -57,18 +61,20 @@ async def execute_notion_ops(
         return
 
     if NOTION_TASK_DB_ID is None:
-        print("[NotionOps] Task DB ID missing → skip")
+        print("[NotionOps] Task DB ID missing → skip all ops")
         return
 
-    # ops を順番に実行
+    # --------------------------------------------------------
+    # 逐次実行（1 failure = continue）
+    # --------------------------------------------------------
     for idx, op_dict in enumerate(ops_list):
         if not isinstance(op_dict, dict):
-            print(f"[NotionOps] skip non-dict op at index {idx}: {op_dict!r}")
+            print(f"[NotionOps] skip non-dict op at index={idx}: {op_dict!r}")
             continue
 
         op_name = op_dict.get("op")
         if not op_name:
-            print(f"[NotionOps] skip invalid op at index {idx}: no 'op'")
+            print(f"[NotionOps] skip invalid op at index={idx}: missing 'op'")
             continue
 
         try:
@@ -91,10 +97,9 @@ async def execute_notion_ops(
                 _update_task_summary(notion, op_dict)
 
             else:
-                print(f"[NotionOps] Unknown op: {op_name!r} (index={idx})")
+                print(f"[NotionOps] Unknown op={op_name!r} (index={idx})")
 
         except Exception as e:
-            # 1 op ごとに握りつぶし、残りの ops は継続実行
             print(
                 "[NotionOps] Fatal error at index "
                 f"{idx} (op={op_name!r}, task_id={op_dict.get('task_id')!r}): {e!r}"
@@ -108,9 +113,8 @@ async def execute_notion_ops(
 def _normalize_ops(
     raw: Union[None, Dict[str, Any], Sequence[Dict[str, Any]]]
 ) -> List[Dict[str, Any]]:
-    """
-    呼び出し側から渡される ops を、内部表現 list[dict] に正規化する。
-    """
+    """内部表現 list[dict] に正規化する。"""
+
     if raw is None:
         return []
 
@@ -120,7 +124,6 @@ def _normalize_ops(
     if isinstance(raw, (list, tuple)):
         return [op for op in raw if isinstance(op, dict)]
 
-    # 想定外の型は無視
     print(f"[NotionOps] unexpected ops type: {type(raw)!r}")
     return []
 
@@ -146,7 +149,7 @@ def _create_task_item(notion, ops: Dict[str, Any]) -> None:
                 "started_at": {"date": None},
                 "ended_at": {"date": None},
                 "duration": {"number": 0},
-                # summary は後続の update_task_summary で設定
+                # summary は update_task_summary で設定する
             },
         )
         print(f"[NotionOps] task_create {task_id}")
@@ -167,9 +170,10 @@ def _update_task_status(notion, ops: Dict[str, Any], status: str) -> None:
         print(f"[NotionOps] No such task {task_id}")
         return
 
+    # status → timestamp の対応
     timestamp_prop = {
         "in_progress": "started_at",
-        "paused": "paused_at",      # paused_at は DB 上にないので更新しない
+        "paused": "paused_at",      # paused_at は DB 側未設定のためスキップ
         "completed": "ended_at",
         "not_started": None,
     }.get(status)
@@ -185,10 +189,7 @@ def _update_task_status(notion, ops: Dict[str, Any], status: str) -> None:
         properties["ended_at"] = {"date": {"start": _now_iso()}}
 
     try:
-        notion.pages.update(
-            page_id=page["id"],
-            properties=properties,
-        )
+        notion.pages.update(page_id=page["id"], properties=properties)
         print(f"[NotionOps] status → {status} (task_id={task_id})")
 
     except Exception as e:
@@ -196,7 +197,7 @@ def _update_task_status(notion, ops: Dict[str, Any], status: str) -> None:
 
 
 # ============================================================
-# Duration 更新（task_end → Stabilizer が ops 追加）
+# Duration 更新
 # ============================================================
 
 def _update_task_duration(notion, ops: Dict[str, Any]) -> None:
@@ -211,9 +212,7 @@ def _update_task_duration(notion, ops: Dict[str, Any]) -> None:
     try:
         notion.pages.update(
             page_id=page["id"],
-            properties={
-                "duration": {"number": duration_seconds}
-            },
+            properties={"duration": {"number": duration_seconds}},
         )
         print(f"[NotionOps] duration update {task_id} = {duration_seconds}")
 
@@ -226,12 +225,6 @@ def _update_task_duration(notion, ops: Dict[str, Any]) -> None:
 # ============================================================
 
 def _update_task_summary(notion, ops: Dict[str, Any]) -> None:
-    """
-    Task のサマリテキストを更新する。
-
-    前提：
-      - Notion DB 側に "summary" (rich_text) プロパティが存在すること。
-    """
     task_id = ops["task_id"]
     summary_text = ops.get("summary_text", "")
 
@@ -244,16 +237,13 @@ def _update_task_summary(notion, ops: Dict[str, Any]) -> None:
         print(f"[NotionOps] No such task for summary {task_id}")
         return
 
+    # Notion rich_text 用構築
+    rich = [{"text": {"content": summary_text}}]
+
     try:
         notion.pages.update(
             page_id=page["id"],
-            properties={
-                "summary": {
-                    "rich_text": [
-                        {"text": {"content": summary_text}}
-                    ]
-                }
-            },
+            properties={"summary": {"rich_text": rich}},
         )
         print(f"[NotionOps] summary update {task_id}")
 
