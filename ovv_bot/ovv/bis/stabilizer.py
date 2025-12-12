@@ -1,28 +1,28 @@
-# ovv/bis/stabilizer.py
 # ============================================================
-# MODULE CONTRACT: BIS / Stabilizer v3.8
-#   (Persist v3.0 + NotionOps + Duration + TaskSummary + DebugTrace)
+# MODULE CONTRACT: BIS / Stabilizer v3.9
+#   (Persist v3.0 + NotionOps + Duration + TaskSummary + WBS Finalize)
 #
 # ROLE:
 #   - BIS の最終統合レイヤ。
-#   - Core 出力をもとに：
+#   - Core / Interface_Box 出力をもとに：
 #         [1] Persist v3.0 への書き込み
 #         [2] NotionOps の拡張（duration / summary）
-#         [3] Notion API の逐次実行
-#         [4] Discord へ返す最終メッセージ確定
+#         [3] work_item finalized（done / dropped）の Notion 移送
+#         [4] Notion API の逐次実行
+#         [5] Discord へ返す最終メッセージ確定
 #
 # RESPONSIBILITY TAGS:
-#   [PERSIST]   task_log / task_session
-#   [BUILD_OPS] duration / summary の ops 構築
-#   [EXEC_OPS]  Notion Executor 呼び出し
-#   [FINAL]     Discord 出力確定
-#   [DEBUG]     pipeline 全体の状態追跡
+#   [PERSIST]        task_log / task_session
+#   [BUILD_OPS]      duration / summary / finalized_item ops 構築
+#   [EXEC_OPS]       Notion Executor 呼び出し
+#   [FINAL]          Discord 出力確定
+#   [DEBUG]          pipeline 全体の状態追跡
 #
 # CONSTRAINTS:
 #   - Core → Stabilizer → Executor の一方向のみ
 #   - Notion API エラーはログ出力し、実行は継続
 #   - duration_seconds の唯一の真は DB（Persist）
-#   - summary_text は Core が生成したものを最優先
+#   - summary_text は Core 生成を最優先
 # ============================================================
 
 from __future__ import annotations
@@ -134,7 +134,7 @@ class Stabilizer:
             traceback.print_exc()
 
     # ========================================================
-    # [BUILD_OPS] duration ops の付与
+    # [BUILD_OPS] duration ops
     # ========================================================
     def _augment_duration(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if (
@@ -152,16 +152,24 @@ class Stabilizer:
         return ops
 
     # ========================================================
-    # [BUILD_OPS] summary text 構築
+    # [BUILD_OPS] summary text
     # ========================================================
     def _build_summary_text(self) -> str:
-        # Core で明示生成していれば最優先
+        # Core 明示生成を最優先
         for key in ("task_summary", "summary_text", "task_summary_text"):
             v = self.core_output.get(key)
             if isinstance(v, str) and v.strip():
                 return v.strip()
 
-        # 次善策：Discord メッセージ
+        # work_item finalized 由来
+        finalized = self.thread_state.get("finalized_item")
+        if isinstance(finalized, dict):
+            rationale = finalized.get("rationale")
+            status = finalized.get("status")
+            if rationale and status:
+                return f"[WBS:{status}] {rationale}"
+
+        # フォールバック：Discord メッセージ
         msg = self.message_for_user.strip()
         if msg:
             return msg
@@ -169,10 +177,11 @@ class Stabilizer:
         return ""
 
     # ========================================================
-    # [BUILD_OPS] summary ops の付与
+    # [BUILD_OPS] summary ops
     # ========================================================
     def _augment_summary(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if self.command_type not in ("task_paused", "task_end"):
+        # task_paused / task_end / work_item finalize のみ
+        if self.command_type not in ("task_paused", "task_end", "wbs_done", "wbs_drop"):
             return ops
 
         if not self.task_id:
@@ -198,7 +207,7 @@ class Stabilizer:
     async def finalize(self) -> str:
 
         # -----------------------------------------
-        # 1. Persist（DB 永続化）
+        # 1. Persist
         # -----------------------------------------
         try:
             self._write_persist()
@@ -207,7 +216,7 @@ class Stabilizer:
             traceback.print_exc()
 
         # -----------------------------------------
-        # 2. NotionOps（duration → summary → execute）
+        # 2. NotionOps
         # -----------------------------------------
         ops = list(self.notion_ops)
         ops = self._augment_duration(ops)
@@ -234,6 +243,6 @@ class Stabilizer:
                 traceback.print_exc()
 
         # -----------------------------------------
-        # 3. Discord 出力を返す
+        # 3. Discord 出力
         # -----------------------------------------
         return self.message_for_user
