@@ -9,7 +9,7 @@
 # RESPONSIBILITY TAGS:
 #   [DISCORD_IO]   Discord イベント処理
 #   [DELEGATE]     Boundary_Gate への完全委譲
-#   [DEBUG]        起動時の環境可視化
+#   [DEBUG]        起動時の環境可視化 / Debug Command Suite 登録
 #
 # CONSTRAINTS:
 #   - Core / WBS / Persist / Notion を直接触らない
@@ -42,6 +42,7 @@ print("=== END SYSPATH ===\n")
 # Discord Bot 初期化
 # ================================================================
 from ovv.bis.boundary_gate import handle_discord_input
+from debug.debug_commands import register_debug_commands  # ★ 必須
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -49,6 +50,11 @@ intents.message_content = True
 # command_prefix を空にし、全入力を on_message で扱う
 bot = commands.Bot(command_prefix="", intents=intents)
 
+# ================================================================
+# Debug Command Suite 登録
+# ================================================================
+register_debug_commands(bot)
+print("[DEBUG] Debug Command Suite registered.")
 
 # ================================================================
 # Discord Events
@@ -57,21 +63,23 @@ bot = commands.Bot(command_prefix="", intents=intents)
 async def on_ready():
     print(f"[Discord] Bot logged in as {bot.user}")
 
-
 @bot.event
 async def on_message(message: discord.Message):
     """
     [DISCORD_IO]
 
     - Bot 自身の発言は無視
-    - すべて Boundary_Gate に委譲
+    - Debug Commands は discord.py Command System に流す
+    - 通常入力は Boundary_Gate に完全委譲
     """
     if message.author.bot:
         return
 
-    # Boundary_Gate がコマンド種別を判定する
-    await handle_discord_input(message)
+    # ---- Debug / commands.py 系は必ず通す ----
+    await bot.process_commands(message)
 
+    # ---- 業務ロジックは Boundary_Gate に委譲 ----
+    await handle_discord_input(message)
 
 # ================================================================
 # Entry Point
@@ -79,7 +87,6 @@ async def on_message(message: discord.Message):
 def run(token: str):
     print("[Discord] starting bot.run()")
     bot.run(token)
-
 
 # Render の Start Command が "python bot.py" の場合に備える
 if __name__ == "__main__":
