@@ -1,6 +1,6 @@
 # ovv/bis/boundary_gate.py
 # ============================================================
-# MODULE CONTRACT: BIS / Boundary_Gate v3.5 (ThreadWBS Commands Routed)
+# MODULE CONTRACT: BIS / Boundary_Gate v3.6 (ThreadWBS Command Routing Hardened)
 #
 # ROLE:
 #   - Discord on_message → BIS パイプラインへの入口。
@@ -56,7 +56,7 @@ def _detect_command_type(raw: str) -> Optional[str]:
         "!tc": "task_end",
 
         # ThreadWBS user-ack commands (draft -> minimal routing)
-        "!wy": "wbs_accept",   # CDC候補を採用
+        "!wy": "wbs_accept",   # CDC候補を採用（※現段階では IFACE 側は未実装でもOK）
         "!wn": "wbs_reject",   # CDC候補を破棄
         "!we": "wbs_edit",     # CDC候補を編集採用（後続テキスト必須想定）
 
@@ -90,6 +90,40 @@ def _strip_head_token(raw: str) -> str:
 
 
 # ------------------------------------------------------------
+# Internal helpers
+# ------------------------------------------------------------
+
+def _safe_get_channel(message) -> object:
+    ch = getattr(message, "channel", None)
+    return ch
+
+
+def _extract_discord_context(message) -> tuple[str, str, str]:
+    """
+    returns: (channel_id, thread_name, send_target)
+      - send_target は message.channel をそのまま使う前提（互換のため）
+    """
+    channel = _safe_get_channel(message)
+    channel_id = str(getattr(channel, "id", "") or "")
+
+    # Thread名（存在すれば）を付与（下流で !t 初期WBS生成に使う）
+    thread_name = str(getattr(channel, "name", "") or "")
+
+    return channel_id, thread_name, channel
+
+
+def _extract_author_meta(message) -> tuple[str, str]:
+    author = getattr(message, "author", None)
+    author_id = str(getattr(author, "id", "") or "")
+    user_name = (
+        getattr(author, "display_name", None)
+        or getattr(author, "name", None)
+        or ""
+    )
+    return author_id, str(user_name)
+
+
+# ------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------
 
@@ -100,10 +134,10 @@ async def handle_discord_input(message) -> None:
     """
 
     # Bot自身の発言は無視
-    if getattr(message.author, "bot", False):
+    if getattr(getattr(message, "author", None), "bot", False):
         return
 
-    raw_content = (message.content or "").strip()
+    raw_content = (getattr(message, "content", "") or "").strip()
     command_type = _detect_command_type(raw_content)
 
     # コマンド以外は現フェーズでは無視
@@ -112,19 +146,11 @@ async def handle_discord_input(message) -> None:
 
     # Discord context → Ovv context
     # Discord Thread = task_id = context_key（現行方針）
-    channel = getattr(message, "channel", None)
-    channel_id = str(getattr(channel, "id", ""))
-    author_id = str(getattr(getattr(message, "author", None), "id", ""))
+    channel_id, thread_name, channel = _extract_discord_context(message)
+    author_id, user_name = _extract_author_meta(message)
 
     context_key = channel_id
     task_id = context_key
-
-    # Thread名（存在すれば）を付与（下流で !t 初期WBS生成に使う）
-    thread_name = getattr(channel, "name", None) or ""
-
-    user_name = getattr(message.author, "display_name", None) or getattr(
-        message.author, "name", ""
-    )
 
     user_meta = {
         "user_id": author_id,
@@ -146,7 +172,7 @@ async def handle_discord_input(message) -> None:
         user_meta=user_meta,
         meta={
             "discord_channel_id": channel_id,
-            "discord_message_id": str(getattr(message, "id", "")),
+            "discord_message_id": str(getattr(message, "id", "") or ""),
             "discord_thread_name": thread_name,
         },
     )
@@ -154,7 +180,12 @@ async def handle_discord_input(message) -> None:
     # --------------------------------------------------------
     # ★ dbg_packet 用に Packet Capture
     # --------------------------------------------------------
-    capture(packet)
+    try:
+        capture(packet)
+    except Exception as e:
+        # capture 失敗は致命ではない（境界で握りつぶす）
+        if DEBUG_BIS:
+            print("[Boundary_Gate:WARN] capture(packet) failed:", repr(e))
 
     if DEBUG_BIS:
         print("[Boundary_Gate] Captured InputPacket:", packet)
@@ -187,4 +218,10 @@ async def handle_discord_input(message) -> None:
     # Discord に返す
     # --------------------------------------------------------
     if final_message:
-        await message.channel.send(final_message)
+        try:
+            # channel が None のケースは Discord 側異常として握る
+            if channel is not None:
+                await channel.send(final_message)
+        except Exception as e:
+            if DEBUG_BIS:
+                print("[Boundary_Gate:WARN] failed to send message:", repr(e))
