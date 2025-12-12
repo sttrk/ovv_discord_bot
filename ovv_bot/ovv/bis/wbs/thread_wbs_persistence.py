@@ -2,18 +2,21 @@
 # MODULE CONTRACT: BIS / ThreadWBS Persistence v1.0 (Minimal)
 #
 # ROLE:
-#   - thread_id ↔ ThreadWBS(JSON text) の永続化
-#   - WBS の「保存 / 取得」のみを責務とする
+#   - thread_id ↔ ThreadWBS(JSON text) の永続化を担当する。
+#   - 保存（UPSERT）と取得（LOAD）のみを行う。
 #
 # RESPONSIBILITY TAGS:
-#   [PERSIST]   PostgreSQL への保存・取得
-#   [STRICT]    ロジックを持たない（Builder 非依存）
-#   [MINIMAL]   STEP2 用の最小実装
+#   [PERSIST]   ThreadWBS の DB 永続化
+#   [LOAD]      ThreadWBS の取得
+#   [MINIMAL]   STEP A 用の最小責務実装
+#   [STRICT]    構造解釈・編集・推論を一切行わない
 #
-# CONSTRAINTS:
+# CONSTRAINTS (HARD):
 #   - ThreadWBS の構造を解釈しない
-#   - CDC / Builder / IFACE ロジックを含めない
-#   - 1 thread_id = 1 row
+#   - CDC / Builder / Interface_Box ロジックを含めない
+#   - Persist v3.0 の接続管理に完全追従する
+#   - 独自 connection / commit / close を行わない
+#   - 1 thread_id = 1 row を厳守する
 # ============================================================
 
 from __future__ import annotations
@@ -22,14 +25,18 @@ from typing import Optional, Dict, Any
 import json
 import datetime
 
-from database.pg import get_connection
+from database.pg import init_db
 
 
 # ============================================================
-# Internal helpers
+# Internal Helpers
 # ============================================================
 
-def _now_utc():
+def _now_utc() -> datetime.datetime:
+    """
+    UTC 現在時刻を返す。
+    Persist 側の TIMESTAMP と整合させるため naive UTC を使用。
+    """
     return datetime.datetime.utcnow()
 
 
@@ -39,36 +46,44 @@ def _now_utc():
 
 def load_thread_wbs(thread_id: str) -> Optional[Dict[str, Any]]:
     """
+    [LOAD]
     ThreadWBS を取得する。
-    存在しない場合は None を返す。
+
+    Returns:
+        - Dict[str, Any]: JSON を復元した WBS
+        - None: 未存在 or JSON 破損時
     """
     sql = """
         SELECT wbs_json
         FROM thread_wbs
         WHERE thread_id = %s
-        LIMIT 1
+        LIMIT 1;
     """
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (thread_id,))
-            row = cur.fetchone()
+    conn = init_db()
+    with conn.cursor() as cur:
+        cur.execute(sql, (thread_id,))
+        row = cur.fetchone()
 
-            if not row:
-                return None
+        if not row:
+            return None
 
-            raw = row[0]
-            try:
-                return json.loads(raw)
-            except Exception:
-                # JSON 破損時は None 扱い（破綻回避）
-                return None
+        raw = row[0]
+        try:
+            return json.loads(raw)
+        except Exception:
+            # JSON 破損時は破綻回避を優先し None 扱い
+            return None
 
 
 def save_thread_wbs(thread_id: str, wbs_json: Dict[str, Any]) -> None:
     """
+    [PERSIST]
     ThreadWBS を保存する。
-    既存 row があれば上書き、なければ INSERT。
+
+    動作:
+        - row が存在しない場合: INSERT
+        - row が存在する場合: UPDATE（上書き）
     """
     raw = json.dumps(wbs_json, ensure_ascii=False)
 
@@ -78,17 +93,16 @@ def save_thread_wbs(thread_id: str, wbs_json: Dict[str, Any]) -> None:
         ON CONFLICT (thread_id)
         DO UPDATE SET
             wbs_json = EXCLUDED.wbs_json,
-            updated_at = EXCLUDED.updated_at
+            updated_at = EXCLUDED.updated_at;
     """
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                sql,
-                (
-                    thread_id,
-                    raw,
-                    _now_utc(),
-                ),
-            )
-        conn.commit()
+    conn = init_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            sql,
+            (
+                thread_id,
+                raw,
+                _now_utc(),
+            ),
+        )
