@@ -1,5 +1,6 @@
 # ============================================================
-# MODULE CONTRACT: BIS / Interface_Box v3.9.1 (CDC Runtime Lock — Spec Fixed)
+# MODULE CONTRACT: BIS / Interface_Box v3.10
+#   (CDC Runtime Lock + WorkItem Finalize)
 #
 # ROLE:
 #   - Boundary_Gate から渡された InputPacket を受け取り、
@@ -8,6 +9,7 @@
 #   - 明示コマンドに限り、ThreadWBS の最小更新を発火させる。
 #   - CDC による work_item 候補は Runtime のみに保持し、
 #     !wy / !wn / !we でのみ確定・破棄する。
+#   - !wd / !wx により work_item を done / dropped に確定する。
 #
 # HARD GUARANTEES:
 #   - CDC 候補の永続化は禁止（Runtime only）
@@ -18,7 +20,6 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
-from datetime import datetime, timezone
 
 from ovv.core.ovv_core import run_core
 from ovv.external_services.notion.ops.builders import build_notion_ops
@@ -32,19 +33,15 @@ from ovv.bis.wbs.thread_wbs_builder import (
     edit_and_accept_work_item,
     on_task_pause,
     on_task_complete,
+    mark_focus_done,
+    mark_focus_dropped,
 )
 
 # ============================================================
 # STEP A: CDC Candidate Runtime Store
-#   - 明示的に「プロセス内メモリのみ」
-#   - 1 thread_id = 1 candidate
 # ============================================================
 
 _RUNTIME_CDC: Dict[str, Dict[str, Any]] = {}
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 # ============================================================
@@ -81,7 +78,8 @@ def _format_wbs_brief(wbs: Dict[str, Any]) -> str:
     else:
         lines.append("- work_items:")
         for i, it in enumerate(items):
-            lines.append(f"  - [{i}] {it.get('rationale', '')}")
+            status = it.get("status", "active")
+            lines.append(f"  - [{i}] ({status}) {it.get('rationale', '')}")
     return "\n".join(lines)
 
 
@@ -94,7 +92,6 @@ def _store_cdc_candidate(thread_id: str, rationale: str) -> str:
         return "[CDC] candidate already exists; use !wy / !wn / !we."
     _RUNTIME_CDC[thread_id] = {
         "rationale": rationale.strip(),
-        "generated_at": _now_iso(),
     }
     return "[CDC] candidate generated. Reply with !wy / !wn / !we."
 
@@ -116,56 +113,82 @@ def _apply_wbs_update(
     thread_id: Optional[str],
     packet: InputPacket,
     wbs: Optional[Dict[str, Any]],
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Returns:
+      - updated_wbs
+      - user_hint
+      - finalized_item (done / dropped 時のみ)
+    """
+    finalized_item = None
 
     if not command or not thread_id:
-        return wbs, None
+        return wbs, None, None
+
+    # ---- task lifecycle ----
 
     if command == "task_create":
         if wbs is not None:
-            return wbs, "[WBS] already exists."
+            return wbs, "[WBS] already exists.", None
         wbs = create_empty_wbs(_get_thread_name(packet))
         save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] initialized."
+        return wbs, "[WBS] initialized.", None
 
     if command == "task_paused" and wbs:
         wbs = on_task_pause(wbs)
         save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] paused."
+        return wbs, "[WBS] paused.", None
 
     if command == "task_end" and wbs:
         wbs = on_task_complete(wbs)
         save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] completed."
+        return wbs, "[WBS] completed.", None
+
+    # ---- inspection ----
 
     if command == "wbs_show" and wbs:
-        return wbs, _format_wbs_brief(wbs)
+        return wbs, _format_wbs_brief(wbs), None
+
+    # ---- CDC accept / reject ----
 
     if command == "wbs_accept" and wbs:
         cand = _pop_cdc_candidate(thread_id)
         if not cand:
-            return wbs, "[CDC] no candidate."
+            return wbs, "[CDC] no candidate.", None
         wbs = accept_work_item(wbs, cand)
         save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] work_item accepted."
+        return wbs, "[WBS] work_item accepted.", None
 
     if command == "wbs_reject":
         _pop_cdc_candidate(thread_id)
-        return wbs, "[CDC] candidate rejected."
+        return wbs, "[CDC] candidate rejected.", None
 
     if command == "wbs_edit" and wbs:
         cand = _peek_cdc_candidate(thread_id)
         if not cand:
-            return wbs, "[CDC] no candidate."
+            return wbs, "[CDC] no candidate.", None
         new_text = packet.content.strip()
         if not new_text:
-            return wbs, "[CDC] edit text required."
+            return wbs, "[CDC] edit text required.", None
         _pop_cdc_candidate(thread_id)
         wbs = edit_and_accept_work_item(wbs, cand, new_text)
         save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] edited & accepted."
+        return wbs, "[WBS] edited & accepted.", None
 
-    return wbs, None
+    # ---- work_item finalize ----
+
+    if command == "wbs_done" and wbs:
+        wbs, finalized_item = mark_focus_done(wbs)
+        save_thread_wbs(thread_id, wbs)
+        return wbs, "[WBS] work_item marked as done.", finalized_item
+
+    if command == "wbs_drop" and wbs:
+        reason = packet.content.strip() or None
+        wbs, finalized_item = mark_focus_dropped(wbs, reason=reason)
+        save_thread_wbs(thread_id, wbs)
+        return wbs, "[WBS] work_item dropped.", finalized_item
+
+    return wbs, None, None
 
 
 # ============================================================
@@ -177,7 +200,9 @@ async def handle_request(packet: InputPacket) -> str:
     thread_id = _select_thread_id(packet.task_id, packet.context_key)
 
     wbs = load_thread_wbs(thread_id) if thread_id else None
-    wbs, wbs_hint = _apply_wbs_update(command, thread_id, packet, wbs)
+    wbs, wbs_hint, finalized_item = _apply_wbs_update(
+        command, thread_id, packet, wbs
+    )
 
     core_input = {
         "command_type": command,
@@ -191,6 +216,7 @@ async def handle_request(packet: InputPacket) -> str:
 
     core_output = run_core(core_input)
 
+    # CDC capture (task_create only)
     cdc_hint = None
     if command == "task_create" and thread_id:
         cdc = core_output.get("cdc_candidate")
@@ -214,7 +240,10 @@ async def handle_request(packet: InputPacket) -> str:
         task_id=packet.task_id,
         command_type=core_output.get("mode"),
         core_output=core_output,
-        thread_state={"thread_wbs": wbs} if wbs else None,
+        thread_state={
+            "thread_wbs": wbs,
+            "finalized_item": finalized_item,  # ★ 次工程で NotionTaskSummary に移送
+        } if wbs else None,
     )
 
     return await stabilizer.finalize()
