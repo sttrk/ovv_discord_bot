@@ -1,16 +1,16 @@
-# ovv/core/ovv_core.py
 # ============================================================
-# Ovv Core v2.2 — Task A案 + TaskSummary A案(min) 対応版
+# Ovv Core v2.3 — Task A案 + CDC Candidate 固定版
 #
 # ROLE:
 #   - BIS / Interface_Box から受け取った core_input(dict) を解釈し、
 #     Task 系コマンド（create / start / paused / end）と free_chat を振り分ける。
-#   - Persist / Notion 用のメタ情報（task_name / task_summary など）を組み立てる。
+#   - Task_create 時にのみ CDC 候補を 1 件生成して返す。
 #
 # RESPONSIBILITY TAGS:
-#   [DISPATCH]  command_type に応じたハンドラ分岐
-#   [TASK_META] task_name / task_summary など Task 用メタ情報の構築
-#   [USER_MSG]  Discord へ返す message_for_user の生成
+#   [DISPATCH]      command_type に応じたハンドラ分岐
+#   [TASK_META]     task_name / task_summary など Task 用メタ情報の構築
+#   [CDC_OUTPUT]    cdc_candidate の生成（task_create のみ）
+#   [USER_MSG]      Discord へ返す message_for_user の生成
 #
 # CONSTRAINTS:
 #   - 外部 I/O（DB / Notion / Discord）は一切行わない（純ロジック層）。
@@ -33,7 +33,7 @@ def run_core(core_input: Dict[str, Any]) -> Dict[str, Any]:
     context_key = core_input.get("context_key")
     user_id = core_input.get("user_id")
 
-    # task_id がまだない場合は context_key を fallback として採用
+    # task_id がまだない場合は context_key を fallback
     if task_id is None and context_key is not None:
         task_id = str(context_key)
 
@@ -56,10 +56,14 @@ def run_core(core_input: Dict[str, Any]) -> Dict[str, Any]:
 # Handlers
 # ============================================================
 
-def _handle_task_create(task_id: str | None, arg_text: str, user_id: str | None) -> Dict[str, Any]:
+def _handle_task_create(
+    task_id: str | None,
+    arg_text: str,
+    user_id: str | None,
+) -> Dict[str, Any]:
     """
     新規タスクの登録。
-    - Notion 側では name/title として反映される。
+    - task_create 時のみ CDC 候補を 1 件生成する。
     """
     if task_id is None:
         return {
@@ -76,21 +80,28 @@ def _handle_task_create(task_id: str | None, arg_text: str, user_id: str | None)
         "[task_create] 新しいタスクを登録しました。\n"
         f"- task_id   : {task_id}\n"
         f"- name      : {title}\n"
-        f"- created_by: {user_label}"
+        f"- created_by: {user_label}\n\n"
+        "[CDC] 作業候補を生成しました。承認する場合は !wy、破棄は !wn、編集は !we を使用してください。"
     )
+
+    # ---- CDC Candidate（固定キー・1行） ----
+    cdc_candidate = {
+        "rationale": f"{title} を進めるための最初の作業項目を定義する"
+    }
 
     return {
         "message_for_user": msg,
         "mode": "task_create",
         "task_name": title,
         "task_id": task_id,
+        # ★ Interface_Box が拾う唯一正のキー
+        "cdc_candidate": cdc_candidate,
     }
 
 
 def _handle_task_start(task_id: str | None, arg_text: str) -> Dict[str, Any]:
     """
     学習セッション開始。
-    - duration は Persist 側で task_end までの時間として算出される。
     """
     if task_id is None:
         return {
@@ -119,8 +130,6 @@ def _handle_task_start(task_id: str | None, arg_text: str) -> Dict[str, Any]:
 def _handle_task_paused(task_id: str | None) -> Dict[str, Any]:
     """
     学習一時停止。
-    - A案（ミニマム）では、現時点では簡易サマリとして message_for_user をそのまま TaskSummary に流用する。
-    - 将来、ThreadBrain / Persist を用いた高度な要約に差し替え可能なよう、task_summary キーを予約する。
     """
     if task_id is None:
         return {
@@ -137,7 +146,6 @@ def _handle_task_paused(task_id: str | None) -> Dict[str, Any]:
         "message_for_user": msg,
         "mode": "task_paused",
         "task_id": task_id,
-        # TaskSummary A案 (min): 現段階では Discord 向けメッセージをそのままサマリとして記録
         "task_summary": msg,
     }
 
@@ -145,8 +153,6 @@ def _handle_task_paused(task_id: str | None) -> Dict[str, Any]:
 def _handle_task_end(task_id: str | None) -> Dict[str, Any]:
     """
     学習セッション終了。
-    - duration は Persist v3.0 側で算出 → Stabilizer から Notion に同期。
-    - TaskSummary A案（ミニマム）では、終了時点のメッセージを summary として記録する。
     """
     if task_id is None:
         return {
@@ -163,7 +169,6 @@ def _handle_task_end(task_id: str | None) -> Dict[str, Any]:
         "message_for_user": msg,
         "mode": "task_end",
         "task_id": task_id,
-        # TaskSummary A案 (min): 終了時点の状態をそのまま summary として保存
         "task_summary": msg,
     }
 
@@ -174,8 +179,7 @@ def _handle_free_chat(
     context_key: str | None,
 ) -> Dict[str, Any]:
     """
-    Task 管理コマンド以外の入力を受けた場合の Fallback。
-    - 現フェーズでは、タスク管理モードを優先しつつ、入力をそのまま echo する。
+    Task 管理コマンド以外の Fallback。
     """
     base = raw_text.strip() or "(empty)"
 
