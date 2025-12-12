@@ -1,6 +1,7 @@
+# ovv/bis/boundary_gate.py
 # ============================================================
 # MODULE CONTRACT: BIS / Boundary_Gate v3.7.1
-#   (ThreadWBS Command Routing + Done/Dropped + Hardened)
+#   (ThreadWBS Command Routing + Done/Dropped + Hardened + DebugSuite Routed)
 #
 # ROLE:
 #   - Discord on_message → BIS パイプラインへの入口。
@@ -22,6 +23,7 @@
 # NOTE:
 #   - ThreadWBS の更新は「明示コマンド」を InputPacket.command に載せて下流へ渡す。
 #     （Boundary_Gate はルーティングのみ。更新ロジック/永続化は担当しない）
+#   - Debug Command Suite は「必ず下流へ通す」(入口で捨てない)。
 # ============================================================
 
 from __future__ import annotations
@@ -42,6 +44,23 @@ DEBUG_BIS = True  # Render ログに内部スタックトレースを出す
 
 
 # ------------------------------------------------------------
+# Debug Command Suite (routing only)
+# ------------------------------------------------------------
+
+_DEBUG_COMMAND_HEADS = {
+    # 代表的なデバッグコマンド（揺れ耐性）
+    "!dbg",
+    "!debug",
+    "!packet",
+    "!dbg_packet",
+    "!state",
+    "!dbg_state",
+    "!help",
+    "!dbg_help",
+}
+
+
+# ------------------------------------------------------------
 # Command 判定
 # ------------------------------------------------------------
 
@@ -49,11 +68,18 @@ def _detect_command_type(raw: str) -> Optional[str]:
     """
     Discord の先頭トークンから command_type を決定する。
     Boundary_Gate は「検出と正規化」までが責務。
+
+    HARD:
+      - Debug Command Suite は必ず下流へ通す（入口で捨てない）。
     """
     if not raw:
         return None
 
     head = raw.strip().split()[0].lower()
+
+    # ---- Debug suite: ALWAYS PASS ----
+    if head in _DEBUG_COMMAND_HEADS:
+        return "debug"
 
     mapping = {
         # Task / thread lifecycle
@@ -94,6 +120,8 @@ def _strip_head_token(raw: str) -> str:
     """
     先頭トークン（コマンド）を除いた残りを content として返す。
     例: "!we 修正文" -> "修正文"
+        "!dbg" -> ""
+        "!packet latest" -> "latest"
     """
     if not raw:
         return ""
