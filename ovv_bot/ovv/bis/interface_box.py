@@ -1,6 +1,7 @@
 # ovv/bis/interface_box.py
 # ============================================================
-# MODULE CONTRACT: BIS / Interface_Box v3.10 (CDC Runtime Lock + WBS Finalize)
+# MODULE CONTRACT: BIS / Interface_Box v3.11
+#   (Debugging Subsystem v1.0 compliant / CDC Runtime Lock + WBS Finalize)
 #
 # ROLE:
 #   - Boundary_Gate から渡された InputPacket を受け取り、
@@ -16,12 +17,19 @@
 #   - CDC 候補の永続化は禁止（Runtime only）
 #   - LLM による自動改変は禁止
 #   - WBS 更新は明示コマンドのみ
+#
+# DEBUGGING SUBSYSTEM v1.0 COMPLIANCE:
+#   - trace_id は Boundary 生成のものを受領し、以降ログに必ず付与する
+#   - チェックポイント名は固定・有限（Checkpoint Determinism）
+#   - except は必ず構造ログを吐き、握りつぶさず raise（FAILSAFE は Boundary が担当）
 # ============================================================
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 from datetime import datetime, timezone
+import json
+import traceback
 
 from ovv.core.ovv_core import run_core
 from ovv.external_services.notion.ops.builders import build_notion_ops
@@ -40,16 +48,111 @@ from ovv.bis.wbs.thread_wbs_builder import (
 )
 
 # ============================================================
+# Debugging Subsystem v1.0 — Checkpoints (FIXED)
+#   Interface/Core layer checkpoints
+# ============================================================
+
+LAYER_CORE = "CORE"
+
+CP_CORE_RECEIVE_PACKET = "CORE_RECEIVE_PACKET"      # CORE-01
+CP_CORE_PARSE_INTENT = "CORE_PARSE_INTENT"          # CORE-02
+CP_CORE_EXECUTE = "CORE_EXECUTE"                    # CORE-03
+CP_CORE_RETURN_RESULT = "CORE_RETURN_RESULT"        # CORE-04
+CP_CORE_EXCEPTION = "CORE_EXCEPTION"                # CORE-FAIL
+
+
+# ============================================================
+# Structured Logging (Observation Only)
+# ============================================================
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log_event(
+    *,
+    trace_id: str,
+    checkpoint: str,
+    layer: str,
+    level: str,
+    summary: str,
+    error: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "trace_id": trace_id,
+        "checkpoint": checkpoint,
+        "layer": layer,
+        "level": level,
+        "summary": summary,
+        "timestamp": _now_iso(),
+    }
+    if error is not None:
+        payload["error"] = error
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def _log_debug(*, trace_id: str, checkpoint: str, summary: str) -> None:
+    _log_event(
+        trace_id=trace_id,
+        checkpoint=checkpoint,
+        layer=LAYER_CORE,
+        level="DEBUG",
+        summary=summary,
+    )
+
+
+def _log_error(
+    *,
+    trace_id: str,
+    checkpoint: str,
+    summary: str,
+    code: str,
+    exc: Exception,
+    at: str,
+    retryable: bool = False,
+) -> None:
+    _log_event(
+        trace_id=trace_id,
+        checkpoint=checkpoint,
+        layer=LAYER_CORE,
+        level="ERROR",
+        summary=summary,
+        error={
+            "code": code,
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "at": at,
+            "retryable": retryable,
+        },
+    )
+
+
+def _get_trace_id(packet: InputPacket) -> str:
+    """
+    trace_id は Boundary_Gate が唯一生成する（Single Trace Rule）。
+    Interface_Box は受領してログに付与するだけ。
+
+    - packet.trace_id があればそれを優先
+    - なければ packet.meta["trace_id"] を参照
+    - それも無ければ "UNKNOWN"
+    """
+    tid = getattr(packet, "trace_id", None)
+    if isinstance(tid, str) and tid:
+        return tid
+    meta = getattr(packet, "meta", None) or {}
+    mt = meta.get("trace_id")
+    if isinstance(mt, str) and mt:
+        return mt
+    return "UNKNOWN"
+
+
+# ============================================================
 # STEP A: CDC Candidate Runtime Store
 #   - 明示的に「プロセス内メモリのみ」
 #   - 1 thread_id = 1 candidate
 # ============================================================
 
 _RUNTIME_CDC: Dict[str, Dict[str, Any]] = {}
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 # ============================================================
@@ -79,7 +182,7 @@ def _format_wbs_brief(wbs: Dict[str, Any], max_items: int = 10) -> str:
     focus = wbs.get("focus_point", None)
     items = wbs.get("work_items", []) or []
 
-    lines = []
+    lines: List[str] = []
     lines.append("[WBS]")
     lines.append(f"- task: {task}")
     lines.append(f"- status: {status}")
@@ -240,82 +343,105 @@ def _apply_wbs_update(
 # ============================================================
 
 async def handle_request(packet: InputPacket) -> str:
-    command = packet.command
-    thread_id = _select_thread_id(packet.task_id, packet.context_key)
+    """
+    Boundary_Gate → Interface_Box → Core → Stabilizer
 
-    # 1) WBS load（失敗は握る）
-    wbs: Optional[Dict[str, Any]] = None
-    try:
-        if thread_id:
-            wbs = load_thread_wbs(thread_id)
-    except Exception as e:
-        print("[Interface_Box:WARN] failed to load ThreadWBS:", repr(e))
-        wbs = None
+    Debugging Subsystem v1.0:
+      - trace_id は Boundary 生成のものを受領
+      - 例外は握りつぶさず raise（BG_FAILSAFE に集約）
+    """
+    trace_id = _get_trace_id(packet)
+    last_checkpoint = CP_CORE_RECEIVE_PACKET
+    _log_debug(trace_id=trace_id, checkpoint=CP_CORE_RECEIVE_PACKET, summary="core receive packet")
 
-    # 2) WBS explicit update（明示コマンドのみ）
-    wbs_hint: Optional[str] = None
-    finalized_item: Optional[Dict[str, Any]] = None
     try:
+        command = packet.command
+        thread_id = _select_thread_id(packet.task_id, packet.context_key)
+
+        # 1) WBS load（失敗は握らず raise：No Silent Death）
+        last_checkpoint = CP_CORE_PARSE_INTENT
+        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_PARSE_INTENT, summary="load thread_wbs")
+        wbs: Optional[Dict[str, Any]] = load_thread_wbs(thread_id) if thread_id else None
+
+        # 2) WBS explicit update（明示コマンドのみ）
+        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_PARSE_INTENT, summary="apply wbs explicit update")
+        wbs_hint: Optional[str] = None
+        finalized_item: Optional[Dict[str, Any]] = None
         wbs, wbs_hint, finalized_item = _apply_wbs_update(command, thread_id, packet, wbs)
-    except Exception as e:
-        print("[Interface_Box:WARN] failed to update ThreadWBS:", repr(e))
 
-    # 3) Core dispatch（WBS は参照コンテキストとして渡す）
-    core_input = {
-        "command_type": command,
-        "raw_text": packet.raw,
-        "arg_text": packet.content,
-        "task_id": packet.task_id,
-        "context_key": packet.context_key,
-        "user_id": packet.author_id,
-        "thread_wbs": wbs,
-    }
-    core_output = run_core(core_input)
+        # 3) Core dispatch（WBS は参照コンテキストとして渡す）
+        last_checkpoint = CP_CORE_EXECUTE
+        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_EXECUTE, summary="run core")
+        core_input = {
+            "command_type": command,
+            "raw_text": packet.raw,
+            "arg_text": packet.content,
+            "task_id": packet.task_id,
+            "context_key": packet.context_key,
+            "user_id": packet.author_id,
+            "thread_wbs": wbs,
+        }
+        core_output = run_core(core_input)
 
-    # 4) CDC candidate store（task_create のみ、Runtime only）
-    cdc_hint: Optional[str] = None
-    try:
+        # 4) CDC candidate store（task_create のみ、Runtime only）
+        cdc_hint: Optional[str] = None
         if command == "task_create" and thread_id:
             cdc = core_output.get("cdc_candidate")
             if isinstance(cdc, dict):
                 r = cdc.get("rationale")
                 if isinstance(r, str) and r.strip():
                     cdc_hint = _store_cdc_candidate(thread_id, r)
+
+        # 5) message compose（上書き禁止：追記のみ）
+        message = core_output.get("message_for_user", "") or ""
+        for h in (wbs_hint, cdc_hint):
+            if isinstance(h, str) and h.strip():
+                message = f"{message}\n\n{h}" if message else h
+
+        # 6) NotionOps builder
+        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_EXECUTE, summary="build notion ops")
+        notion_ops = build_notion_ops(core_output, request=_PacketProxy(packet))
+
+        # 7) Stabilizer
+        #    NOTE: wbs_done / wbs_drop は Core.mode が free_chat になり得るため、
+        #          Stabilizer には command を優先して渡す（summary 発火のため）。
+        command_type_for_stabilizer = core_output.get("mode") or command
+
+        thread_state: Dict[str, Any] = {}
+        if wbs:
+            thread_state["thread_wbs"] = wbs
+        if finalized_item:
+            thread_state["finalized_item"] = finalized_item
+
+        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_RETURN_RESULT, summary="call stabilizer.finalize")
+        stabilizer = Stabilizer(
+            message_for_user=message,
+            notion_ops=notion_ops,
+            context_key=packet.context_key,
+            user_id=packet.author_id,
+            task_id=packet.task_id,
+            command_type=command_type_for_stabilizer,
+            core_output=core_output,
+            thread_state=thread_state if thread_state else None,
+        )
+
+        result = await stabilizer.finalize()
+        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_RETURN_RESULT, summary="return result")
+        return result
+
     except Exception as e:
-        print("[Interface_Box:WARN] failed to store CDC candidate:", repr(e))
-
-    # 5) message compose（上書き禁止：追記のみ）
-    message = core_output.get("message_for_user", "") or ""
-    for h in (wbs_hint, cdc_hint):
-        if isinstance(h, str) and h.strip():
-            message = f"{message}\n\n{h}" if message else h
-
-    # 6) NotionOps builder
-    notion_ops = build_notion_ops(core_output, request=_PacketProxy(packet))
-
-    # 7) Stabilizer
-    #    NOTE: wbs_done / wbs_drop は Core.mode が free_chat になり得るため、
-    #          Stabilizer には command を優先して渡す（summary 発火のため）。
-    command_type_for_stabilizer = core_output.get("mode") or command
-
-    thread_state: Dict[str, Any] = {}
-    if wbs:
-        thread_state["thread_wbs"] = wbs
-    if finalized_item:
-        thread_state["finalized_item"] = finalized_item
-
-    stabilizer = Stabilizer(
-        message_for_user=message,
-        notion_ops=notion_ops,
-        context_key=packet.context_key,
-        user_id=packet.author_id,
-        task_id=packet.task_id,
-        command_type=command_type_for_stabilizer,
-        core_output=core_output,
-        thread_state=thread_state if thread_state else None,
-    )
-
-    return await stabilizer.finalize()
+        last_checkpoint = CP_CORE_EXCEPTION
+        _log_error(
+            trace_id=trace_id,
+            checkpoint=CP_CORE_EXCEPTION,
+            summary="exception in interface_box",
+            code="E_CORE",
+            exc=e,
+            at=last_checkpoint,
+            retryable=False,
+        )
+        traceback.print_exc()
+        raise  # BG_FAILSAFE に集約
 
 
 class _PacketProxy:
