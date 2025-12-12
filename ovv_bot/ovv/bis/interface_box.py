@@ -1,329 +1,282 @@
-# ovv/bis/interface_box.py
+# ovv/bis/boundary_gate.py
 # ============================================================
-# MODULE CONTRACT: BIS / Interface_Box v3.10 (CDC Runtime Lock + WBS Finalize)
+# MODULE CONTRACT: BIS / Boundary_Gate v3.7.2
+#   (ThreadWBS Command Routing + Done/Dropped + Hardened + DebugSuite Typed)
 #
 # ROLE:
-#   - Boundary_Gate から渡された InputPacket を受け取り、
-#     Core → NotionOps Builder → Stabilizer の実行順序を保証する。
-#   - ThreadWBS を「推論前コンテキスト」として Core に渡す。
-#   - 明示コマンドに限り、ThreadWBS の最小更新を発火させる。
-#   - CDC による work_item 候補は Runtime のみに保持し、
-#     !wy / !wn / !we でのみ確定・破棄する。
-#   - work_item の finalize（done/dropped）は !wd / !wx のみで確定し、
-#     finalized_item は Stabilizer(thread_state) に引き渡す。
+#   - Discord on_message → BIS パイプラインへの入口。
+#   - Discord メッセージ → InputPacket 変換を一元管理。
+#   - パイプライン開始前に InputPacket を capture（dbg_packet 用）
+#   - 例外発生時は Render ログに詳細、Discord には境界エラーを返す。
 #
-# HARD GUARANTEES:
-#   - CDC 候補の永続化は禁止（Runtime only）
-#   - LLM による自動改変は禁止
-#   - WBS 更新は明示コマンドのみ
+# RESPONSIBILITY TAGS:
+#   [ENTRY_BG]     Discord message を受けて入口処理
+#   [CMD_ROUTE]    コマンド検出と正規化（ルーティングのみ）
+#   [PACKETIZE]    InputPacket 構築
+#   [CAPTURE]      dbg_packet 用 capture
+#   [FAILSAFE]     例外隔離（境界で止める）
+#
+# CONSTRAINTS (HARD):
+#   - Core / Persist / Notion / WBS(PG) には直接触れない。
+#   - interface_box.handle_request() のみを呼ぶ。
+#
+# NOTE:
+#   - ThreadWBS の更新は「明示コマンド」を InputPacket.command に載せて下流へ渡す。
+#     （Boundary_Gate はルーティングのみ。更新ロジック/永続化は担当しない）
+#   - Debug Command Suite は「必ず下流へ通す」(入口で捨てない)。
+#   - Debug は command="debug" に潰さず、dbg_* として種別を保持する（情報落ち防止）。
 # ============================================================
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
-from datetime import datetime, timezone
+from typing import Optional, Tuple, Any
+import traceback
 
-from ovv.core.ovv_core import run_core
-from ovv.external_services.notion.ops.builders import build_notion_ops
-from .stabilizer import Stabilizer
 from .types import InputPacket
-
-from ovv.bis.wbs.thread_wbs_persistence import load_thread_wbs, save_thread_wbs
-from ovv.bis.wbs.thread_wbs_builder import (
-    create_empty_wbs,
-    accept_work_item,
-    edit_and_accept_work_item,
-    on_task_pause,
-    on_task_complete,
-    mark_focus_done,
-    mark_focus_dropped,
-)
-
-# ============================================================
-# STEP A: CDC Candidate Runtime Store
-#   - 明示的に「プロセス内メモリのみ」
-#   - 1 thread_id = 1 candidate
-# ============================================================
-
-_RUNTIME_CDC: Dict[str, Dict[str, Any]] = {}
+from .interface_box import handle_request
+from .capture_interface_packet import capture  # dbg_packet 用
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# ------------------------------------------------------------
+# Debug Flag
+# ------------------------------------------------------------
+
+DEBUG_BIS = True  # Render ログに内部スタックトレースを出す
 
 
-# ============================================================
-# Helpers
-# ============================================================
+# ------------------------------------------------------------
+# Debug Command Suite (routing only)
+#   - Boundary では「種別の正規化」まで（実行は下流）
+# ------------------------------------------------------------
 
-def _select_thread_id(task_id: Any, context_key: Any) -> Optional[str]:
-    if task_id:
-        return str(task_id)
-    if context_key is not None:
-        return str(context_key)
-    return None
+_DEBUG_MAP = {
+    # packet dump
+    "!packet": "dbg_packet",
+    "!dbg_packet": "dbg_packet",
 
+    # state dump
+    "!state": "dbg_state",
+    "!dbg_state": "dbg_state",
 
-def _get_thread_name(packet: InputPacket) -> str:
-    meta = getattr(packet, "meta", None) or {}
-    for k in ("discord_thread_name", "discord_channel_name", "thread_name", "channel_name"):
-        v = meta.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return str(getattr(packet, "channel_id", "") or "untitled-task")
-
-
-def _format_wbs_brief(wbs: Dict[str, Any], max_items: int = 10) -> str:
-    task = wbs.get("task", "")
-    status = wbs.get("status", "")
-    focus = wbs.get("focus_point", None)
-    items = wbs.get("work_items", []) or []
-
-    lines = []
-    lines.append("[WBS]")
-    lines.append(f"- task: {task}")
-    lines.append(f"- status: {status}")
-    lines.append(f"- focus_point: {focus}")
-
-    if not items:
-        lines.append("- work_items: (empty)")
-        return "\n".join(lines)
-
-    lines.append("- work_items:")
-    for i, it in enumerate(items[:max_items]):
-        rationale = ""
-        st = ""
-        if isinstance(it, dict):
-            rationale = (it.get("rationale") or "").strip()
-            st = (it.get("status") or "").strip()
-        if not rationale:
-            rationale = "<no rationale>"
-        if st:
-            lines.append(f"  - [{i}] ({st}) {rationale}")
-        else:
-            lines.append(f"  - [{i}] {rationale}")
-
-    if len(items) > max_items:
-        lines.append(f"  ... ({len(items) - max_items} more)")
-
-    return "\n".join(lines)
+    # help
+    "!help": "dbg_help",
+    "!dbg_help": "dbg_help",
+    "!dbg": "dbg_help",
+    "!debug": "dbg_help",
+}
 
 
-# ============================================================
-# CDC Runtime Ops
-# ============================================================
+# ------------------------------------------------------------
+# Command 判定
+# ------------------------------------------------------------
 
-def _store_cdc_candidate(thread_id: str, rationale: str) -> str:
-    if thread_id in _RUNTIME_CDC:
-        return "[CDC] candidate already exists; use !wy / !wn / !we."
-    _RUNTIME_CDC[thread_id] = {
-        "rationale": rationale.strip(),
-        "generated_at": _now_iso(),
+def _detect_command_type(raw: str) -> Optional[str]:
+    """
+    Discord の先頭トークンから command_type を決定する。
+    Boundary_Gate は「検出と正規化」までが責務。
+
+    HARD:
+      - Debug Command Suite は必ず下流へ通す（入口で捨てない）。
+      - Debug は dbg_* に正規化して種別を保持する（情報落ち防止）。
+    """
+    if not raw:
+        return None
+
+    head = raw.strip().split()[0].lower()
+
+    # ---- Debug suite: ALWAYS PASS (typed) ----
+    dbg = _DEBUG_MAP.get(head)
+    if dbg:
+        return dbg
+
+    mapping = {
+        # Task / thread lifecycle
+        "!t": "task_create",
+        "!ts": "task_start",
+        "!tp": "task_paused",
+        "!tc": "task_end",
+
+        # ThreadWBS user-ack commands (candidate -> explicit decision)
+        "!wy": "wbs_accept",
+        "!wn": "wbs_reject",
+        "!we": "wbs_edit",
+
+        # ThreadWBS work_item lifecycle (focus item)
+        "!wd": "wbs_done",
+        "!wx": "wbs_drop",
+
+        # Debug / inspect
+        "!wbs": "wbs_show",
+        "!w": "wbs_show",
+
+        # 旧互換コマンド
+        "!task": "task_create",
+        "!task_s": "task_start",
+        "!task_start": "task_start",
+        "!task_p": "task_paused",
+        "!task_pause": "task_paused",
+        "!task_e": "task_end",
+        "!task_end": "task_end",
+        "!task_c": "task_end",
+        "!task_completed": "task_end",
     }
-    return "[CDC] candidate generated. Reply with !wy / !wn / !we."
+
+    return mapping.get(head)
 
 
-def _pop_cdc_candidate(thread_id: str) -> Optional[Dict[str, Any]]:
-    return _RUNTIME_CDC.pop(thread_id, None)
+def _strip_head_token(raw: str) -> str:
+    """
+    先頭トークン（コマンド）を除いた残りを content として返す。
+    """
+    if not raw:
+        return ""
+    parts = raw.strip().split(maxsplit=1)
+    return parts[1] if len(parts) == 2 else ""
 
 
-def _peek_cdc_candidate(thread_id: str) -> Optional[Dict[str, Any]]:
-    return _RUNTIME_CDC.get(thread_id)
+# ------------------------------------------------------------
+# Internal helpers
+# ------------------------------------------------------------
+
+def _safe_get_channel(message: Any) -> Any:
+    return getattr(message, "channel", None)
 
 
-# ============================================================
-# WBS Explicit Update
-#   returns: (updated_wbs, hint, finalized_item)
-# ============================================================
-
-def _apply_wbs_update(
-    command: Optional[str],
-    thread_id: Optional[str],
-    packet: InputPacket,
-    wbs: Optional[Dict[str, Any]],
-) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]]:
-
-    if not command or not thread_id:
-        return wbs, None, None
-
-    # ---- !t ----
-    if command == "task_create":
-        if wbs is not None:
-            return wbs, "[WBS] already exists.", None
-        wbs = create_empty_wbs(_get_thread_name(packet))
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] initialized.", None
-
-    # ---- !tp ----
-    if command == "task_paused":
-        if not wbs:
-            return wbs, "[WBS] not found; pause skipped.", None
-        wbs = on_task_pause(wbs)
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] paused.", None
-
-    # ---- !tc ----
-    if command == "task_end":
-        if not wbs:
-            return wbs, "[WBS] not found; complete skipped.", None
-        wbs = on_task_complete(wbs)
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] completed.", None
-
-    # ---- !wbs / !w ----
-    if command == "wbs_show":
-        if not wbs:
-            return wbs, "[WBS] not found.", None
-        return wbs, _format_wbs_brief(wbs), None
-
-    # ---- !wy ----
-    if command == "wbs_accept":
-        if not wbs:
-            return wbs, "[WBS] not found; run !t first.", None
-        cand = _pop_cdc_candidate(thread_id)
-        if not cand:
-            return wbs, "[CDC] no candidate.", None
-        wbs = accept_work_item(wbs, {"rationale": cand.get("rationale", "")})
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] work_item accepted.", None
-
-    # ---- !wn ----
-    if command == "wbs_reject":
-        cand = _pop_cdc_candidate(thread_id)
-        if not cand:
-            return wbs, "[CDC] no candidate; nothing to reject.", None
-        return wbs, "[CDC] candidate rejected.", None
-
-    # ---- !we ----
-    if command == "wbs_edit":
-        if not wbs:
-            return wbs, "[WBS] not found; run !t first.", None
-        cand = _peek_cdc_candidate(thread_id)
-        if not cand:
-            return wbs, "[CDC] no candidate.", None
-        new_text = (packet.content or "").strip()
-        if not new_text:
-            return wbs, "[CDC] edit text required. Usage: !we <new rationale>", None
-        _pop_cdc_candidate(thread_id)
-        wbs = edit_and_accept_work_item(wbs, {"rationale": cand.get("rationale", "")}, new_text)
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] edited & accepted.", None
-
-    # ---- !wd ----
-    if command == "wbs_done":
-        if not wbs:
-            return wbs, "[WBS] not found; run !t first.", None
-        wbs, finalized = mark_focus_done(wbs)
-        if not finalized:
-            save_thread_wbs(thread_id, wbs)
-            return wbs, "[WBS] no focus_point; nothing done.", None
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] focus work_item marked as done.", finalized
-
-    # ---- !wx ----
-    if command == "wbs_drop":
-        if not wbs:
-            return wbs, "[WBS] not found; run !t first.", None
-        reason = (packet.content or "").strip() or None
-        wbs, finalized = mark_focus_dropped(wbs, reason=reason)
-        if not finalized:
-            save_thread_wbs(thread_id, wbs)
-            return wbs, "[WBS] no focus_point; nothing dropped.", None
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] focus work_item marked as dropped.", finalized
-
-    return wbs, None, None
+def _extract_discord_context(message: Any) -> Tuple[str, str, Any]:
+    channel = _safe_get_channel(message)
+    channel_id = str(getattr(channel, "id", "") or "")
+    thread_name = str(getattr(channel, "name", "") or "")
+    return channel_id, thread_name, channel
 
 
-# ============================================================
-# ENTRY
-# ============================================================
-
-async def handle_request(packet: InputPacket) -> str:
-    command = packet.command
-    thread_id = _select_thread_id(packet.task_id, packet.context_key)
-
-    # 1) WBS load（失敗は握る）
-    wbs: Optional[Dict[str, Any]] = None
-    try:
-        if thread_id:
-            wbs = load_thread_wbs(thread_id)
-    except Exception as e:
-        print("[Interface_Box:WARN] failed to load ThreadWBS:", repr(e))
-        wbs = None
-
-    # 2) WBS explicit update（明示コマンドのみ）
-    wbs_hint: Optional[str] = None
-    finalized_item: Optional[Dict[str, Any]] = None
-    try:
-        wbs, wbs_hint, finalized_item = _apply_wbs_update(command, thread_id, packet, wbs)
-    except Exception as e:
-        print("[Interface_Box:WARN] failed to update ThreadWBS:", repr(e))
-
-    # 3) Core dispatch（WBS は参照コンテキストとして渡す）
-    core_input = {
-        "command_type": command,
-        "raw_text": packet.raw,
-        "arg_text": packet.content,
-        "task_id": packet.task_id,
-        "context_key": packet.context_key,
-        "user_id": packet.author_id,
-        "thread_wbs": wbs,
-    }
-    core_output = run_core(core_input)
-
-    # 4) CDC candidate store（task_create のみ、Runtime only）
-    cdc_hint: Optional[str] = None
-    try:
-        if command == "task_create" and thread_id:
-            cdc = core_output.get("cdc_candidate")
-            if isinstance(cdc, dict):
-                r = cdc.get("rationale")
-                if isinstance(r, str) and r.strip():
-                    cdc_hint = _store_cdc_candidate(thread_id, r)
-    except Exception as e:
-        print("[Interface_Box:WARN] failed to store CDC candidate:", repr(e))
-
-    # 5) message compose（上書き禁止：追記のみ）
-    message = core_output.get("message_for_user", "") or ""
-    for h in (wbs_hint, cdc_hint):
-        if isinstance(h, str) and h.strip():
-            message = f"{message}\n\n{h}" if message else h
-
-    # 6) NotionOps builder
-    notion_ops = build_notion_ops(core_output, request=_PacketProxy(packet))
-
-    # 7) Stabilizer
-    #    NOTE: wbs_done / wbs_drop は Core.mode が free_chat になり得るため、
-    #          Stabilizer には command を優先して渡す（summary 発火のため）。
-    command_type_for_stabilizer = core_output.get("mode") or command
-
-    thread_state: Dict[str, Any] = {}
-    if wbs:
-        thread_state["thread_wbs"] = wbs
-    if finalized_item:
-        thread_state["finalized_item"] = finalized_item
-
-    stabilizer = Stabilizer(
-        message_for_user=message,
-        notion_ops=notion_ops,
-        context_key=packet.context_key,
-        user_id=packet.author_id,
-        task_id=packet.task_id,
-        command_type=command_type_for_stabilizer,
-        core_output=core_output,
-        thread_state=thread_state if thread_state else None,
+def _extract_author_meta(message: Any) -> Tuple[str, str]:
+    author = getattr(message, "author", None)
+    author_id = str(getattr(author, "id", "") or "")
+    user_name = (
+        getattr(author, "display_name", None)
+        or getattr(author, "name", None)
+        or ""
     )
+    return author_id, str(user_name)
 
-    return await stabilizer.finalize()
 
+# ------------------------------------------------------------
+# Public API
+# ------------------------------------------------------------
 
-class _PacketProxy:
-    def __init__(self, packet: InputPacket):
-        self.task_id = packet.task_id
-        self.user_meta = packet.user_meta
-        self.context_key = packet.context_key
-        self.meta = packet.meta
+async def handle_discord_input(message: Any) -> None:
+    """
+    bot.py → ONLY ENTRY.
+    Discord → InputPacket → BIS Pipeline.
+    """
 
-    def __repr__(self) -> str:
-        return f"<PacketProxy task_id={self.task_id}>"
+    # Bot自身の発言は無視
+    if getattr(getattr(message, "author", None), "bot", False):
+        return
+
+    raw_content = (getattr(message, "content", "") or "").strip()
+
+    # 空入力は無視（ログ汚染防止）
+    if not raw_content:
+        return
+
+    command_type = _detect_command_type(raw_content)
+
+    # コマンド以外は現フェーズでは無視
+    if command_type is None:
+        return
+
+    # Discord context → Ovv context
+    channel_id, thread_name, channel = _extract_discord_context(message)
+
+    if not channel_id:
+        if DEBUG_BIS:
+            print("[Boundary_Gate:WARN] channel_id is empty; drop message.")
+        return
+
+    author_id, user_name = _extract_author_meta(message)
+
+    # Discord Thread = task_id = context_key（現行方針）
+    context_key = channel_id
+    task_id = context_key
+
+    user_meta = {"user_id": author_id, "user_name": user_name}
+
+    # content は downstream でコマンド引数として使われるので、必ず strip して安定化
+    content = _strip_head_token(raw_content).strip()
+
+    # 元headを保持（監査/揺れ耐性）
+    head = raw_content.split()[0].lower()
+
+    # --------------------------------------------------------
+    # InputPacket 構築（FAILSAFE）
+    # --------------------------------------------------------
+    try:
+        packet = InputPacket(
+            raw=raw_content,
+            source="discord",
+            command=command_type,
+            content=content,
+            author_id=author_id,
+            channel_id=channel_id,
+            context_key=context_key,
+            task_id=task_id,
+            user_meta=user_meta,
+            meta={
+                "discord_channel_id": channel_id,
+                "discord_message_id": str(getattr(message, "id", "") or ""),
+                "discord_thread_name": thread_name,
+                "command_head": head,
+            },
+        )
+    except Exception as e:
+        if DEBUG_BIS:
+            print("[Boundary_Gate:ERROR] failed to build InputPacket:", repr(e))
+            traceback.print_exc()
+        return
+
+    # --------------------------------------------------------
+    # ★ dbg_packet 用に Packet Capture
+    # --------------------------------------------------------
+    try:
+        capture(packet)
+    except Exception as e:
+        if DEBUG_BIS:
+            print("[Boundary_Gate:WARN] capture(packet) failed:", repr(e))
+
+    if DEBUG_BIS:
+        print("[Boundary_Gate] Captured InputPacket:", packet)
+
+    # --------------------------------------------------------
+    # BIS Pipeline 実行（Interface_Box → Core → Stabilizer）
+    # --------------------------------------------------------
+    try:
+        final_message = await handle_request(packet)
+
+    except Exception as e:
+        if DEBUG_BIS:
+            print("==== BIS PIPELINE EXCEPTION ====")
+            print("Exception in Boundary_Gate.handle_discord_input:", repr(e))
+            print("-- InputPacket --")
+            try:
+                print(packet)
+            except Exception:
+                print("<unprintable packet>")
+            print("-- Traceback --")
+            traceback.print_exc()
+            print("================================")
+        else:
+            print("[Boundary Error] internal failure in BIS pipeline.")
+
+        final_message = "[Boundary Error] internal failure in BIS pipeline."
+
+    # --------------------------------------------------------
+    # Discord に返す
+    # --------------------------------------------------------
+    if final_message and channel is not None:
+        try:
+            await channel.send(final_message)
+        except Exception as e:
+            if DEBUG_BIS:
+                print("[Boundary_Gate:WARN] failed to send message:", repr(e))
+                traceback.print_exc()
