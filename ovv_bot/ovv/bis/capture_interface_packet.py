@@ -1,6 +1,6 @@
 # ovv/bis/capture_interface_packet.py
 # ============================================================
-# MODULE CONTRACT: BIS / PacketCapture v1.4 (Defensive Edition)
+# MODULE CONTRACT: BIS / PacketCapture v1.5 (Defensive + Trace-Aware)
 #
 # ROLE:
 #   - BIS パイプライン入口（Boundary_Gate → Interface_Box）で受け取る
@@ -9,7 +9,8 @@
 # RESPONSIBILITY TAGS:
 #   [CAPTURE]  パケットのスナップショットを安全に保持
 #   [READ]     dbg_packet / debug_commands からの読み取り専用 API
-#   [DEFENSE]  InputPacket 仕様変更に対して壊れない防御的構造を採用
+#   [DEFENSE]  InputPacket 仕様変更に対して壊れない防御的構造
+#   [TRACE]    trace_id を確実に観測可能な形で保持
 #
 # GUARANTEES:
 #   - Capture は BIS パイプラインに影響しない（例外非送出）
@@ -30,8 +31,16 @@ import json
 
 
 # ------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------
+
+_MAX_DEBUG_LEN = 1900
+
+
+# ------------------------------------------------------------
 # Internal State
 # ------------------------------------------------------------
+
 _last_packet: Optional[Dict[str, Any]] = None
 
 
@@ -46,7 +55,8 @@ def _json_safe(value: Any) -> Any:
 
     - dict → 再帰処理
     - list/tuple → 再帰処理
-    - 基本型（str/int/bool/None など）→ そのまま
+    - 基本型 → そのまま
+    - dataclass / object → __dict__ 展開
     - 未知オブジェクト → repr() 文字列に落とす
     """
     if isinstance(value, dict):
@@ -55,16 +65,37 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
 
-    # 基本型はそのまま
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
 
-    # dataclass/object 対応
     if hasattr(value, "__dict__"):
         return _json_safe(value.__dict__)
 
-    # それ以外の未知型は repr に落とす
     return f"<unserializable {type(value).__name__}: {repr(value)}>"
+
+
+def _extract_trace_id(packet: Any, safe_packet: Dict[str, Any]) -> None:
+    """
+    trace_id を可能な限り正規化して top-level に昇格させる。
+
+    優先順位:
+      1. packet.trace_id
+      2. packet.meta["trace_id"]
+    """
+    try:
+        tid = getattr(packet, "trace_id", None)
+        if isinstance(tid, str) and tid:
+            safe_packet["trace_id"] = tid
+            return
+
+        meta = getattr(packet, "meta", None)
+        if isinstance(meta, dict):
+            mt = meta.get("trace_id")
+            if isinstance(mt, str) and mt:
+                safe_packet["trace_id"] = mt
+                return
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------
@@ -76,16 +107,19 @@ def capture(packet: Any) -> None:
     Boundary_Gate から呼ばれ、直近の InputPacket を保持する。
 
     注意:
-    - 例外をパイプラインへ伝播しない（Debug Layer は読み取り専用であるべき）。
-    - InputPacket の構造が変化しても _json_safe により安全に保持される。
+    - 例外をパイプラインへ伝播しない
+    - Debug Layer は観測専用（挙動を変えない）
     """
     global _last_packet
 
     try:
-        # dataclass / object / dict などすべて JSON-safe に変換
         safe_packet = _json_safe(packet)
-        # レイヤ情報を添付（開発者が判別できるように）
-        safe_packet["_captured_from"] = "Boundary_Gate"
+
+        # trace_id を正規化して保持
+        if isinstance(safe_packet, dict):
+            _extract_trace_id(packet, safe_packet)
+            safe_packet["_captured_from"] = "Boundary_Gate"
+
         _last_packet = safe_packet
 
     except Exception as e:
@@ -117,13 +151,13 @@ def debug_dump() -> str:
     Returns
     -------
     str
-        2000 文字制限を考慮し、~1900 文字で安全トリミングする。
+        Discord 制限を考慮し、最大 ~1900 文字で安全トリミング。
     """
     if _last_packet is None:
         return "(No packet captured)"
 
     try:
         text = json.dumps(_last_packet, indent=2, ensure_ascii=False)
-        return text[:1900]
+        return text[:_MAX_DEBUG_LEN]
     except Exception as e:
         return f"(packet dump failed: {repr(e)})"
