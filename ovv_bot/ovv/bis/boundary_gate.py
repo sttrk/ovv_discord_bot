@@ -1,7 +1,7 @@
 # ovv/bis/boundary_gate.py
 # ============================================================
-# MODULE CONTRACT: BIS / Boundary_Gate v3.7.1
-#   (ThreadWBS Command Routing + Done/Dropped + Hardened + DebugSuite Routed)
+# MODULE CONTRACT: BIS / Boundary_Gate v3.7.2
+#   (ThreadWBS Command Routing + Done/Dropped + Hardened + DebugSuite Isolated)
 #
 # ROLE:
 #   - Discord on_message → BIS パイプラインへの入口。
@@ -18,12 +18,13 @@
 #
 # CONSTRAINTS (HARD):
 #   - Core / Persist / Notion / WBS(PG) には直接触れない。
-#   - interface_box.handle_request() のみを呼ぶ。
+#   - ovv.bis.interface_box.handle_request() のみを呼ぶ。
 #
 # NOTE:
 #   - ThreadWBS の更新は「明示コマンド」を InputPacket.command に載せて下流へ渡す。
 #     （Boundary_Gate はルーティングのみ。更新ロジック/永続化は担当しない）
-#   - Debug Command Suite は「必ず下流へ通す」(入口で捨てない)。
+#   - Debug Command Suite は Gate-Assist（discord.py commands）側の責務。
+#     Boundary_Gate は debug 入力を BIS に流さない（二重応答/境界汚染防止）。
 # ============================================================
 
 from __future__ import annotations
@@ -44,19 +45,21 @@ DEBUG_BIS = True  # Render ログに内部スタックトレースを出す
 
 
 # ------------------------------------------------------------
-# Debug Command Suite (routing only)
+# Debug Command Suite (Gate-Assist)
+#   - bot.py 側の bot.process_commands() が処理する。
+#   - Boundary_Gate は二重処理を避けるため除外する。
 # ------------------------------------------------------------
 
 _DEBUG_COMMAND_HEADS = {
-    # 代表的なデバッグコマンド（揺れ耐性）
-    "!dbg",
-    "!debug",
-    "!packet",
-    "!dbg_packet",
-    "!state",
-    "!dbg_state",
-    "!help",
-    "!dbg_help",
+    # debug/debug_commands.py 由来（prefix 運用の揺れ耐性のため両対応）
+    "bs", "!bs",
+    "dbg_flow", "!dbg_flow",
+    "dbg_packet", "!dbg_packet",
+    "dbg_mem", "!dbg_mem",
+    "dbg_all", "!dbg_all",
+    "wipe", "!wipe",
+    "help", "!help",
+    "dbg_help", "!dbg_help",
 }
 
 
@@ -70,16 +73,16 @@ def _detect_command_type(raw: str) -> Optional[str]:
     Boundary_Gate は「検出と正規化」までが責務。
 
     HARD:
-      - Debug Command Suite は必ず下流へ通す（入口で捨てない）。
+      - Debug Command Suite は Gate-Assist 側で処理されるため、ここでは対象外。
     """
     if not raw:
         return None
 
     head = raw.strip().split()[0].lower()
 
-    # ---- Debug suite: ALWAYS PASS ----
+    # ---- Debug suite: DO NOT ROUTE TO BIS ----
     if head in _DEBUG_COMMAND_HEADS:
-        return "debug"
+        return None
 
     mapping = {
         # Task / thread lifecycle
@@ -97,7 +100,7 @@ def _detect_command_type(raw: str) -> Optional[str]:
         "!wd": "wbs_done",     # focus work_item を done
         "!wx": "wbs_drop",     # focus work_item を dropped（理由は content 側）
 
-        # Debug / inspect
+        # Debug / inspect (WBS only)
         "!wbs": "wbs_show",    # 現在のWBSを表示（参照のみ）
         "!w": "wbs_show",
 
@@ -120,8 +123,7 @@ def _strip_head_token(raw: str) -> str:
     """
     先頭トークン（コマンド）を除いた残りを content として返す。
     例: "!we 修正文" -> "修正文"
-        "!dbg" -> ""
-        "!packet latest" -> "latest"
+         "!wx 仕様変更のため" -> "仕様変更のため"
     """
     if not raw:
         return ""
@@ -172,11 +174,15 @@ async def handle_discord_input(message: Any) -> None:
     if getattr(getattr(message, "author", None), "bot", False):
         return
 
-    raw_content = (getattr(message, "content", "") or "")
-    raw_content = raw_content.strip()
+    raw_content = (getattr(message, "content", "") or "").strip()
 
     # 空入力は無視（ログ汚染防止）
     if not raw_content:
+        return
+
+    # Debug suite は Gate-Assist 側で処理する前提なので、BIS では扱わない
+    head = raw_content.split()[0].lower()
+    if head in _DEBUG_COMMAND_HEADS:
         return
 
     command_type = _detect_command_type(raw_content)
@@ -209,7 +215,7 @@ async def handle_discord_input(message: Any) -> None:
     content = _strip_head_token(raw_content).strip()
 
     # --------------------------------------------------------
-    # InputPacket 構築（FAILSAFE）
+    # [PACKETIZE] InputPacket 構築（FAILSAFE）
     # --------------------------------------------------------
     try:
         packet = InputPacket(
@@ -235,7 +241,7 @@ async def handle_discord_input(message: Any) -> None:
         return
 
     # --------------------------------------------------------
-    # ★ dbg_packet 用に Packet Capture
+    # [CAPTURE] dbg_packet 用に Packet Capture
     # --------------------------------------------------------
     try:
         capture(packet)
