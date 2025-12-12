@@ -1,6 +1,6 @@
-# ovv/bis/boundary_gate.py
 # ============================================================
-# MODULE CONTRACT: BIS / Boundary_Gate v3.7 (ThreadWBS Command Routing + Done/Dropped)
+# MODULE CONTRACT: BIS / Boundary_Gate v3.7.1
+#   (ThreadWBS Command Routing + Done/Dropped + Hardened)
 #
 # ROLE:
 #   - Discord on_message → BIS パイプラインへの入口。
@@ -69,7 +69,7 @@ def _detect_command_type(raw: str) -> Optional[str]:
 
         # ThreadWBS work_item lifecycle (focus item)
         "!wd": "wbs_done",     # focus work_item を done
-        "!wx": "wbs_drop",     # focus work_item を dropped
+        "!wx": "wbs_drop",     # focus work_item を dropped（理由は content 側）
 
         # Debug / inspect
         "!wbs": "wbs_show",    # 現在のWBSを表示（参照のみ）
@@ -144,7 +144,13 @@ async def handle_discord_input(message: Any) -> None:
     if getattr(getattr(message, "author", None), "bot", False):
         return
 
-    raw_content = (getattr(message, "content", "") or "").strip()
+    raw_content = (getattr(message, "content", "") or "")
+    raw_content = raw_content.strip()
+
+    # 空入力は無視（ログ汚染防止）
+    if not raw_content:
+        return
+
     command_type = _detect_command_type(raw_content)
 
     # コマンド以外は現フェーズでは無視
@@ -152,10 +158,17 @@ async def handle_discord_input(message: Any) -> None:
         return
 
     # Discord context → Ovv context
-    # Discord Thread = task_id = context_key（現行方針）
     channel_id, thread_name, channel = _extract_discord_context(message)
+
+    # channel_id が空は異常（境界で止める）
+    if not channel_id:
+        if DEBUG_BIS:
+            print("[Boundary_Gate:WARN] channel_id is empty; drop message.")
+        return
+
     author_id, user_name = _extract_author_meta(message)
 
+    # Discord Thread = task_id = context_key（現行方針）
     context_key = channel_id
     task_id = context_key
 
@@ -164,25 +177,34 @@ async def handle_discord_input(message: Any) -> None:
         "user_name": user_name,
     }
 
+    # content は downstream でコマンド引数として使われるので、必ず strip して安定化
+    content = _strip_head_token(raw_content).strip()
+
     # --------------------------------------------------------
-    # InputPacket 構築
+    # InputPacket 構築（FAILSAFE）
     # --------------------------------------------------------
-    packet = InputPacket(
-        raw=raw_content,
-        source="discord",
-        command=command_type,
-        content=_strip_head_token(raw_content),
-        author_id=author_id,
-        channel_id=channel_id,
-        context_key=context_key,
-        task_id=task_id,
-        user_meta=user_meta,
-        meta={
-            "discord_channel_id": channel_id,
-            "discord_message_id": str(getattr(message, "id", "") or ""),
-            "discord_thread_name": thread_name,
-        },
-    )
+    try:
+        packet = InputPacket(
+            raw=raw_content,
+            source="discord",
+            command=command_type,
+            content=content,
+            author_id=author_id,
+            channel_id=channel_id,
+            context_key=context_key,
+            task_id=task_id,
+            user_meta=user_meta,
+            meta={
+                "discord_channel_id": channel_id,
+                "discord_message_id": str(getattr(message, "id", "") or ""),
+                "discord_thread_name": thread_name,
+            },
+        )
+    except Exception as e:
+        if DEBUG_BIS:
+            print("[Boundary_Gate:ERROR] failed to build InputPacket:", repr(e))
+            traceback.print_exc()
+        return
 
     # --------------------------------------------------------
     # ★ dbg_packet 用に Packet Capture
@@ -204,7 +226,6 @@ async def handle_discord_input(message: Any) -> None:
         final_message = await handle_request(packet)
 
     except Exception as e:
-        # デバッグログ
         if DEBUG_BIS:
             print("==== BIS PIPELINE EXCEPTION ====")
             print("Exception in Boundary_Gate.handle_discord_input:", repr(e))
@@ -224,11 +245,10 @@ async def handle_discord_input(message: Any) -> None:
     # --------------------------------------------------------
     # Discord に返す
     # --------------------------------------------------------
-    if final_message:
+    if final_message and channel is not None:
         try:
-            # channel が None のケースは Discord 側異常として握る
-            if channel is not None:
-                await channel.send(final_message)
+            await channel.send(final_message)
         except Exception as e:
             if DEBUG_BIS:
                 print("[Boundary_Gate:WARN] failed to send message:", repr(e))
+                traceback.print_exc()
