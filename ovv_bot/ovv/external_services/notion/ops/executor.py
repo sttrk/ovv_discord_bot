@@ -1,17 +1,18 @@
 # ovv/external_services/notion/ops/executor.py
 # ============================================================
-# MODULE CONTRACT: External / NotionOps Executor v2.2
-#   (Duration + Summary + Status + DebugTrace / BIS-Stabilizer 専用)
+# MODULE CONTRACT: External / NotionOps Executor v2.3
+#   (Duration + Summary + Status + SummaryAppend + DebugTrace / BIS-Stabilizer 専用)
 #
 # ROLE:
 #   - BIS / Stabilizer が構築した NotionOps(list[dict]) を
 #     Task DB（NOTION_TASK_DB_ID）へ逐次適用する。
 #
 # RESPONSIBILITY TAGS:
-#   [EXEC_OPS]   ops を順序通り Notion API に適用
-#   [TASK_DB]    Task DB（title / status / duration / summary）更新
-#   [GUARD]      設定不備・Notion無効時の安全ガード
-#   [DEBUG]      実行ステップのログ出力
+#   [EXEC_OPS]     ops を順序通り Notion API に適用
+#   [TASK_DB]      Task DB（title / status / duration / summary）更新
+#   [SUMMARY_APP]  TaskSummary 追記（append_task_summary）
+#   [GUARD]        設定不備・Notion無効時の安全ガード
+#   [DEBUG]        実行ステップのログ出力
 #
 # CONSTRAINTS:
 #   - 呼び出し元は BIS/Stabilizer のみ
@@ -96,6 +97,10 @@ async def execute_notion_ops(
             elif op_name == "update_task_summary":
                 _update_task_summary(notion, op_dict)
 
+            # ★ Stabilizer v3.10 (Final) 対応: TaskSummary 追記
+            elif op_name == "append_task_summary":
+                _append_task_summary(notion, op_dict)
+
             else:
                 print(f"[NotionOps] Unknown op={op_name!r} (index={idx})")
 
@@ -149,7 +154,7 @@ def _create_task_item(notion, ops: Dict[str, Any]) -> None:
                 "started_at": {"date": None},
                 "ended_at": {"date": None},
                 "duration": {"number": 0},
-                # summary は update_task_summary で設定する
+                # summary は update/append で設定する
             },
         )
         print(f"[NotionOps] task_create {task_id}")
@@ -249,6 +254,63 @@ def _update_task_summary(notion, ops: Dict[str, Any]) -> None:
 
     except Exception as e:
         print("[NotionOps] summary update error:", repr(e))
+
+
+# ============================================================
+# Summary 追記（WBS finalized → NotionTaskSummary）
+# ============================================================
+
+def _append_task_summary(notion, ops: Dict[str, Any]) -> None:
+    """
+    Stabilizer v3.10 の append_task_summary を適用する。
+    - 既存 summary を取得して、末尾に改行 + append_text を追記する。
+    """
+    task_id = ops["task_id"]
+    append_text = (ops.get("append_text") or "").strip()
+
+    if not append_text:
+        print(f"[NotionOps] empty append_text for task {task_id} → skip")
+        return
+
+    page = _find_page_by_task_id(notion, task_id)
+    if page is None:
+        print(f"[NotionOps] No such task for append_summary {task_id}")
+        return
+
+    current = _get_rich_text_plain(page, prop_name="summary").strip()
+    new_text = append_text if not current else f"{current}\n{append_text}"
+
+    rich = [{"text": {"content": new_text}}]
+
+    try:
+        notion.pages.update(
+            page_id=page["id"],
+            properties={"summary": {"rich_text": rich}},
+        )
+        print(f"[NotionOps] summary append {task_id}")
+
+    except Exception as e:
+        print("[NotionOps] summary append error:", repr(e))
+
+
+def _get_rich_text_plain(page: Dict[str, Any], prop_name: str) -> str:
+    """
+    Notion page object の properties[prop_name].rich_text から plain_text を連結して返す。
+    失敗しても空文字を返す（破綻回避）。
+    """
+    try:
+        props = page.get("properties") or {}
+        p = props.get(prop_name) or {}
+        rt = p.get("rich_text") or []
+        parts: List[str] = []
+        for x in rt:
+            if isinstance(x, dict):
+                pt = x.get("plain_text")
+                if isinstance(pt, str):
+                    parts.append(pt)
+        return "".join(parts)
+    except Exception:
+        return ""
 
 
 # ============================================================
