@@ -27,7 +27,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 import datetime
 import traceback
 
@@ -71,7 +71,7 @@ class Stabilizer:
         self.user_id = user_id
         self.task_id = str(task_id) if task_id is not None else None
 
-        # Core の mode（例: "task_start", "task_end"）
+        # Core の mode / Interface の command_type（例: "task_start", "task_end", "wbs_done"）
         self.command_type = command_type
 
         self.core_output = core_output or {}
@@ -103,7 +103,7 @@ class Stabilizer:
         now = datetime.datetime.utcnow()
         event = self.command_type or "unknown"
 
-        # task_log
+        # task_log（すべてのイベントで残す）
         try:
             insert_task_log(
                 task_id=self.task_id,
@@ -115,7 +115,7 @@ class Stabilizer:
             print("[Stabilizer:ERROR] task_log failed:", repr(e))
             traceback.print_exc()
 
-        # task_session start / end
+        # task_session start / end（該当イベントのみ）
         try:
             if event == "task_start":
                 insert_task_session_start(
@@ -152,6 +152,39 @@ class Stabilizer:
         return ops
 
     # ========================================================
+    # Internal: finalized_item extract
+    # ========================================================
+    def _extract_finalized_item(self) -> Optional[Dict[str, Any]]:
+        """
+        Interface_Box から渡される thread_state.finalized_item を取得する。
+        期待する形（最小）:
+          {
+            "rationale": str,
+            "status": "done" | "dropped",
+            "finalized_at": "...(optional)..."
+          }
+        """
+        finalized = self.thread_state.get("finalized_item")
+        if not isinstance(finalized, dict):
+            return None
+
+        rationale = finalized.get("rationale")
+        status = finalized.get("status")
+        if not (isinstance(rationale, str) and rationale.strip()):
+            return None
+        if status not in ("done", "dropped"):
+            return None
+
+        out = {
+            "rationale": rationale.strip(),
+            "status": status,
+        }
+        fa = finalized.get("finalized_at")
+        if isinstance(fa, str) and fa.strip():
+            out["finalized_at"] = fa.strip()
+        return out
+
+    # ========================================================
     # [BUILD_OPS] summary text
     # ========================================================
     def _build_summary_text(self) -> str:
@@ -161,13 +194,10 @@ class Stabilizer:
             if isinstance(v, str) and v.strip():
                 return v.strip()
 
-        # work_item finalized 由来
-        finalized = self.thread_state.get("finalized_item")
-        if isinstance(finalized, dict):
-            rationale = finalized.get("rationale")
-            status = finalized.get("status")
-            if rationale and status:
-                return f"[WBS:{status}] {rationale}"
+        # work_item finalized 由来（最小）
+        finalized = self._extract_finalized_item()
+        if finalized:
+            return f"[WBS:{finalized['status']}] {finalized['rationale']}"
 
         # フォールバック：Discord メッセージ
         msg = self.message_for_user.strip()
@@ -180,7 +210,7 @@ class Stabilizer:
     # [BUILD_OPS] summary ops
     # ========================================================
     def _augment_summary(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        # task_paused / task_end / work_item finalize のみ
+        # task_paused / task_end / wbs finalize のみ
         if self.command_type not in ("task_paused", "task_end", "wbs_done", "wbs_drop"):
             return ops
 
@@ -197,6 +227,45 @@ class Stabilizer:
                 "op": "update_task_summary",
                 "task_id": self.task_id,
                 "summary_text": summary,
+            }
+        )
+        return ops
+
+    # ========================================================
+    # [BUILD_OPS] finalized_item ops（WBS → NotionTaskSummary 移送）
+    # ========================================================
+    def _augment_finalized_item(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        v3.9:
+          - work_item が done/dropped になった「確定イベント」を Notion に移送する。
+        最小実装としては、Notion 側の保存領域が summary であるため、
+          - command_type が wbs_done / wbs_drop のとき
+          - finalized_item が存在するとき
+        に「summary 更新」を確実に走らせる（上書きの是非は NotionOps 側で管理される前提）。
+        """
+        if self.command_type not in ("wbs_done", "wbs_drop"):
+            return ops
+        if not self.task_id:
+            return ops
+
+        finalized = self._extract_finalized_item()
+        if not finalized:
+            return ops
+
+        # 既に summary op が追加されている場合は二重追加しない
+        already = any(
+            isinstance(op, dict) and op.get("op") == "update_task_summary" and op.get("task_id") == self.task_id
+            for op in ops
+        )
+        if already:
+            return ops
+
+        summary_text = f"[WBS:{finalized['status']}] {finalized['rationale']}"
+        ops.append(
+            {
+                "op": "update_task_summary",
+                "task_id": self.task_id,
+                "summary_text": summary_text,
             }
         )
         return ops
@@ -220,6 +289,11 @@ class Stabilizer:
         # -----------------------------------------
         ops = list(self.notion_ops)
         ops = self._augment_duration(ops)
+
+        # finalized_item は「移送」なので、summary より先に確実に ops 化しておく
+        ops = self._augment_finalized_item(ops)
+
+        # task_paused/task_end/wbs_finalize の summary
         ops = self._augment_summary(ops)
 
         if ops:
@@ -227,6 +301,9 @@ class Stabilizer:
             print(" context_key :", self.context_key)
             print(" task_id     :", self.task_id)
             print(" command_type:", self.command_type)
+            finalized = self._extract_finalized_item()
+            if finalized:
+                print(" finalized_item:", finalized)
             print(" ops:")
             for op in ops:
                 print("   ", op)
