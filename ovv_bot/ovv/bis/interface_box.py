@@ -21,15 +21,14 @@
 # ============================================================
 
 from __future__ import annotations
+
 from typing import Any, Dict, Optional
 
 from ovv.core.ovv_core import run_core
 from ovv.external_services.notion.ops.builders import build_notion_ops
+from ovv.bis.wbs.thread_wbs_persistence import load_thread_wbs
 from .stabilizer import Stabilizer
 from .types import InputPacket
-
-# ThreadWBS Persistence API（STEP2で実装済前提）
-from ovv.bis.wbs.thread_wbs_persistence import load_thread_wbs
 
 
 # ============================================================
@@ -56,27 +55,36 @@ async def handle_request(packet: InputPacket) -> str:
 
     # --------------------------------------------------------
     # [CTX_BUILD] ThreadWBS 読み込み（参照専用）
+    #   - 取得失敗は致命扱いにしない（推論は継続）
+    #   - thread_id は task_id を優先、なければ context_key
     # --------------------------------------------------------
     thread_wbs: Optional[Dict[str, Any]] = None
+    thread_id: Optional[str] = None
+
+    if task_id:
+        thread_id = str(task_id)
+    elif context_key is not None:
+        thread_id = str(context_key)
+
     try:
-        if context_key:
-            thread_wbs = load_thread_wbs(context_key)
+        if thread_id:
+            thread_wbs = load_thread_wbs(thread_id)
     except Exception as e:
-        # WBS 取得失敗は致命ではない（推論継続）
+        # WBS 取得失敗はログのみ（破綻回避）
         print("[Interface_Box:WARN] failed to load ThreadWBS:", repr(e))
         thread_wbs = None
 
     # --------------------------------------------------------
     # [DISPATCH] Core 呼び出し
     # --------------------------------------------------------
-    core_input = {
+    core_input: Dict[str, Any] = {
         "command_type": command_type,
         "raw_text": raw_text,
         "arg_text": arg_text,
         "task_id": task_id,
         "context_key": context_key,
         "user_id": user_id,
-        # 推論用コンテキストとしてのみ使用
+        # 推論用コンテキスト（参照専用）
         "thread_wbs": thread_wbs,
     }
 
@@ -99,10 +107,8 @@ async def handle_request(packet: InputPacket) -> str:
         task_id=task_id,
         command_type=core_output.get("mode"),
         core_output=core_output,
-        # 将来 ThreadWBS 状態を Stabilizer で参照する場合に備える
-        thread_state={
-            "thread_wbs": thread_wbs,
-        } if thread_wbs else None,
+        # 将来 ThreadWBS 状態を参照する余地を確保
+        thread_state={"thread_wbs": thread_wbs} if thread_wbs else None,
     )
 
     return await stabilizer.finalize()
@@ -123,5 +129,5 @@ class _PacketProxy:
         self.context_key = packet.context_key
         self.meta = packet.meta
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<PacketProxy task_id={self.task_id}>"
