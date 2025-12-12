@@ -1,6 +1,6 @@
 # ovv/bis/boundary_gate.py
 # ============================================================
-# MODULE CONTRACT: BIS / Boundary_Gate v3.6 (ThreadWBS Command Routing Hardened)
+# MODULE CONTRACT: BIS / Boundary_Gate v3.7 (ThreadWBS Command Routing + Done/Dropped)
 #
 # ROLE:
 #   - Discord on_message → BIS パイプラインへの入口。
@@ -8,7 +8,14 @@
 #   - パイプライン開始前に InputPacket を capture（dbg_packet 用）
 #   - 例外発生時は Render ログに詳細、Discord には境界エラーを返す。
 #
-# CONSTRAINT:
+# RESPONSIBILITY TAGS:
+#   [ENTRY_BG]     Discord message を受けて入口処理
+#   [CMD_ROUTE]    コマンド検出と正規化（ルーティングのみ）
+#   [PACKETIZE]    InputPacket 構築
+#   [CAPTURE]      dbg_packet 用 capture
+#   [FAILSAFE]     例外隔離（境界で止める）
+#
+# CONSTRAINTS (HARD):
 #   - Core / Persist / Notion / WBS(PG) には直接触れない。
 #   - interface_box.handle_request() のみを呼ぶ。
 #
@@ -19,7 +26,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple, Any
 import traceback
 
 from .types import InputPacket
@@ -55,13 +62,18 @@ def _detect_command_type(raw: str) -> Optional[str]:
         "!tp": "task_paused",
         "!tc": "task_end",
 
-        # ThreadWBS user-ack commands (draft -> minimal routing)
-        "!wy": "wbs_accept",   # CDC候補を採用（※現段階では IFACE 側は未実装でもOK）
+        # ThreadWBS user-ack commands (candidate -> explicit decision)
+        "!wy": "wbs_accept",   # CDC候補を採用
         "!wn": "wbs_reject",   # CDC候補を破棄
         "!we": "wbs_edit",     # CDC候補を編集採用（後続テキスト必須想定）
 
+        # ThreadWBS work_item lifecycle (focus item)
+        "!wd": "wbs_done",     # focus work_item を done
+        "!wx": "wbs_drop",     # focus work_item を dropped
+
         # Debug / inspect
         "!wbs": "wbs_show",    # 現在のWBSを表示（参照のみ）
+        "!w": "wbs_show",
 
         # 旧互換コマンド
         "!task": "task_create",
@@ -93,26 +105,21 @@ def _strip_head_token(raw: str) -> str:
 # Internal helpers
 # ------------------------------------------------------------
 
-def _safe_get_channel(message) -> object:
-    ch = getattr(message, "channel", None)
-    return ch
+def _safe_get_channel(message: Any) -> Any:
+    return getattr(message, "channel", None)
 
 
-def _extract_discord_context(message) -> tuple[str, str, str]:
+def _extract_discord_context(message: Any) -> Tuple[str, str, Any]:
     """
-    returns: (channel_id, thread_name, send_target)
-      - send_target は message.channel をそのまま使う前提（互換のため）
+    returns: (channel_id, thread_name, channel_obj)
     """
     channel = _safe_get_channel(message)
     channel_id = str(getattr(channel, "id", "") or "")
-
-    # Thread名（存在すれば）を付与（下流で !t 初期WBS生成に使う）
     thread_name = str(getattr(channel, "name", "") or "")
-
     return channel_id, thread_name, channel
 
 
-def _extract_author_meta(message) -> tuple[str, str]:
+def _extract_author_meta(message: Any) -> Tuple[str, str]:
     author = getattr(message, "author", None)
     author_id = str(getattr(author, "id", "") or "")
     user_name = (
@@ -127,7 +134,7 @@ def _extract_author_meta(message) -> tuple[str, str]:
 # Public API
 # ------------------------------------------------------------
 
-async def handle_discord_input(message) -> None:
+async def handle_discord_input(message: Any) -> None:
     """
     bot.py → ONLY ENTRY.
     Discord → InputPacket → BIS Pipeline.
