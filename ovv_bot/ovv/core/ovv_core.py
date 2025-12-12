@@ -1,29 +1,126 @@
 # ovv/core/ovv_core.py
 # ============================================================
-# MODULE CONTRACT: Ovv Core v2.4 — Task(A) + CDC Candidate + WBS Mode Normalize
+# MODULE CONTRACT: Ovv Core v2.5
+#   (Debugging Subsystem v1.0 compliant / Task + CDC Candidate + WBS Mode Normalize)
 #
 # ROLE:
 #   - BIS / Interface_Box から受け取った core_input(dict) を解釈し、
-#     Task 系コマンドと WBS 系コマンド、free_chat を振り分ける。
+#     Task 系コマンド / WBS 系コマンド / free_chat を振り分ける。
 #   - task_create 時にのみ CDC 候補を 1 件生成して返す（固定キー: cdc_candidate）。
 #   - WBS コマンドについては「mode の正規化」と「最小のユーザー応答」のみを行う。
 #
-# RESPONSIBILITY TAGS:
-#   [DISPATCH]      command_type に応じたハンドラ分岐
-#   [TASK_META]     task_name / task_summary など Task 用メタ情報の構築
-#   [CDC_OUTPUT]    cdc_candidate の生成（task_create のみ）
-#   [MODE_NORM]     wbs_* を free_chat に落とさない
-#   [USER_MSG]      Discord へ返す message_for_user の生成
+# DEBUGGING SUBSYSTEM v1.0 COMPLIANCE:
+#   - trace_id は Boundary_Gate 生成のものを受領するのみ（Single Trace Rule）
+#   - 固定チェックポイントのみを使用（Checkpoint Determinism）
+#   - except は必ず構造ログを吐き、握りつぶさず raise
 #
 # CONSTRAINTS (HARD):
 #   - 外部 I/O（DB / Notion / Discord）は一切行わない（純ロジック層）。
-#   - WBS の更新/永続化/候補確定/Finalize を行わない（Interface_Box が責務）。
-#   - 戻り値は dict のみ。I/O は上位レイヤ（BIS / Stabilizer）で処理する。
+#   - WBS の更新 / 永続化 / 候補確定 / Finalize を行わない。
+#   - FAILSAFE を持たない（Boundary_Gate に集約）。
 # ============================================================
 
 from __future__ import annotations
 
 from typing import Any, Dict
+from datetime import datetime, timezone
+import json
+import traceback
+
+
+# ============================================================
+# Debugging Subsystem v1.0 — Checkpoints (FIXED)
+# ============================================================
+
+LAYER_CORE = "CORE"
+
+CP_CORE_RECEIVE_INPUT = "CORE_RECEIVE_INPUT"      # CORE-01
+CP_CORE_PARSE_COMMAND = "CORE_PARSE_COMMAND"      # CORE-02
+CP_CORE_DISPATCH = "CORE_DISPATCH"                # CORE-03
+CP_CORE_BUILD_RESULT = "CORE_BUILD_RESULT"        # CORE-04
+CP_CORE_EXCEPTION = "CORE_EXCEPTION"              # CORE-FAIL
+
+
+# ============================================================
+# Structured Logging (Observation Only)
+# ============================================================
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log_event(
+    *,
+    trace_id: str,
+    checkpoint: str,
+    level: str,
+    summary: str,
+    error: Dict[str, Any] | None = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "trace_id": trace_id,
+        "checkpoint": checkpoint,
+        "layer": LAYER_CORE,
+        "level": level,
+        "summary": summary,
+        "timestamp": _now_iso(),
+    }
+    if error is not None:
+        payload["error"] = error
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def _log_debug(*, trace_id: str, checkpoint: str, summary: str) -> None:
+    _log_event(
+        trace_id=trace_id,
+        checkpoint=checkpoint,
+        level="DEBUG",
+        summary=summary,
+    )
+
+
+def _log_error(
+    *,
+    trace_id: str,
+    checkpoint: str,
+    summary: str,
+    exc: Exception,
+    at: str,
+    code: str = "E_CORE",
+    retryable: bool = False,
+) -> None:
+    _log_event(
+        trace_id=trace_id,
+        checkpoint=checkpoint,
+        level="ERROR",
+        summary=summary,
+        error={
+            "code": code,
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "at": at,
+            "retryable": retryable,
+        },
+    )
+
+
+# ============================================================
+# trace_id helper
+# ============================================================
+
+def _get_trace_id(core_input: Dict[str, Any]) -> str:
+    """
+    trace_id は Boundary_Gate が唯一生成する。
+    Core は受領してログに付与するのみ。
+    """
+    tid = core_input.get("trace_id")
+    if isinstance(tid, str) and tid:
+        return tid
+    meta = core_input.get("meta") or {}
+    mt = meta.get("trace_id")
+    if isinstance(mt, str) and mt:
+        return mt
+    return "UNKNOWN"
 
 
 # ============================================================
@@ -31,49 +128,74 @@ from typing import Any, Dict
 # ============================================================
 
 def run_core(core_input: Dict[str, Any]) -> Dict[str, Any]:
-    command_type = core_input.get("command_type", "free_chat")
-    raw_text = core_input.get("raw_text", "") or ""
-    arg_text = core_input.get("arg_text", "") or ""
-    task_id = core_input.get("task_id")
-    context_key = core_input.get("context_key")
-    user_id = core_input.get("user_id")
+    trace_id = _get_trace_id(core_input)
+    checkpoint = CP_CORE_RECEIVE_INPUT
+    _log_debug(trace_id=trace_id, checkpoint=checkpoint, summary="core input received")
 
-    # task_id がまだない場合は context_key を fallback
-    if task_id is None and context_key is not None:
-        task_id = str(context_key)
+    try:
+        checkpoint = CP_CORE_PARSE_COMMAND
+        _log_debug(trace_id=trace_id, checkpoint=checkpoint, summary="parse core_input")
 
-    # -------------------------
-    # Task Commands
-    # -------------------------
-    if command_type == "task_create":
-        return _handle_task_create(task_id, arg_text, user_id)
+        command_type = core_input.get("command_type", "free_chat")
+        raw_text = core_input.get("raw_text", "") or ""
+        arg_text = core_input.get("arg_text", "") or ""
+        task_id = core_input.get("task_id")
+        context_key = core_input.get("context_key")
+        user_id = core_input.get("user_id")
 
-    if command_type == "task_start":
-        return _handle_task_start(task_id, arg_text)
+        if task_id is None and context_key is not None:
+            task_id = str(context_key)
 
-    if command_type == "task_paused":
-        return _handle_task_paused(task_id)
+        checkpoint = CP_CORE_DISPATCH
+        _log_debug(
+            trace_id=trace_id,
+            checkpoint=checkpoint,
+            summary=f"dispatch command_type={command_type}",
+        )
 
-    if command_type == "task_end":
-        return _handle_task_end(task_id)
+        # -------------------------
+        # Task Commands
+        # -------------------------
+        if command_type == "task_create":
+            return _handle_task_create(trace_id, task_id, arg_text, user_id)
 
-    # -------------------------
-    # WBS Commands (mode normalize only)
-    # -------------------------
-    if command_type in (
-        "wbs_show",
-        "wbs_accept",
-        "wbs_reject",
-        "wbs_edit",
-        "wbs_done",
-        "wbs_drop",
-    ):
-        return _handle_wbs_command(command_type, task_id)
+        if command_type == "task_start":
+            return _handle_task_start(trace_id, task_id, arg_text)
 
-    # -------------------------
-    # Fallback
-    # -------------------------
-    return _handle_free_chat(raw_text, user_id, context_key)
+        if command_type == "task_paused":
+            return _handle_task_paused(trace_id, task_id)
+
+        if command_type == "task_end":
+            return _handle_task_end(trace_id, task_id)
+
+        # -------------------------
+        # WBS Commands (mode normalize only)
+        # -------------------------
+        if command_type in (
+            "wbs_show",
+            "wbs_accept",
+            "wbs_reject",
+            "wbs_edit",
+            "wbs_done",
+            "wbs_drop",
+        ):
+            return _handle_wbs_command(trace_id, command_type, task_id)
+
+        # -------------------------
+        # Fallback
+        # -------------------------
+        return _handle_free_chat(trace_id, raw_text, user_id, context_key)
+
+    except Exception as e:
+        _log_error(
+            trace_id=trace_id,
+            checkpoint=CP_CORE_EXCEPTION,
+            summary="exception in core",
+            exc=e,
+            at=checkpoint,
+        )
+        traceback.print_exc()
+        raise  # FAILSAFE は Boundary_Gate が担当
 
 
 # ============================================================
@@ -81,14 +203,11 @@ def run_core(core_input: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 def _handle_task_create(
+    trace_id: str,
     task_id: str | None,
     arg_text: str,
     user_id: str | None,
 ) -> Dict[str, Any]:
-    """
-    新規タスクの登録。
-    - task_create 時のみ CDC 候補を 1 件生成する（固定キー: cdc_candidate）。
-    """
     if task_id is None:
         return {
             "message_for_user": "[task_create] このコマンドはスレッド内でのみ有効です。",
@@ -106,26 +225,26 @@ def _handle_task_create(
         "[CDC] 作業候補を生成しました。承認: !wy / 破棄: !wn / 編集: !we"
     )
 
-    cdc_candidate = {
-        # ★ Interface_Box が拾う唯一正のキー
-        "rationale": f"{title} を進めるための最初の作業項目を定義する",
-    }
+    _log_debug(
+        trace_id=trace_id,
+        checkpoint=CP_CORE_BUILD_RESULT,
+        summary="task_create result built",
+    )
 
     return {
         "message_for_user": msg,
         "mode": "task_create",
         "task_name": title,
         "task_id": task_id,
-        "cdc_candidate": cdc_candidate,
+        "cdc_candidate": {
+            "rationale": f"{title} を進めるための最初の作業項目を定義する",
+        },
     }
 
 
-def _handle_task_start(task_id: str | None, arg_text: str) -> Dict[str, Any]:
+def _handle_task_start(trace_id: str, task_id: str | None, arg_text: str) -> Dict[str, Any]:
     if task_id is None:
-        return {
-            "message_for_user": "[task_start] スレッド内で実行してください。",
-            "mode": "free_chat",
-        }
+        return {"message_for_user": "[task_start] スレッド内で実行してください。", "mode": "free_chat"}
 
     memo = arg_text.strip()
     memo_line = f"- memo   : {memo}\n" if memo else ""
@@ -137,64 +256,33 @@ def _handle_task_start(task_id: str | None, arg_text: str) -> Dict[str, Any]:
         "※ task_end までの時間が duration に記録されます。"
     )
 
-    return {
-        "message_for_user": msg,
-        "mode": "task_start",
-        "task_id": task_id,
-        "memo": memo,
-    }
+    return {"message_for_user": msg, "mode": "task_start", "task_id": task_id, "memo": memo}
 
 
-def _handle_task_paused(task_id: str | None) -> Dict[str, Any]:
+def _handle_task_paused(trace_id: str, task_id: str | None) -> Dict[str, Any]:
     if task_id is None:
-        return {
-            "message_for_user": "[task_paused] スレッド内で実行してください。",
-            "mode": "free_chat",
-        }
+        return {"message_for_user": "[task_paused] スレッド内で実行してください。", "mode": "free_chat"}
 
-    msg = "[task_paused] 学習を一時停止しました。\n" f"- task_id: {task_id}"
-
-    return {
-        "message_for_user": msg,
-        "mode": "task_paused",
-        "task_id": task_id,
-        "task_summary": msg,
-    }
+    msg = f"[task_paused] 学習を一時停止しました。\n- task_id: {task_id}"
+    return {"message_for_user": msg, "mode": "task_paused", "task_id": task_id, "task_summary": msg}
 
 
-def _handle_task_end(task_id: str | None) -> Dict[str, Any]:
+def _handle_task_end(trace_id: str, task_id: str | None) -> Dict[str, Any]:
     if task_id is None:
-        return {
-            "message_for_user": "[task_end] スレッド内で実行してください。",
-            "mode": "free_chat",
-        }
+        return {"message_for_user": "[task_end] スレッド内で実行してください。", "mode": "free_chat"}
 
-    msg = "[task_end] 学習セッションを終了しました。\n" f"- task_id: {task_id}"
-
-    return {
-        "message_for_user": msg,
-        "mode": "task_end",
-        "task_id": task_id,
-        "task_summary": msg,
-    }
+    msg = f"[task_end] 学習セッションを終了しました。\n- task_id: {task_id}"
+    return {"message_for_user": msg, "mode": "task_end", "task_id": task_id, "task_summary": msg}
 
 
 # ============================================================
-# WBS Handler (no WBS logic)
+# WBS Handler (mode normalize only)
 # ============================================================
 
-def _handle_wbs_command(command_type: str, task_id: str | None) -> Dict[str, Any]:
-    """
-    WBS コマンドは Core では更新しない。
-    目的は「mode を確定させる」ことのみ。
-    """
-    # task_id が無くても mode は返す（Interface_Box 側が thread_id を決める）
-    # message_for_user は最小限。実際の詳細は Interface_Box の hint が追記される前提。
-    base = f"[{command_type}]"
-
+def _handle_wbs_command(trace_id: str, command_type: str, task_id: str | None) -> Dict[str, Any]:
     return {
-        "message_for_user": base,
-        "mode": command_type,   # ★ Stabilizer が command_type を判定できるようにする
+        "message_for_user": f"[{command_type}]",
+        "mode": command_type,
         "task_id": task_id,
     }
 
@@ -204,6 +292,7 @@ def _handle_wbs_command(command_type: str, task_id: str | None) -> Dict[str, Any
 # ============================================================
 
 def _handle_free_chat(
+    trace_id: str,
     raw_text: str,
     user_id: str | None,
     context_key: str | None,
@@ -218,7 +307,4 @@ def _handle_free_chat(
         f"{base}"
     )
 
-    return {
-        "message_for_user": msg,
-        "mode": "free_chat",
-    }
+    return {"message_for_user": msg, "mode": "free_chat"}
