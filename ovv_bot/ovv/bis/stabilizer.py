@@ -1,22 +1,6 @@
 # ovv/bis/stabilizer.py
 # ============================================================
-# MODULE CONTRACT: BIS / Stabilizer v3.11
-#   (Debugging Subsystem v1.0 compliant / Final Output Layer)
-#
-# ROLE:
-#   - BIS の最終統合レイヤ。
-#   - Core / Interface_Box 出力をもとに：
-#         [1] Persist v3.0 への書き込み
-#         [2] NotionOps の拡張（duration / summary）
-#         [3] work_item finalized（done / dropped）を
-#             NotionTaskSummary に append
-#         [4] Notion API の逐次実行
-#         [5] Discord へ返す最終メッセージ確定
-#
-# DEBUGGING SUBSYSTEM v1.0:
-#   - trace_id を必ずログに含める
-#   - チェックポイントは固定・有限
-#   - 例外はログに残し、最終出力は必ず返す（No Silent Death）
+# MODULE CONTRACT: BIS / Stabilizer v3.11 (FIXED)
 # ============================================================
 
 from __future__ import annotations
@@ -34,20 +18,19 @@ from database.pg import (
 )
 
 # ============================================================
-# Debugging Subsystem v1.0 — Checkpoints (FIXED)
+# Debugging Subsystem v1.0 — Checkpoints
 # ============================================================
 
 LAYER_ST = "ST"
 
-CP_ST_RECEIVE_RESULT = "ST_RECEIVE_RESULT"      # ST-01
-CP_ST_SANITIZE = "ST_SANITIZE"                  # ST-02
-CP_ST_FORMAT_OUTPUT = "ST_FORMAT_OUTPUT"        # ST-03
-CP_ST_SEND_DISCORD = "ST_SEND_DISCORD"          # ST-04
-CP_ST_EXCEPTION = "ST_EXCEPTION"                # ST-FAIL
+CP_ST_RECEIVE_RESULT = "ST_RECEIVE_RESULT"
+CP_ST_SANITIZE = "ST_SANITIZE"
+CP_ST_SEND_DISCORD = "ST_SEND_DISCORD"
+CP_ST_EXCEPTION = "ST_EXCEPTION"
 
 
 # ============================================================
-# Structured Logging (Observation Only)
+# Logging
 # ============================================================
 
 def _now_iso() -> str:
@@ -113,25 +96,14 @@ def _log_error(
 
 
 def _get_trace_id(context_key: Optional[str], core_output: Dict[str, Any]) -> str:
-    """
-    Stabilizer は trace_id を生成しない。
-    受領のみ。
-
-    優先順:
-      1. core_output["trace_id"]
-      2. core_output["meta"]["trace_id"]
-      3. context_key fallback
-    """
     tid = core_output.get("trace_id")
     if isinstance(tid, str) and tid:
         return tid
-
     meta = core_output.get("meta")
     if isinstance(meta, dict):
         mt = meta.get("trace_id")
         if isinstance(mt, str) and mt:
             return mt
-
     return str(context_key or "UNKNOWN")
 
 
@@ -140,11 +112,6 @@ def _get_trace_id(context_key: Optional[str], core_output: Dict[str, Any]) -> st
 # ============================================================
 
 class Stabilizer:
-    """
-    BIS Final Layer:
-        Persist → NotionOps → Discord Response
-    """
-
     def __init__(
         self,
         message_for_user: str,
@@ -152,7 +119,7 @@ class Stabilizer:
         context_key: Optional[str],
         user_id: Optional[str],
         task_id: Optional[str] = None,
-        command_type: Optional[str] = None,
+        command_type: Optional[str] = None,  # 互換のため残す（使用しない）
         core_output: Optional[Dict[str, Any]] = None,
         thread_state: Optional[Dict[str, Any]] = None,
     ):
@@ -162,12 +129,13 @@ class Stabilizer:
         self.context_key = context_key
         self.user_id = user_id
         self.task_id = str(task_id) if task_id is not None else None
-        self.command_type = command_type
 
         self.core_output = core_output or {}
         self.thread_state = thread_state or {}
 
+        self.mode: str = str(self.core_output.get("mode") or "unknown")
         self.trace_id = _get_trace_id(context_key, self.core_output)
+
         self._last_duration_seconds: Optional[int] = None
 
     # ========================================================
@@ -193,35 +161,34 @@ class Stabilizer:
             return
 
         now = datetime.now(timezone.utc)
-        event = self.command_type or "unknown"
 
         insert_task_log(
             task_id=self.task_id,
-            event_type=event,
+            event_type=self.mode,
             content=self.message_for_user or "",
             created_at=now,
         )
 
-        if event == "task_start":
+        if self.mode == "task_start":
             insert_task_session_start(
                 task_id=self.task_id,
                 user_id=self.user_id,
                 started_at=now,
             )
 
-        elif event == "task_end":
+        elif self.mode == "task_end":
             self._last_duration_seconds = insert_task_session_end_and_duration(
                 task_id=self.task_id,
                 ended_at=now,
             )
 
     # ========================================================
-    # [BUILD_OPS]
+    # [OPS AUGMENT]
     # ========================================================
 
     def _augment_duration(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if (
-            self.command_type == "task_end"
+            self.mode == "task_end"
             and self._last_duration_seconds is not None
             and self.task_id
         ):
@@ -242,7 +209,7 @@ class Stabilizer:
         return self.message_for_user.strip()
 
     def _augment_summary(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if self.command_type not in ("task_paused", "task_end"):
+        if self.mode not in ("task_paused", "task_end"):
             return ops
         if not self.task_id:
             return ops
@@ -261,7 +228,7 @@ class Stabilizer:
     def _augment_wbs_finalize_append(self, ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         finalized = self.thread_state.get("finalized_item")
         if (
-            self.command_type not in ("wbs_done", "wbs_drop")
+            self.mode not in ("wbs_done", "wbs_drop")
             or not self.task_id
             or not isinstance(finalized, dict)
         ):
@@ -289,7 +256,6 @@ class Stabilizer:
             summary="stabilizer receive result",
         )
 
-        # 1. Persist
         try:
             self._write_persist()
         except Exception as e:
@@ -300,23 +266,14 @@ class Stabilizer:
                 code="E_ST_PERSIST",
                 exc=e,
                 at="PERSIST",
-                retryable=False,
             )
             traceback.print_exc()
-
-        # 2. Build ops
-        _log_debug(
-            trace_id=self.trace_id,
-            checkpoint=CP_ST_SANITIZE,
-            summary="build notion ops",
-        )
 
         ops = list(self.notion_ops)
         ops = self._augment_duration(ops)
         ops = self._augment_summary(ops)
         ops = self._augment_wbs_finalize_append(ops)
 
-        # 3. Execute ops
         if ops:
             try:
                 await execute_notion_ops(
@@ -336,7 +293,6 @@ class Stabilizer:
                 )
                 traceback.print_exc()
 
-        # 4. Return output
         _log_debug(
             trace_id=self.trace_id,
             checkpoint=CP_ST_SEND_DISCORD,
