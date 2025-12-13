@@ -1,6 +1,6 @@
 # ovv/external_services/notion/ops/builders.py
 # ============================================================
-# MODULE CONTRACT: External / NotionOps Builder v3.0
+# MODULE CONTRACT: External / NotionOps Builder v3.1
 #
 # ROLE:
 #   - Core の出力 dict を、Notion Executor が必ず処理可能な
@@ -8,14 +8,16 @@
 #
 # RESPONSIBILITY TAGS:
 #   [BUILD_OPS]   Core → NotionOps の形式変換（正規化）
-#   [TASK_DB]     TaskDB(name, status, duration, summary) 反映のための命令生成
+#   [TASK_DB]     TaskDB(name, status, duration, summary) 反映命令生成
 #   [STRICT]      Core の "mode" を唯一のディスパッチ基準として扱う
 #   [SAFE]        None 返却禁止（必ず list を返す）
 #
 # CONSTRAINTS:
 #   - Builder は「命令のフォーマット化のみ」、副作用禁止。
-#   - Stabilizer（Persist/augment）と Executor（Notion API）とは厳密に分離する。
+#   - Stabilizer（Persist/augment）と Executor（Notion API）とは厳密分離。
 #   - free_chat / 不明モードでは空リスト [] を返す。
+#   - thread_id を Task 名に使用しない（内部キー専用）。
+#   - Task 名の唯一の参照元は CDC 済み title（Core から渡される）。
 # ============================================================
 
 from __future__ import annotations
@@ -36,7 +38,12 @@ def build_notion_ops(core_output: Dict[str, Any], request: Any) -> List[Dict[str
     """
 
     mode = core_output.get("mode")
+
+    # 内部キー（表示・命名に使用しない）
     task_id = getattr(request, "task_id", None)
+
+    # CDC 済み title（唯一の Task 名ソース）
+    task_title = core_output.get("task_title")
 
     # NOTE: user_meta → created_by 変換
     user_meta = getattr(request, "user_meta", {}) or {}
@@ -52,8 +59,10 @@ def build_notion_ops(core_output: Dict[str, Any], request: Any) -> List[Dict[str
         ops.append(
             {
                 "op": "task_create",
+                # task_id は Notion 側の関連付け用キー（表示禁止）
                 "task_id": task_id,
-                "task_name": core_output.get("task_name", f"Task {task_id}"),
+                # Task 名は必ず CDC 済み title を使う
+                "task_name": str(task_title or "(untitled task)"),
                 "created_by": created_by,
             }
         )
@@ -88,7 +97,7 @@ def build_notion_ops(core_output: Dict[str, Any], request: Any) -> List[Dict[str
 
     # --------------------------------------------------------
     # task_end
-    #   - duration と summary は Stabilizer が augment する。
+    #   - duration / summary は Stabilizer が augment する。
     # --------------------------------------------------------
     if mode == "task_end":
         ops.append(
