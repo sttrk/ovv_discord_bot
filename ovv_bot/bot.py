@@ -93,7 +93,6 @@ async def on_ready():
         )
         print("[DEBUG] Deploy notification sent via bot.")
     except Exception as e:
-        # 観測系は Bot 継続を最優先
         print("[DEBUG] Deploy notification failed (ignored):", repr(e))
 
 
@@ -101,11 +100,34 @@ async def on_ready():
 async def on_message(message: discord.Message):
     """
     [DISCORD_IO]
+    Entrance split:
+      - Gate-Assist (discord.py commands)
+      - Ovv BIS Pipeline (Boundary_Gate)
     """
+    # Bot自身の発言は無視
     if message.author.bot:
         return
 
-    await bot.process_commands(message)
+    content = (message.content or "").strip()
+
+    # ------------------------------------------------------------
+    # Gate-Assist commands（Debug / Help 系）
+    # ------------------------------------------------------------
+    if content.startswith((
+        "!bs",
+        "!dbg",
+        "!dbg_",
+        "!dbg-all",
+        "!dbg_all",
+        "!help",
+        "!wipe",
+    )):
+        await bot.process_commands(message)
+        return
+
+    # ------------------------------------------------------------
+    # Ovv BIS Pipeline
+    # ------------------------------------------------------------
     await handle_discord_input(message)
 
 # ================================================================
