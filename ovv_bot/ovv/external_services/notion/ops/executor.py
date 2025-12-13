@@ -1,6 +1,6 @@
 # ovv/external_services/notion/ops/executor.py
 # ============================================================
-# MODULE CONTRACT: External / NotionOps Executor v2.4
+# MODULE CONTRACT: External / NotionOps Executor v2.5
 #   (Duration + Summary + Status + SummaryAppend + Trace Observe)
 #
 # ROLE:
@@ -18,13 +18,15 @@
 #   - 呼び出し元は BIS/Stabilizer のみ
 #   - Executor は trace_id を生成しない
 #   - 1 op 単位で例外 isolation（他の ops は継続）
+#   - thread_id/task_id を Task 名に使用しない（内部キー専用）
 # ============================================================
 
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, List, Sequence, Union
+from typing import Dict, Any, List, Sequence, Union, Optional
 from datetime import datetime, timezone
 import json
+import os
 
 from ..notion_client import get_notion_client
 from ..config_notion import NOTION_TASK_DB_ID
@@ -60,6 +62,29 @@ def _log(msg: Dict[str, Any]) -> None:
     print(json.dumps(msg, ensure_ascii=False))
 
 
+# ------------------------------------------------------------
+# Notion Property Map (single edit point)
+#   NOTE:
+#     - DB のプロパティ名は環境/DBにより異なる可能性があるため、
+#       ここで一元管理し、必要なら ENV で上書きできるようにする。
+# ------------------------------------------------------------
+
+PROP_TITLE      = os.getenv("OVV_NOTION_PROP_TITLE", "name")        # title property
+PROP_TASK_ID    = os.getenv("OVV_NOTION_PROP_TASK_ID", "task_id")   # rich_text
+PROP_STATUS     = os.getenv("OVV_NOTION_PROP_STATUS", "status")     # select
+PROP_CREATED_AT = os.getenv("OVV_NOTION_PROP_CREATED_AT", "created_at")  # date
+PROP_STARTED_AT = os.getenv("OVV_NOTION_PROP_STARTED_AT", "started_at")  # date
+PROP_ENDED_AT   = os.getenv("OVV_NOTION_PROP_ENDED_AT", "ended_at")      # date
+PROP_DURATION   = os.getenv("OVV_NOTION_PROP_DURATION", "duration")      # number
+PROP_SUMMARY    = os.getenv("OVV_NOTION_PROP_SUMMARY", "summary")        # rich_text
+
+# Status values (select option names)
+STATUS_NOT_STARTED = os.getenv("OVV_NOTION_STATUS_NOT_STARTED", "not_started")
+STATUS_IN_PROGRESS = os.getenv("OVV_NOTION_STATUS_IN_PROGRESS", "in_progress")
+STATUS_PAUSED      = os.getenv("OVV_NOTION_STATUS_PAUSED", "paused")
+STATUS_COMPLETED   = os.getenv("OVV_NOTION_STATUS_COMPLETED", "completed")
+
+
 # ============================================================
 # Public entry (唯一の外部 API)
 # ============================================================
@@ -72,7 +97,6 @@ async def execute_notion_ops(
     """
     BIS / Stabilizer → Executor の唯一の API。
     """
-
     ops_list: List[Dict[str, Any]] = _normalize_ops(ops)
     if not ops_list:
         return
@@ -83,7 +107,7 @@ async def execute_notion_ops(
             "layer": "NOTION_EXECUTOR",
             "level": "INFO",
             "summary": "notion disabled; skip all ops",
-            "context_key": context_key,
+            "context_key": str(context_key),
         })
         return
 
@@ -92,13 +116,10 @@ async def execute_notion_ops(
             "layer": "NOTION_EXECUTOR",
             "level": "ERROR",
             "summary": "NOTION_TASK_DB_ID missing; skip all ops",
-            "context_key": context_key,
+            "context_key": str(context_key),
         })
         return
 
-    # --------------------------------------------------------
-    # 逐次実行（1 failure = continue）
-    # --------------------------------------------------------
     for idx, op_dict in enumerate(ops_list):
         if not isinstance(op_dict, dict):
             continue
@@ -107,7 +128,7 @@ async def execute_notion_ops(
         if not op_name:
             continue
 
-        trace_id = _extract_trace_id(op_dict, context_key)
+        trace_id = _extract_trace_id(op_dict, str(context_key))
         task_id = op_dict.get("task_id")
 
         try:
@@ -115,13 +136,13 @@ async def execute_notion_ops(
                 _create_task_item(notion, op_dict)
 
             elif op_name == "task_start":
-                _update_task_status(notion, op_dict, status="in_progress")
+                _update_task_status(notion, op_dict, status=STATUS_IN_PROGRESS)
 
             elif op_name == "task_paused":
-                _update_task_status(notion, op_dict, status="paused")
+                _update_task_status(notion, op_dict, status=STATUS_PAUSED)
 
             elif op_name == "task_end":
-                _update_task_status(notion, op_dict, status="completed")
+                _update_task_status(notion, op_dict, status=STATUS_COMPLETED)
 
             elif op_name == "update_task_duration":
                 _update_task_duration(notion, op_dict)
@@ -139,6 +160,7 @@ async def execute_notion_ops(
                     "trace_id": trace_id,
                     "summary": f"unknown op ignored: {op_name}",
                     "task_id": task_id,
+                    "op_index": idx,
                 })
 
         except Exception as e:
@@ -149,6 +171,7 @@ async def execute_notion_ops(
                 "summary": "op execution failed",
                 "op": op_name,
                 "task_id": task_id,
+                "op_index": idx,
                 "error": {
                     "type": type(e).__name__,
                     "message": str(e),
@@ -160,9 +183,7 @@ async def execute_notion_ops(
 # Normalization
 # ============================================================
 
-def _normalize_ops(
-    raw: Union[None, Dict[str, Any], Sequence[Dict[str, Any]]]
-) -> List[Dict[str, Any]]:
+def _normalize_ops(raw: Union[None, Dict[str, Any], Sequence[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     if raw is None:
         return []
     if isinstance(raw, dict):
@@ -177,17 +198,29 @@ def _normalize_ops(
 # ============================================================
 
 def _create_task_item(notion, ops: Dict[str, Any]) -> None:
-    task_id = ops["task_id"]
-    task_name = ops.get("task_name", f"Task {task_id}")
+    """
+    重要:
+      - task_name は必須（thread_id/task_id を代用しない）
+      - task_id は内部キー（検索・紐付け用）として別プロパティへ保存
+    """
+    task_id = str(ops.get("task_id") or "").strip()
+    task_name = str(ops.get("task_name") or "").strip()
+
+    if not task_id:
+        raise ValueError("task_create missing task_id")
+
+    # task_name が空の場合でも task_id で埋めない（仕様）
+    if not task_name:
+        task_name = "(untitled task)"
 
     notion.pages.create(
         parent={"database_id": NOTION_TASK_DB_ID},
         properties={
-            "name": {"title": [{"text": {"content": task_name}}]},
-            "task_id": {"rich_text": [{"text": {"content": task_id}}]},
-            "status": {"select": {"name": "not_started"}},
-            "created_at": {"date": {"start": _now_iso()}},
-            "duration": {"number": 0},
+            PROP_TITLE: {"title": [{"text": {"content": task_name}}]},
+            PROP_TASK_ID: {"rich_text": [{"text": {"content": task_id}}]},
+            PROP_STATUS: {"select": {"name": STATUS_NOT_STARTED}},
+            PROP_CREATED_AT: {"date": {"start": _now_iso()}},
+            PROP_DURATION: {"number": 0},
         },
     )
 
@@ -197,16 +230,19 @@ def _create_task_item(notion, ops: Dict[str, Any]) -> None:
 # ============================================================
 
 def _update_task_status(notion, ops: Dict[str, Any], status: str) -> None:
-    task_id = ops["task_id"]
+    task_id = str(ops.get("task_id") or "").strip()
+    if not task_id:
+        raise ValueError("status update missing task_id")
+
     page = _find_page_by_task_id(notion, task_id)
     if page is None:
         return
 
-    props: Dict[str, Any] = {"status": {"select": {"name": status}}}
-    if status == "in_progress":
-        props["started_at"] = {"date": {"start": _now_iso()}}
-    elif status == "completed":
-        props["ended_at"] = {"date": {"start": _now_iso()}}
+    props: Dict[str, Any] = {PROP_STATUS: {"select": {"name": status}}}
+    if status == STATUS_IN_PROGRESS:
+        props[PROP_STARTED_AT] = {"date": {"start": _now_iso()}}
+    elif status == STATUS_COMPLETED:
+        props[PROP_ENDED_AT] = {"date": {"start": _now_iso()}}
 
     notion.pages.update(page_id=page["id"], properties=props)
 
@@ -216,12 +252,21 @@ def _update_task_status(notion, ops: Dict[str, Any], status: str) -> None:
 # ============================================================
 
 def _update_task_duration(notion, ops: Dict[str, Any]) -> None:
-    page = _find_page_by_task_id(notion, ops["task_id"])
+    task_id = str(ops.get("task_id") or "").strip()
+    if not task_id:
+        raise ValueError("duration update missing task_id")
+
+    page = _find_page_by_task_id(notion, task_id)
     if page is None:
         return
+
+    duration_seconds = ops.get("duration_seconds")
+    if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, (int, float)):
+        return
+
     notion.pages.update(
         page_id=page["id"],
-        properties={"duration": {"number": ops["duration_seconds"]}},
+        properties={PROP_DURATION: {"number": duration_seconds}},
     )
 
 
@@ -230,18 +275,22 @@ def _update_task_duration(notion, ops: Dict[str, Any]) -> None:
 # ============================================================
 
 def _update_task_summary(notion, ops: Dict[str, Any]) -> None:
-    page = _find_page_by_task_id(notion, ops["task_id"])
+    task_id = str(ops.get("task_id") or "").strip()
+    if not task_id:
+        raise ValueError("summary update missing task_id")
+
+    page = _find_page_by_task_id(notion, task_id)
     if page is None:
         return
 
-    summary_text = ops.get("summary_text", "")
+    summary_text = str(ops.get("summary_text") or "").strip()
     if not summary_text:
         return
 
     notion.pages.update(
         page_id=page["id"],
         properties={
-            "summary": {"rich_text": [{"text": {"content": summary_text}}]}
+            PROP_SUMMARY: {"rich_text": [{"text": {"content": summary_text}}]}
         },
     )
 
@@ -251,21 +300,25 @@ def _update_task_summary(notion, ops: Dict[str, Any]) -> None:
 # ============================================================
 
 def _append_task_summary(notion, ops: Dict[str, Any]) -> None:
-    page = _find_page_by_task_id(notion, ops["task_id"])
+    task_id = str(ops.get("task_id") or "").strip()
+    if not task_id:
+        raise ValueError("summary append missing task_id")
+
+    page = _find_page_by_task_id(notion, task_id)
     if page is None:
         return
 
-    append_text = (ops.get("append_text") or "").strip()
+    append_text = str(ops.get("append_text") or "").strip()
     if not append_text:
         return
 
-    current = _get_rich_text_plain(page, "summary").strip()
+    current = _get_rich_text_plain(page, PROP_SUMMARY).strip()
     new_text = append_text if not current else f"{current}\n{append_text}"
 
     notion.pages.update(
         page_id=page["id"],
         properties={
-            "summary": {"rich_text": [{"text": {"content": new_text}}]}
+            PROP_SUMMARY: {"rich_text": [{"text": {"content": new_text}}]}
         },
     )
 
@@ -287,7 +340,7 @@ def _find_page_by_task_id(notion, task_id: str):
         res = notion.databases.query(
             database_id=NOTION_TASK_DB_ID,
             filter={
-                "property": "task_id",
+                "property": PROP_TASK_ID,
                 "rich_text": {"equals": task_id},
             },
         )
