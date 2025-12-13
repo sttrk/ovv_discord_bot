@@ -1,310 +1,293 @@
 # ovv/core/ovv_core.py
 # ============================================================
-# MODULE CONTRACT: Ovv Core v2.5
-#   (Debugging Subsystem v1.0 compliant / Task + CDC Candidate + WBS Mode Normalize)
+# MODULE CONTRACT: CORE / OvvCore v1.3
 #
 # ROLE:
-#   - BIS / Interface_Box から受け取った core_input(dict) を解釈し、
-#     Task 系コマンド / WBS 系コマンド / free_chat を振り分ける。
-#   - task_create 時にのみ CDC 候補を 1 件生成して返す（固定キー: cdc_candidate）。
-#   - WBS コマンドについては「mode の正規化」と「最小のユーザー応答」のみを行う。
+#   - InputPacket を受け取り、ThreadWBS / Persist / NotionOps を構成し、
+#     Stabilizer に返す「Core 統合制御層」。
 #
-# DEBUGGING SUBSYSTEM v1.0 COMPLIANCE:
-#   - trace_id は Boundary_Gate 生成のものを受領するのみ（Single Trace Rule）
-#   - 固定チェックポイントのみを使用（Checkpoint Determinism）
-#   - except は必ず構造ログを吐き、握りつぶさず raise
+# RESPONSIBILITY TAGS:
+#   [CORE]     command dispatch / orchestration
+#   [WBS]      ThreadWBS の生成・更新（builder に委譲）
+#   [PERSIST]  PG I/O は adapter 経由（直接 SQL しない）
+#   [NOTION]   Notion ops の生成のみ（実行は executor）
+#   [DEBUG]    Debugging Subsystem v1.0（観測のみ）
 #
-# CONSTRAINTS (HARD):
-#   - 外部 I/O（DB / Notion / Discord）は一切行わない（純ロジック層）。
-#   - WBS の更新 / 永続化 / 候補確定 / Finalize を行わない。
-#   - FAILSAFE を持たない（Boundary_Gate に集約）。
+# CONSTRAINTS:
+#   - 推論しない（LLM を呼ばない）
+#   - thread_id を UI 名に使わない（命名は CDC 済み title）
+#   - 初期命名 CDC は ThreadWBS builder の create_empty_wbs に集約
+#   - context_splitter は初期段階では使用しない
 # ============================================================
 
 from __future__ import annotations
 
-from typing import Any, Dict
-from datetime import datetime, timezone
-import json
-import traceback
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, List
+
+# NOTE: パスはあなたのリポジトリ構造に合わせている
+from ovv.bis.types import InputPacket
+from ovv.bis.wbs import thread_wbs_builder as wbs_builder
+
+# Persist adapters
+from database import pg_wbs
+from database import runtime_memory
+
+# Notion ops (builder only; executor is called elsewhere)
+from ovv.external_services.notion.ops import builders as notion_builders
 
 
-# ============================================================
-# Debugging Subsystem v1.0 — Checkpoints (FIXED)
-# ============================================================
-
-LAYER_CORE = "CORE"
-
-CP_CORE_RECEIVE_INPUT = "CORE_RECEIVE_INPUT"      # CORE-01
-CP_CORE_PARSE_COMMAND = "CORE_PARSE_COMMAND"      # CORE-02
-CP_CORE_DISPATCH = "CORE_DISPATCH"                # CORE-03
-CP_CORE_BUILD_RESULT = "CORE_BUILD_RESULT"        # CORE-04
-CP_CORE_EXCEPTION = "CORE_EXCEPTION"              # CORE-FAIL
-
-
-# ============================================================
-# Structured Logging (Observation Only)
-# ============================================================
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _log_event(
-    *,
-    trace_id: str,
-    checkpoint: str,
-    level: str,
-    summary: str,
-    error: Dict[str, Any] | None = None,
-) -> None:
-    payload: Dict[str, Any] = {
-        "trace_id": trace_id,
-        "checkpoint": checkpoint,
-        "layer": LAYER_CORE,
-        "level": level,
-        "summary": summary,
-        "timestamp": _now_iso(),
-    }
-    if error is not None:
-        payload["error"] = error
-    print(json.dumps(payload, ensure_ascii=False))
-
-
-def _log_debug(*, trace_id: str, checkpoint: str, summary: str) -> None:
-    _log_event(
-        trace_id=trace_id,
-        checkpoint=checkpoint,
-        level="DEBUG",
-        summary=summary,
-    )
-
-
-def _log_error(
-    *,
-    trace_id: str,
-    checkpoint: str,
-    summary: str,
-    exc: Exception,
-    at: str,
-    code: str = "E_CORE",
-    retryable: bool = False,
-) -> None:
-    _log_event(
-        trace_id=trace_id,
-        checkpoint=checkpoint,
-        level="ERROR",
-        summary=summary,
-        error={
-            "code": code,
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "at": at,
-            "retryable": retryable,
-        },
-    )
-
-
-# ============================================================
-# trace_id helper
-# ============================================================
-
-def _get_trace_id(core_input: Dict[str, Any]) -> str:
+@dataclass
+class CoreResult:
     """
-    trace_id は Boundary_Gate が唯一生成する。
-    Core は受領してログに付与するのみ。
+    Stabilizer に返す統合結果（最小）。
+    - discord_output: Discord に返す本文
+    - notion_ops: Notion へ送る ops（executor が実行）
+    - wbs: ThreadWBS（Persist へ保存する前提）
     """
-    tid = core_input.get("trace_id")
-    if isinstance(tid, str) and tid:
-        return tid
-    meta = core_input.get("meta") or {}
-    mt = meta.get("trace_id")
-    if isinstance(mt, str) and mt:
-        return mt
-    return "UNKNOWN"
+    discord_output: str
+    notion_ops: Optional[List[Dict[str, Any]]] = None
+    wbs: Optional[Dict[str, Any]] = None
 
 
-# ============================================================
-# Public Entry
-# ============================================================
+# ------------------------------------------------------------
+# Safe helpers
+# ------------------------------------------------------------
 
-def run_core(core_input: Dict[str, Any]) -> Dict[str, Any]:
-    trace_id = _get_trace_id(core_input)
-    checkpoint = CP_CORE_RECEIVE_INPUT
-    _log_debug(trace_id=trace_id, checkpoint=checkpoint, summary="core input received")
+def _safe_meta_thread_name(packet: InputPacket) -> str:
+    """
+    thread_name の唯一の入力源は packet.meta.discord_thread_name。
+    無い場合は空文字（→ CDC が unconfirmed に収束させる）。
+    """
+    meta = getattr(packet, "meta", None)
+    if isinstance(meta, dict):
+        v = meta.get("discord_thread_name")
+        if isinstance(v, str):
+            return v
+    return ""
 
+
+def _load_wbs(thread_id: str) -> Optional[Dict[str, Any]]:
     try:
-        checkpoint = CP_CORE_PARSE_COMMAND
-        _log_debug(trace_id=trace_id, checkpoint=checkpoint, summary="parse core_input")
+        return pg_wbs.load_thread_wbs(thread_id)
+    except Exception:
+        return None
 
-        command_type = core_input.get("command_type", "free_chat")
-        raw_text = core_input.get("raw_text", "") or ""
-        arg_text = core_input.get("arg_text", "") or ""
-        task_id = core_input.get("task_id")
-        context_key = core_input.get("context_key")
-        user_id = core_input.get("user_id")
 
-        if task_id is None and context_key is not None:
-            task_id = str(context_key)
+def _save_wbs(thread_id: str, wbs: Dict[str, Any]) -> None:
+    pg_wbs.save_thread_wbs(thread_id, wbs)
 
-        checkpoint = CP_CORE_DISPATCH
-        _log_debug(
-            trace_id=trace_id,
-            checkpoint=checkpoint,
-            summary=f"dispatch command_type={command_type}",
+
+# ------------------------------------------------------------
+# Core entry
+# ------------------------------------------------------------
+
+def handle_packet(packet: InputPacket) -> CoreResult:
+    """
+    Core の単一エントリポイント。
+    Boundary_Gate → Interface_Box から InputPacket を受けて処理する。
+    """
+    cmd = getattr(packet, "command", None)
+    if not isinstance(cmd, str):
+        return CoreResult(discord_output="Command missing.")
+
+    if cmd == "task_create":
+        return _cmd_task_create(packet)
+
+    if cmd == "wbs_show":
+        return _cmd_wbs_show(packet)
+
+    if cmd == "task_pause":
+        return _cmd_task_pause(packet)
+
+    if cmd == "task_complete":
+        return _cmd_task_complete(packet)
+
+    # WBS accept/edit/finalize 系（あなたのコマンド体系に合わせて）
+    if cmd == "wbs_accept":  # !wy
+        return _cmd_wbs_accept(packet)
+
+    if cmd == "wbs_edit_accept":  # !we
+        return _cmd_wbs_edit_accept(packet)
+
+    if cmd == "wbs_done":  # !wd
+        return _cmd_wbs_done(packet)
+
+    if cmd == "wbs_drop":  # !wx
+        return _cmd_wbs_drop(packet)
+
+    return CoreResult(discord_output=f"Unknown command: {cmd}")
+
+
+# ------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------
+
+def _cmd_task_create(packet: InputPacket) -> CoreResult:
+    """
+    !t 相当（task_create）
+    - ThreadWBS を作成
+    - Notion Task を作成（Name は wbs.task）
+    """
+    thread_id = str(packet.context_key)
+    raw_thread_name = _safe_meta_thread_name(packet)
+
+    # 既存があればそれを返す（上書きしない：運用安全）
+    existing = _load_wbs(thread_id)
+    if isinstance(existing, dict) and existing.get("task"):
+        title = str(existing.get("task"))
+        return CoreResult(
+            discord_output=f"Task already exists: {title}",
+            notion_ops=None,
+            wbs=existing,
         )
 
-        # -------------------------
-        # Task Commands
-        # -------------------------
-        if command_type == "task_create":
-            return _handle_task_create(trace_id, task_id, arg_text, user_id)
+    # CDC は builder 内で実行され、task(title) が確定する
+    wbs = wbs_builder.create_empty_wbs(raw_thread_name, trace_id=getattr(packet, "trace_id", None))
 
-        if command_type == "task_start":
-            return _handle_task_start(trace_id, task_id, arg_text)
+    # Persist
+    _save_wbs(thread_id, wbs)
 
-        if command_type == "task_paused":
-            return _handle_task_paused(trace_id, task_id)
-
-        if command_type == "task_end":
-            return _handle_task_end(trace_id, task_id)
-
-        # -------------------------
-        # WBS Commands (mode normalize only)
-        # -------------------------
-        if command_type in (
-            "wbs_show",
-            "wbs_accept",
-            "wbs_reject",
-            "wbs_edit",
-            "wbs_done",
-            "wbs_drop",
-        ):
-            return _handle_wbs_command(trace_id, command_type, task_id)
-
-        # -------------------------
-        # Fallback
-        # -------------------------
-        return _handle_free_chat(trace_id, raw_text, user_id, context_key)
-
-    except Exception as e:
-        _log_error(
-            trace_id=trace_id,
-            checkpoint=CP_CORE_EXCEPTION,
-            summary="exception in core",
-            exc=e,
-            at=checkpoint,
-        )
-        traceback.print_exc()
-        raise  # FAILSAFE は Boundary_Gate が担当
-
-
-# ============================================================
-# Task Handlers
-# ============================================================
-
-def _handle_task_create(
-    trace_id: str,
-    task_id: str | None,
-    arg_text: str,
-    user_id: str | None,
-) -> Dict[str, Any]:
-    if task_id is None:
-        return {
-            "message_for_user": "[task_create] このコマンドはスレッド内でのみ有効です。",
-            "mode": "free_chat",
-        }
-
-    title = arg_text.strip() or f"Task {task_id}"
-    user_label = user_id or "unknown"
-
-    msg = (
-        "[task_create] 新しいタスクを登録しました。\n"
-        f"- task_id   : {task_id}\n"
-        f"- name      : {title}\n"
-        f"- created_by: {user_label}\n\n"
-        "[CDC] 作業候補を生成しました。承認: !wy / 破棄: !wn / 編集: !we"
+    # Notion ops: Name は wbs.task（= CDC title）
+    # thread_id は技術プロパティ側へ（builders 側で扱う想定）
+    notion_ops = notion_builders.build_task_create_ops(
+        *,
+        task_name=str(wbs.get("task") or ""),
+        thread_id=thread_id,
+        context_key=thread_id,
+        user_meta=getattr(packet, "user_meta", None) if isinstance(getattr(packet, "user_meta", None), dict) else {},
     )
 
-    _log_debug(
-        trace_id=trace_id,
-        checkpoint=CP_CORE_BUILD_RESULT,
-        summary="task_create result built",
+    return CoreResult(
+        discord_output=f"Task created: {wbs.get('task')}",
+        notion_ops=notion_ops,
+        wbs=wbs,
     )
 
-    return {
-        "message_for_user": msg,
-        "mode": "task_create",
-        "task_name": title,
-        "task_id": task_id,
-        "cdc_candidate": {
-            "rationale": f"{title} を進めるための最初の作業項目を定義する",
-        },
-    }
+
+def _cmd_wbs_show(packet: InputPacket) -> CoreResult:
+    thread_id = str(packet.context_key)
+    wbs = _load_wbs(thread_id)
+    if not wbs:
+        return CoreResult(discord_output="WBS not found. Run !t to create.")
+    return CoreResult(discord_output=_format_wbs(wbs), wbs=wbs)
 
 
-def _handle_task_start(trace_id: str, task_id: str | None, arg_text: str) -> Dict[str, Any]:
-    if task_id is None:
-        return {"message_for_user": "[task_start] スレッド内で実行してください。", "mode": "free_chat"}
+def _cmd_task_pause(packet: InputPacket) -> CoreResult:
+    thread_id = str(packet.context_key)
+    wbs = _load_wbs(thread_id)
+    if not wbs:
+        return CoreResult(discord_output="WBS not found. Run !t first.")
 
-    memo = arg_text.strip()
-    memo_line = f"- memo   : {memo}\n" if memo else ""
+    wbs = wbs_builder.on_task_pause(wbs, trace_id=getattr(packet, "trace_id", None))
+    _save_wbs(thread_id, wbs)
 
-    msg = (
-        "[task_start] 学習セッションを開始しました。\n"
-        f"- task_id: {task_id}\n"
-        f"{memo_line}"
-        "※ task_end までの時間が duration に記録されます。"
+    # Notion summary/duration は Stabilizer 側で処理する想定（本Coreでは ops を作らない）
+    return CoreResult(discord_output="Task paused.", wbs=wbs)
+
+
+def _cmd_task_complete(packet: InputPacket) -> CoreResult:
+    thread_id = str(packet.context_key)
+    wbs = _load_wbs(thread_id)
+    if not wbs:
+        return CoreResult(discord_output="WBS not found. Run !t first.")
+
+    wbs = wbs_builder.on_task_complete(wbs, trace_id=getattr(packet, "trace_id", None))
+    _save_wbs(thread_id, wbs)
+
+    return CoreResult(discord_output="Task completed.", wbs=wbs)
+
+
+def _cmd_wbs_accept(packet: InputPacket) -> CoreResult:
+    """
+    !wy: 直近の CDC candidate を accept する、などは上位で candidate を構築して渡す想定。
+    ここでは packet.content を rationale として受ける最小実装（運用上は Interface_Box 側で candidate を構築して渡せ）。
+    """
+    thread_id = str(packet.context_key)
+    wbs = _load_wbs(thread_id)
+    if not wbs:
+        return CoreResult(discord_output="WBS not found. Run !t first.")
+
+    candidate = {"rationale": str(getattr(packet, "content", "") or "")}
+    wbs = wbs_builder.accept_work_item(wbs, candidate, trace_id=getattr(packet, "trace_id", None))
+    _save_wbs(thread_id, wbs)
+
+    return CoreResult(discord_output="Work item accepted.", wbs=wbs)
+
+
+def _cmd_wbs_edit_accept(packet: InputPacket) -> CoreResult:
+    thread_id = str(packet.context_key)
+    wbs = _load_wbs(thread_id)
+    if not wbs:
+        return CoreResult(discord_output="WBS not found. Run !t first.")
+
+    new_rationale = str(getattr(packet, "content", "") or "").strip()
+    candidate = {}
+    wbs = wbs_builder.edit_and_accept_work_item(
+        wbs,
+        candidate,
+        new_rationale,
+        trace_id=getattr(packet, "trace_id", None),
     )
+    _save_wbs(thread_id, wbs)
 
-    return {"message_for_user": msg, "mode": "task_start", "task_id": task_id, "memo": memo}
-
-
-def _handle_task_paused(trace_id: str, task_id: str | None) -> Dict[str, Any]:
-    if task_id is None:
-        return {"message_for_user": "[task_paused] スレッド内で実行してください。", "mode": "free_chat"}
-
-    msg = f"[task_paused] 学習を一時停止しました。\n- task_id: {task_id}"
-    return {"message_for_user": msg, "mode": "task_paused", "task_id": task_id, "task_summary": msg}
+    return CoreResult(discord_output="Work item edited+accepted.", wbs=wbs)
 
 
-def _handle_task_end(trace_id: str, task_id: str | None) -> Dict[str, Any]:
-    if task_id is None:
-        return {"message_for_user": "[task_end] スレッド内で実行してください。", "mode": "free_chat"}
+def _cmd_wbs_done(packet: InputPacket) -> CoreResult:
+    thread_id = str(packet.context_key)
+    wbs = _load_wbs(thread_id)
+    if not wbs:
+        return CoreResult(discord_output="WBS not found. Run !t first.")
 
-    msg = f"[task_end] 学習セッションを終了しました。\n- task_id: {task_id}"
-    return {"message_for_user": msg, "mode": "task_end", "task_id": task_id, "task_summary": msg}
+    wbs, finalized = wbs_builder.mark_focus_done(wbs, trace_id=getattr(packet, "trace_id", None))
+    _save_wbs(thread_id, wbs)
 
+    if not finalized:
+        return CoreResult(discord_output="No focus item to finalize.", wbs=wbs)
 
-# ============================================================
-# WBS Handler (mode normalize only)
-# ============================================================
-
-def _handle_wbs_command(trace_id: str, command_type: str, task_id: str | None) -> Dict[str, Any]:
-    return {
-        "message_for_user": f"[{command_type}]",
-        "mode": command_type,
-        "task_id": task_id,
-    }
+    return CoreResult(discord_output="Focus item marked done.", wbs=wbs)
 
 
-# ============================================================
-# Free chat fallback
-# ============================================================
+def _cmd_wbs_drop(packet: InputPacket) -> CoreResult:
+    thread_id = str(packet.context_key)
+    wbs = _load_wbs(thread_id)
+    if not wbs:
+        return CoreResult(discord_output="WBS not found. Run !t first.")
 
-def _handle_free_chat(
-    trace_id: str,
-    raw_text: str,
-    user_id: str | None,
-    context_key: str | None,
-) -> Dict[str, Any]:
-    base = raw_text.strip() or "(empty)"
+    reason = str(getattr(packet, "content", "") or "").strip() or None
+    wbs, finalized = wbs_builder.mark_focus_dropped(wbs, reason, trace_id=getattr(packet, "trace_id", None))
+    _save_wbs(thread_id, wbs)
 
-    msg = (
-        "[free_chat] タスク管理モード（Persist / Notion 連携）を優先しています。\n"
-        f"- user_id    : {user_id or 'unknown'}\n"
-        f"- context_key: {context_key or 'none'}\n\n"
-        "---- Echo ----\n"
-        f"{base}"
-    )
+    if not finalized:
+        return CoreResult(discord_output="No focus item to finalize.", wbs=wbs)
 
-    return {"message_for_user": msg, "mode": "free_chat"}
+    return CoreResult(discord_output="Focus item dropped.", wbs=wbs)
+
+
+# ------------------------------------------------------------
+# Formatting
+# ------------------------------------------------------------
+
+def _format_wbs(wbs: Dict[str, Any]) -> str:
+    task = str(wbs.get("task") or "")
+    status = str(wbs.get("status") or "")
+    focus = wbs.get("focus_point")
+    items = wbs.get("work_items") if isinstance(wbs.get("work_items"), list) else []
+
+    lines = [
+        "=== ThreadWBS ===",
+        f"task   : {task}",
+        f"status : {status}",
+        f"focus  : {focus}",
+        "",
+        "[work_items]",
+    ]
+    for i, it in enumerate(items):
+        if isinstance(it, dict):
+            r = str(it.get("rationale", "") or "")
+            st = str(it.get("status", "") or "")
+            lines.append(f"- {i}: {r} [{st}]".strip())
+        else:
+            lines.append(f"- {i}: {str(it)}")
+    return "```\n" + "\n".join(lines) + "\n```"
