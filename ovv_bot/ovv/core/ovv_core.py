@@ -1,6 +1,6 @@
 # ovv/core/ovv_core.py
 # ============================================================
-# MODULE CONTRACT: CORE / OvvCore v1.4 (FIXED)
+# MODULE CONTRACT: CORE / OvvCore v1.4 (STABLE)
 #
 # ROLE:
 #   - InputPacket を受け取り、ThreadWBS / Persist / NotionOps を構成し、
@@ -66,9 +66,6 @@ def _safe_meta_thread_name(packet: InputPacket) -> str:
 
 
 def _load_wbs(thread_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Persist / ThreadWBS のロード（正規API）。
-    """
     try:
         return pg_wbs.load_thread_wbs(thread_id)
     except Exception:
@@ -76,9 +73,6 @@ def _load_wbs(thread_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _save_wbs(thread_id: str, wbs: Dict[str, Any]) -> None:
-    """
-    Persist / ThreadWBS の保存（正規API）。
-    """
     pg_wbs.save_thread_wbs(thread_id, wbs)
 
 
@@ -111,6 +105,8 @@ def handle_packet(packet: InputPacket) -> CoreResult:
 
     if cmd == "task_create":
         return _cmd_task_create(packet)
+    if cmd == "task_start":
+        return _cmd_task_start(packet)
     if cmd == "wbs_show":
         return _cmd_wbs_show(packet)
     if cmd == "task_paused":
@@ -168,15 +164,34 @@ def _cmd_task_create(packet: InputPacket) -> CoreResult:
     )
 
 
+def _cmd_task_start(packet: InputPacket) -> CoreResult:
+    """
+    !ts
+    - タスク開始の宣言のみを行う
+    - 実時間記録 / セッション管理は Stabilizer の責務
+    """
+    thread_id = str(packet.context_key)
+    wbs = _load_wbs(thread_id)
+    if not wbs:
+        return CoreResult("WBS not found. Run !t first.", [])
+
+    title = str(wbs.get("task") or "")
+    core_output = _mk_core_output(mode="task_start", task_title=title)
+    notion_ops = build_notion_ops(core_output, packet)
+
+    return CoreResult(
+        discord_output="Task started.",
+        notion_ops=notion_ops,
+        wbs=wbs,
+        core_output=core_output,
+    )
+
+
 def _cmd_wbs_show(packet: InputPacket) -> CoreResult:
     thread_id = str(packet.context_key)
     wbs = _load_wbs(thread_id)
     if not wbs:
-        return CoreResult(
-            discord_output="WBS not found. Run !t to create.",
-            notion_ops=[],
-            core_output=_mk_core_output(mode="free_chat"),
-        )
+        return CoreResult("WBS not found. Run !t to create.", [])
 
     return CoreResult(
         discord_output=_format_wbs(wbs),
