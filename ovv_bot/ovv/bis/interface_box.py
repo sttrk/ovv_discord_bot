@@ -1,458 +1,69 @@
 # ovv/bis/interface_box.py
 # ============================================================
-# MODULE CONTRACT: BIS / Interface_Box v3.11
-#   (Debugging Subsystem v1.0 compliant / CDC Runtime Lock + WBS Finalize)
+# MODULE CONTRACT: BIS / Interface_Box v1.3
 #
 # ROLE:
-#   - Boundary_Gate から渡された InputPacket を受け取り、
-#     Core → NotionOps Builder → Stabilizer の実行順序を保証する。
-#   - ThreadWBS を「推論前コンテキスト」として Core に渡す。
-#   - 明示コマンドに限り、ThreadWBS の最小更新を発火させる。
-#   - CDC による work_item 候補は Runtime のみに保持し、
-#     !wy / !wn / !we でのみ確定・破棄する。
-#   - work_item の finalize（done/dropped）は !wd / !wx のみで確定し、
-#     finalized_item は Stabilizer(thread_state) に引き渡す。
+#   - Boundary_Gate から受け取った InputPacket を正規化し、
+#     Core に安全に受け渡すための「薄いインターフェース層」
 #
-# HARD GUARANTEES:
-#   - CDC 候補の永続化は禁止（Runtime only）
-#   - LLM による自動改変は禁止
-#   - WBS 更新は明示コマンドのみ
+# RESPONSIBILITY TAGS:
+#   [INTERFACE]   InputPacket 正規化
+#   [DELEGATE]    Core.handle_packet への完全委譲
+#   [GUARD]       不正・不足フィールドの最小ガード
+#   [DEBUG]       Debugging Subsystem v1.0（観測のみ）
 #
-# DEBUGGING SUBSYSTEM v1.0 COMPLIANCE:
-#   - trace_id は Boundary 生成のものを受領し、以降ログに必ず付与する
-#   - チェックポイント名は固定・有限（Checkpoint Determinism）
-#   - except は必ず構造ログを吐き、握りつぶさず raise（FAILSAFE は Boundary が担当）
+# CONSTRAINTS:
+#   - 推論しない
+#   - 状態を持たない
+#   - 命名・CDC・業務判断は行わない
+#   - context_splitter は使用しない
 # ============================================================
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, List
-from datetime import datetime, timezone
+from typing import Optional
 import json
-import traceback
 
-from ovv.core.ovv_core import run_core
-from ovv.external_services.notion.ops.builders import build_notion_ops
-from .stabilizer import Stabilizer
-from .types import InputPacket
-
-from ovv.bis.wbs.thread_wbs_persistence import load_thread_wbs, save_thread_wbs
-from ovv.bis.wbs.thread_wbs_builder import (
-    create_empty_wbs,
-    accept_work_item,
-    edit_and_accept_work_item,
-    on_task_pause,
-    on_task_complete,
-    mark_focus_done,
-    mark_focus_dropped,
-)
-
-# ============================================================
-# Debugging Subsystem v1.0 — Checkpoints (FIXED)
-#   Interface/Core layer checkpoints
-# ============================================================
-
-LAYER_CORE = "CORE"
-
-CP_CORE_RECEIVE_PACKET = "CORE_RECEIVE_PACKET"      # CORE-01
-CP_CORE_PARSE_INTENT = "CORE_PARSE_INTENT"          # CORE-02
-CP_CORE_EXECUTE = "CORE_EXECUTE"                    # CORE-03
-CP_CORE_RETURN_RESULT = "CORE_RETURN_RESULT"        # CORE-04
-CP_CORE_EXCEPTION = "CORE_EXCEPTION"                # CORE-FAIL
+from ovv.bis.types import InputPacket
+from ovv.core.ovv_core import handle_packet, CoreResult
 
 
-# ============================================================
-# Structured Logging (Observation Only)
-# ============================================================
+# ------------------------------------------------------------
+# Debug logging (observation only)
+# ------------------------------------------------------------
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+LAYER_BIS = "BIS"
+CP_IFACE_DISPATCH = "IFACE_DISPATCH"
 
 
-def _log_event(
-    *,
-    trace_id: str,
-    checkpoint: str,
-    layer: str,
-    level: str,
-    summary: str,
-    error: Optional[Dict[str, Any]] = None,
-) -> None:
-    payload: Dict[str, Any] = {
-        "trace_id": trace_id,
-        "checkpoint": checkpoint,
-        "layer": layer,
-        "level": level,
-        "summary": summary,
-        "timestamp": _now_iso(),
+def _log_dispatch(packet: InputPacket) -> None:
+    payload = {
+        "trace_id": getattr(packet, "trace_id", None) or "UNKNOWN",
+        "checkpoint": CP_IFACE_DISPATCH,
+        "layer": LAYER_BIS,
+        "level": "DEBUG",
+        "summary": "interface dispatch to core",
     }
-    if error is not None:
-        payload["error"] = error
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def _log_debug(*, trace_id: str, checkpoint: str, summary: str) -> None:
-    _log_event(
-        trace_id=trace_id,
-        checkpoint=checkpoint,
-        layer=LAYER_CORE,
-        level="DEBUG",
-        summary=summary,
-    )
+# ------------------------------------------------------------
+# Public entry
+# ------------------------------------------------------------
 
-
-def _log_error(
-    *,
-    trace_id: str,
-    checkpoint: str,
-    summary: str,
-    code: str,
-    exc: Exception,
-    at: str,
-    retryable: bool = False,
-) -> None:
-    _log_event(
-        trace_id=trace_id,
-        checkpoint=checkpoint,
-        layer=LAYER_CORE,
-        level="ERROR",
-        summary=summary,
-        error={
-            "code": code,
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "at": at,
-            "retryable": retryable,
-        },
-    )
-
-
-def _get_trace_id(packet: InputPacket) -> str:
+def handle_request(packet: InputPacket) -> CoreResult:
     """
-    trace_id は Boundary_Gate が唯一生成する（Single Trace Rule）。
-    Interface_Box は受領してログに付与するだけ。
+    Interface_Box の単一エントリ。
 
-    - packet.trace_id があればそれを優先
-    - なければ packet.meta["trace_id"] を参照
-    - それも無ければ "UNKNOWN"
-
-    NOTE:
-      - InputPacket が trace_id フィールドを未実装の場合にも耐える。
+    - packet の最低限の整合性のみを確認
+    - Core に完全委譲
     """
-    tid = getattr(packet, "trace_id", None)
-    if isinstance(tid, str) and tid:
-        return tid
-    meta = getattr(packet, "meta", None) or {}
-    mt = meta.get("trace_id")
-    if isinstance(mt, str) and mt:
-        return mt
-    return "UNKNOWN"
+    if not isinstance(packet, InputPacket):
+        # Boundary_Gate が保証する前提だが、念のためのガード
+        return CoreResult(discord_output="Invalid input packet.")
 
+    # 観測のみ
+    _log_dispatch(packet)
 
-# ============================================================
-# STEP A: CDC Candidate Runtime Store
-#   - 明示的に「プロセス内メモリのみ」
-#   - 1 thread_id = 1 candidate
-# ============================================================
-
-_RUNTIME_CDC: Dict[str, Dict[str, Any]] = {}
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def _select_thread_id(task_id: Any, context_key: Any) -> Optional[str]:
-    if task_id:
-        return str(task_id)
-    if context_key is not None:
-        return str(context_key)
-    return None
-
-
-def _get_thread_name(packet: InputPacket) -> str:
-    meta = getattr(packet, "meta", None) or {}
-    for k in ("discord_thread_name", "discord_channel_name", "thread_name", "channel_name"):
-        v = meta.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return str(getattr(packet, "channel_id", "") or "untitled-task")
-
-
-def _format_wbs_brief(wbs: Dict[str, Any], max_items: int = 10) -> str:
-    task = wbs.get("task", "")
-    status = wbs.get("status", "")
-    focus = wbs.get("focus_point", None)
-    items = wbs.get("work_items", []) or []
-
-    lines: List[str] = []
-    lines.append("[WBS]")
-    lines.append(f"- task: {task}")
-    lines.append(f"- status: {status}")
-    lines.append(f"- focus_point: {focus}")
-
-    if not items:
-        lines.append("- work_items: (empty)")
-        return "\n".join(lines)
-
-    lines.append("- work_items:")
-    for i, it in enumerate(items[:max_items]):
-        rationale = ""
-        st = ""
-        if isinstance(it, dict):
-            rationale = (it.get("rationale") or "").strip()
-            st = (it.get("status") or "").strip()
-        if not rationale:
-            rationale = "<no rationale>"
-        if st:
-            lines.append(f"  - [{i}] ({st}) {rationale}")
-        else:
-            lines.append(f"  - [{i}] {rationale}")
-
-    if len(items) > max_items:
-        lines.append(f"  ... ({len(items) - max_items} more)")
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# CDC Runtime Ops
-# ============================================================
-
-def _store_cdc_candidate(thread_id: str, rationale: str) -> str:
-    if thread_id in _RUNTIME_CDC:
-        return "[CDC] candidate already exists; use !wy / !wn / !we."
-    _RUNTIME_CDC[thread_id] = {
-        "rationale": rationale.strip(),
-        "generated_at": _now_iso(),
-    }
-    return "[CDC] candidate generated. Reply with !wy / !wn / !we."
-
-
-def _pop_cdc_candidate(thread_id: str) -> Optional[Dict[str, Any]]:
-    return _RUNTIME_CDC.pop(thread_id, None)
-
-
-def _peek_cdc_candidate(thread_id: str) -> Optional[Dict[str, Any]]:
-    return _RUNTIME_CDC.get(thread_id)
-
-
-# ============================================================
-# WBS Explicit Update
-#   returns: (updated_wbs, hint, finalized_item)
-# ============================================================
-
-def _apply_wbs_update(
-    command: Optional[str],
-    thread_id: Optional[str],
-    packet: InputPacket,
-    wbs: Optional[Dict[str, Any]],
-) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[Dict[str, Any]]]:
-
-    if not command or not thread_id:
-        return wbs, None, None
-
-    # ---- !t ----
-    if command == "task_create":
-        if wbs is not None:
-            return wbs, "[WBS] already exists.", None
-        wbs = create_empty_wbs(_get_thread_name(packet))
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] initialized.", None
-
-    # ---- !tp ----
-    if command == "task_paused":
-        if not wbs:
-            return wbs, "[WBS] not found; pause skipped.", None
-        wbs = on_task_pause(wbs)
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] paused.", None
-
-    # ---- !tc ----
-    if command == "task_end":
-        if not wbs:
-            return wbs, "[WBS] not found; complete skipped.", None
-        wbs = on_task_complete(wbs)
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] completed.", None
-
-    # ---- !wbs / !w ----
-    if command == "wbs_show":
-        if not wbs:
-            return wbs, "[WBS] not found.", None
-        return wbs, _format_wbs_brief(wbs), None
-
-    # ---- !wy ----
-    if command == "wbs_accept":
-        if not wbs:
-            return wbs, "[WBS] not found; run !t first.", None
-        cand = _pop_cdc_candidate(thread_id)
-        if not cand:
-            return wbs, "[CDC] no candidate.", None
-        wbs = accept_work_item(wbs, {"rationale": cand.get("rationale", "")})
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] work_item accepted.", None
-
-    # ---- !wn ----
-    if command == "wbs_reject":
-        cand = _pop_cdc_candidate(thread_id)
-        if not cand:
-            return wbs, "[CDC] no candidate; nothing to reject.", None
-        return wbs, "[CDC] candidate rejected.", None
-
-    # ---- !we ----
-    if command == "wbs_edit":
-        if not wbs:
-            return wbs, "[WBS] not found; run !t first.", None
-        cand = _peek_cdc_candidate(thread_id)
-        if not cand:
-            return wbs, "[CDC] no candidate.", None
-        new_text = (packet.content or "").strip()
-        if not new_text:
-            return wbs, "[CDC] edit text required. Usage: !we <new rationale>", None
-        _pop_cdc_candidate(thread_id)
-        wbs = edit_and_accept_work_item(wbs, {"rationale": cand.get("rationale", "")}, new_text)
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] edited & accepted.", None
-
-    # ---- !wd ----
-    if command == "wbs_done":
-        if not wbs:
-            return wbs, "[WBS] not found; run !t first.", None
-        wbs, finalized = mark_focus_done(wbs)
-        if not finalized:
-            save_thread_wbs(thread_id, wbs)
-            return wbs, "[WBS] no focus_point; nothing done.", None
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] focus work_item marked as done.", finalized
-
-    # ---- !wx ----
-    if command == "wbs_drop":
-        if not wbs:
-            return wbs, "[WBS] not found; run !t first.", None
-        reason = (packet.content or "").strip() or None
-        wbs, finalized = mark_focus_dropped(wbs, reason=reason)
-        if not finalized:
-            save_thread_wbs(thread_id, wbs)
-            return wbs, "[WBS] no focus_point; nothing dropped.", None
-        save_thread_wbs(thread_id, wbs)
-        return wbs, "[WBS] focus work_item marked as dropped.", finalized
-
-    return wbs, None, None
-
-
-# ============================================================
-# ENTRY
-# ============================================================
-
-async def handle_request(packet: InputPacket) -> str:
-    """
-    Boundary_Gate → Interface_Box → Core → Stabilizer
-
-    Debugging Subsystem v1.0:
-      - trace_id は Boundary 生成のものを受領
-      - 例外は握りつぶさず raise（BG_FAILSAFE に集約）
-    """
-    trace_id = _get_trace_id(packet)
-    last_checkpoint = CP_CORE_RECEIVE_PACKET
-    _log_debug(trace_id=trace_id, checkpoint=CP_CORE_RECEIVE_PACKET, summary="core receive packet")
-
-    try:
-        command = packet.command
-        thread_id = _select_thread_id(packet.task_id, packet.context_key)
-
-        # 1) WBS load（失敗は握らず raise：No Silent Death）
-        last_checkpoint = CP_CORE_PARSE_INTENT
-        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_PARSE_INTENT, summary="load thread_wbs")
-        wbs: Optional[Dict[str, Any]] = load_thread_wbs(thread_id) if thread_id else None
-
-        # 2) WBS explicit update（明示コマンドのみ）
-        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_PARSE_INTENT, summary="apply wbs explicit update")
-        wbs_hint: Optional[str] = None
-        finalized_item: Optional[Dict[str, Any]] = None
-        wbs, wbs_hint, finalized_item = _apply_wbs_update(command, thread_id, packet, wbs)
-
-        # 3) Core dispatch（WBS は参照コンテキストとして渡す）
-        last_checkpoint = CP_CORE_EXECUTE
-        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_EXECUTE, summary="run core")
-        core_input = {
-            "command_type": command,
-            "raw_text": packet.raw,
-            "arg_text": packet.content,
-            "task_id": packet.task_id,
-            "context_key": packet.context_key,
-            "user_id": packet.author_id,
-            "thread_wbs": wbs,
-        }
-        core_output = run_core(core_input)
-
-        # 4) CDC candidate store（task_create のみ、Runtime only）
-        cdc_hint: Optional[str] = None
-        if command == "task_create" and thread_id:
-            cdc = core_output.get("cdc_candidate")
-            if isinstance(cdc, dict):
-                r = cdc.get("rationale")
-                if isinstance(r, str) and r.strip():
-                    cdc_hint = _store_cdc_candidate(thread_id, r)
-
-        # 5) message compose（上書き禁止：追記のみ）
-        message = core_output.get("message_for_user", "") or ""
-        for h in (wbs_hint, cdc_hint):
-            if isinstance(h, str) and h.strip():
-                message = f"{message}\n\n{h}" if message else h
-
-        # 6) NotionOps builder
-        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_EXECUTE, summary="build notion ops")
-        notion_ops = build_notion_ops(core_output, request=_PacketProxy(packet))
-
-        # 7) Stabilizer
-        #    NOTE: wbs_done / wbs_drop は Core.mode が free_chat になり得るため、
-        #          Stabilizer には command を優先して渡す（summary 発火のため）。
-        command_type_for_stabilizer = core_output.get("mode") or command
-
-        thread_state: Dict[str, Any] = {}
-        if wbs:
-            thread_state["thread_wbs"] = wbs
-        if finalized_item:
-            thread_state["finalized_item"] = finalized_item
-
-        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_RETURN_RESULT, summary="call stabilizer.finalize")
-        stabilizer = Stabilizer(
-            message_for_user=message,
-            notion_ops=notion_ops,
-            context_key=packet.context_key,
-            user_id=packet.author_id,
-            task_id=packet.task_id,
-            command_type=command_type_for_stabilizer,
-            core_output=core_output,
-            thread_state=thread_state if thread_state else None,
-        )
-
-        result = await stabilizer.finalize()
-        _log_debug(trace_id=trace_id, checkpoint=CP_CORE_RETURN_RESULT, summary="return result")
-        return result
-
-    except Exception as e:
-        last_checkpoint = CP_CORE_EXCEPTION
-        _log_error(
-            trace_id=trace_id,
-            checkpoint=CP_CORE_EXCEPTION,
-            summary="exception in interface_box",
-            code="E_CORE",
-            exc=e,
-            at=last_checkpoint,
-            retryable=False,
-        )
-        traceback.print_exc()
-        raise  # BG_FAILSAFE に集約
-
-
-class _PacketProxy:
-    def __init__(self, packet: InputPacket):
-        self.task_id = packet.task_id
-        self.user_meta = packet.user_meta
-        self.context_key = packet.context_key
-        self.meta = packet.meta
-
-    def __repr__(self) -> str:
-        return f"<PacketProxy task_id={self.task_id}>"
+    # 完全委譲
+    return handle_packet(packet)
