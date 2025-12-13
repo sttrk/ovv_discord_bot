@@ -135,6 +135,9 @@ def _get_trace_id(packet: InputPacket) -> str:
     - packet.trace_id があればそれを優先
     - なければ packet.meta["trace_id"] を参照
     - それも無ければ "UNKNOWN"
+
+    NOTE:
+      - InputPacket が trace_id フィールドを未実装の場合にも耐える。
     """
     tid = getattr(packet, "trace_id", None)
     if isinstance(tid, str) and tid:
