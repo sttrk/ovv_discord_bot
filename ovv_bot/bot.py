@@ -63,7 +63,12 @@ print("=== AFTER bot_notifier import ===")
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="", intents=intents)
+# IMPORTANT:
+# discord.py command system is isolated by internal-only prefix
+bot = commands.Bot(
+    command_prefix="__OVV_INTERNAL__",
+    intents=intents,
+)
 
 # ================================================================
 # Debug Command Suite 登録
@@ -104,7 +109,6 @@ async def on_message(message: discord.Message):
       - Gate-Assist (discord.py commands)
       - Ovv BIS Pipeline (Boundary_Gate)
     """
-    # Bot自身の発言は無視
     if message.author.bot:
         return
 
