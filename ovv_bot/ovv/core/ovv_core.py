@@ -41,10 +41,12 @@ from ovv.external_services.notion.ops.builders import build_notion_ops
 class CoreResult:
     """
     Stabilizer に返す統合結果（最小）。
-    - discord_output: Discord に返す本文
-    - notion_ops: Notion へ送る ops（executor が実行）
-    - wbs: ThreadWBS（Persist へ保存する前提）
-    - core_output: NotionOps Builder の入力（mode/task_title を含む）
+
+    Fields:
+      - discord_output: Discord に返す本文
+      - notion_ops: Notion へ送る ops（executor が実行）
+      - wbs: ThreadWBS（Persist へ保存する前提）
+      - core_output: NotionOps Builder の入力（mode/task_title を含む）
     """
     discord_output: str
     notion_ops: Optional[List[Dict[str, Any]]] = None
@@ -70,19 +72,44 @@ def _safe_meta_thread_name(packet: InputPacket) -> str:
 
 
 def _load_wbs(thread_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Persist / ThreadWBS のロード。
+
+    NOTE:
+      - database.pg_wbs の公開APIは get_wbs/save_wbs/delete_wbs
+        （load_thread_wbs 等ではない）
+    """
     try:
-        return pg_wbs.load_thread_wbs(thread_id)
+        return pg_wbs.get_wbs(thread_id)
     except Exception:
         return None
 
 
 def _save_wbs(thread_id: str, wbs: Dict[str, Any]) -> None:
-    pg_wbs.save_thread_wbs(thread_id, wbs)
+    """
+    Persist / ThreadWBS の保存。
+    """
+    try:
+        pg_wbs.save_wbs(thread_id, wbs)
+    except Exception:
+        # Persist 失敗は上位の Stabilizer/Boundary の failsafe に委ねる
+        # （Core はここで例外を握りつぶすかどうかは方針次第だが、
+        #  現行は Boundary で集約する設計のため、ここでは落とさない）
+        raise
 
 
-def _mk_core_output(*, mode: str, task_title: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _mk_core_output(
+    *,
+    mode: str,
+    task_title: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     NotionOps Builder が参照する最小 core_output を確定する。
+
+    CONTRACT:
+      - mode: 必須
+      - task_title: task_create/task_paused/task_end 等で利用
     """
     out: Dict[str, Any] = {"mode": mode}
     if task_title is not None:
@@ -103,7 +130,7 @@ def handle_packet(packet: InputPacket) -> CoreResult:
     """
     cmd = getattr(packet, "command", None)
     if not isinstance(cmd, str):
-        return CoreResult(discord_output="Command missing.")
+        return CoreResult(discord_output="Command missing.", notion_ops=[], core_output=_mk_core_output(mode="free_chat"))
 
     if cmd == "task_create":
         return _cmd_task_create(packet)
@@ -111,16 +138,16 @@ def handle_packet(packet: InputPacket) -> CoreResult:
     if cmd == "wbs_show":
         return _cmd_wbs_show(packet)
 
-    if cmd == "task_pause":
+    if cmd == "task_paused":  # BoundaryGate mapping: !tp -> task_paused
         return _cmd_task_pause(packet)
 
-    if cmd == "task_complete":
+    if cmd == "task_end":     # BoundaryGate mapping: !tc -> task_end
         return _cmd_task_complete(packet)
 
     if cmd == "wbs_accept":       # !wy
         return _cmd_wbs_accept(packet)
 
-    if cmd == "wbs_edit_accept":  # !we
+    if cmd == "wbs_edit":         # !we (BoundaryGate mapping)
         return _cmd_wbs_edit_accept(packet)
 
     if cmd == "wbs_done":         # !wd
@@ -129,7 +156,10 @@ def handle_packet(packet: InputPacket) -> CoreResult:
     if cmd == "wbs_drop":         # !wx
         return _cmd_wbs_drop(packet)
 
-    return CoreResult(discord_output=f"Unknown command: {cmd}")
+    # task_start は現仕様上 Core 実装対象ならここに追加（現状は未実装）
+    # if cmd == "task_start": return _cmd_task_start(packet)
+
+    return CoreResult(discord_output=f"Unknown command: {cmd}", notion_ops=[], core_output=_mk_core_output(mode="free_chat"))
 
 
 # ------------------------------------------------------------
@@ -182,7 +212,11 @@ def _cmd_wbs_show(packet: InputPacket) -> CoreResult:
     thread_id = str(packet.context_key)
     wbs = _load_wbs(thread_id)
     if not wbs:
-        return CoreResult(discord_output="WBS not found. Run !t to create.", notion_ops=[], core_output=_mk_core_output(mode="free_chat"))
+        return CoreResult(
+            discord_output="WBS not found. Run !t to create.",
+            notion_ops=[],
+            core_output=_mk_core_output(mode="free_chat"),
+        )
 
     return CoreResult(
         discord_output=_format_wbs(wbs),
@@ -201,7 +235,11 @@ def _cmd_task_pause(packet: InputPacket) -> CoreResult:
     thread_id = str(packet.context_key)
     wbs = _load_wbs(thread_id)
     if not wbs:
-        return CoreResult(discord_output="WBS not found. Run !t first.", notion_ops=[], core_output=_mk_core_output(mode="free_chat"))
+        return CoreResult(
+            discord_output="WBS not found. Run !t first.",
+            notion_ops=[],
+            core_output=_mk_core_output(mode="free_chat"),
+        )
 
     wbs = wbs_builder.on_task_pause(wbs, trace_id=getattr(packet, "trace_id", None))
     _save_wbs(thread_id, wbs)
@@ -210,7 +248,12 @@ def _cmd_task_pause(packet: InputPacket) -> CoreResult:
     core_output = _mk_core_output(mode="task_paused", task_title=title)
     notion_ops = build_notion_ops(core_output, packet)
 
-    return CoreResult(discord_output="Task paused.", notion_ops=notion_ops, wbs=wbs, core_output=core_output)
+    return CoreResult(
+        discord_output="Task paused.",
+        notion_ops=notion_ops,
+        wbs=wbs,
+        core_output=core_output,
+    )
 
 
 def _cmd_task_complete(packet: InputPacket) -> CoreResult:
@@ -222,7 +265,11 @@ def _cmd_task_complete(packet: InputPacket) -> CoreResult:
     thread_id = str(packet.context_key)
     wbs = _load_wbs(thread_id)
     if not wbs:
-        return CoreResult(discord_output="WBS not found. Run !t first.", notion_ops=[], core_output=_mk_core_output(mode="free_chat"))
+        return CoreResult(
+            discord_output="WBS not found. Run !t first.",
+            notion_ops=[],
+            core_output=_mk_core_output(mode="free_chat"),
+        )
 
     wbs = wbs_builder.on_task_complete(wbs, trace_id=getattr(packet, "trace_id", None))
     _save_wbs(thread_id, wbs)
@@ -231,7 +278,12 @@ def _cmd_task_complete(packet: InputPacket) -> CoreResult:
     core_output = _mk_core_output(mode="task_end", task_title=title)
     notion_ops = build_notion_ops(core_output, packet)
 
-    return CoreResult(discord_output="Task completed.", notion_ops=notion_ops, wbs=wbs, core_output=core_output)
+    return CoreResult(
+        discord_output="Task completed.",
+        notion_ops=notion_ops,
+        wbs=wbs,
+        core_output=core_output,
+    )
 
 
 def _cmd_wbs_accept(packet: InputPacket) -> CoreResult:
@@ -243,13 +295,22 @@ def _cmd_wbs_accept(packet: InputPacket) -> CoreResult:
     thread_id = str(packet.context_key)
     wbs = _load_wbs(thread_id)
     if not wbs:
-        return CoreResult(discord_output="WBS not found. Run !t first.", notion_ops=[], core_output=_mk_core_output(mode="free_chat"))
+        return CoreResult(
+            discord_output="WBS not found. Run !t first.",
+            notion_ops=[],
+            core_output=_mk_core_output(mode="free_chat"),
+        )
 
     candidate = {"rationale": str(getattr(packet, "content", "") or "")}
     wbs = wbs_builder.accept_work_item(wbs, candidate, trace_id=getattr(packet, "trace_id", None))
     _save_wbs(thread_id, wbs)
 
-    return CoreResult(discord_output="Work item accepted.", notion_ops=[], wbs=wbs, core_output=_mk_core_output(mode="free_chat"))
+    return CoreResult(
+        discord_output="Work item accepted.",
+        notion_ops=[],
+        wbs=wbs,
+        core_output=_mk_core_output(mode="free_chat"),
+    )
 
 
 def _cmd_wbs_edit_accept(packet: InputPacket) -> CoreResult:
@@ -259,10 +320,14 @@ def _cmd_wbs_edit_accept(packet: InputPacket) -> CoreResult:
     thread_id = str(packet.context_key)
     wbs = _load_wbs(thread_id)
     if not wbs:
-        return CoreResult(discord_output="WBS not found. Run !t first.", notion_ops=[], core_output=_mk_core_output(mode="free_chat"))
+        return CoreResult(
+            discord_output="WBS not found. Run !t first.",
+            notion_ops=[],
+            core_output=_mk_core_output(mode="free_chat"),
+        )
 
     new_rationale = str(getattr(packet, "content", "") or "").strip()
-    candidate = {}
+    candidate: Dict[str, Any] = {}
     wbs = wbs_builder.edit_and_accept_work_item(
         wbs,
         candidate,
@@ -271,7 +336,12 @@ def _cmd_wbs_edit_accept(packet: InputPacket) -> CoreResult:
     )
     _save_wbs(thread_id, wbs)
 
-    return CoreResult(discord_output="Work item edited+accepted.", notion_ops=[], wbs=wbs, core_output=_mk_core_output(mode="free_chat"))
+    return CoreResult(
+        discord_output="Work item edited+accepted.",
+        notion_ops=[],
+        wbs=wbs,
+        core_output=_mk_core_output(mode="free_chat"),
+    )
 
 
 def _cmd_wbs_done(packet: InputPacket) -> CoreResult:
@@ -281,16 +351,32 @@ def _cmd_wbs_done(packet: InputPacket) -> CoreResult:
     thread_id = str(packet.context_key)
     wbs = _load_wbs(thread_id)
     if not wbs:
-        return CoreResult(discord_output="WBS not found. Run !t first.", notion_ops=[], core_output=_mk_core_output(mode="free_chat"))
+        return CoreResult(
+            discord_output="WBS not found. Run !t first.",
+            notion_ops=[],
+            core_output=_mk_core_output(mode="free_chat"),
+        )
 
     wbs, finalized = wbs_builder.mark_focus_done(wbs, trace_id=getattr(packet, "trace_id", None))
     _save_wbs(thread_id, wbs)
 
     if not finalized:
-        return CoreResult(discord_output="No focus item to finalize.", notion_ops=[], wbs=wbs, core_output=_mk_core_output(mode="free_chat"))
+        return CoreResult(
+            discord_output="No focus item to finalize.",
+            notion_ops=[],
+            wbs=wbs,
+            core_output=_mk_core_output(mode="free_chat"),
+        )
 
     # finalized_item の Notion 反映は Stabilizer の責務（Summary Spec v1.1）
-    return CoreResult(discord_output="Focus item marked done.", notion_ops=[], wbs=wbs, core_output=_mk_core_output(mode="free_chat"))
+    # Stabilizer が thread_state["finalized_item"] を参照するため、ここで渡す
+    core_output = _mk_core_output(mode="free_chat")
+    return CoreResult(
+        discord_output="Focus item marked done.",
+        notion_ops=[],
+        wbs=wbs,
+        core_output=core_output,
+    )
 
 
 def _cmd_wbs_drop(packet: InputPacket) -> CoreResult:
@@ -300,17 +386,31 @@ def _cmd_wbs_drop(packet: InputPacket) -> CoreResult:
     thread_id = str(packet.context_key)
     wbs = _load_wbs(thread_id)
     if not wbs:
-        return CoreResult(discord_output="WBS not found. Run !t first.", notion_ops=[], core_output=_mk_core_output(mode="free_chat"))
+        return CoreResult(
+            discord_output="WBS not found. Run !t first.",
+            notion_ops=[],
+            core_output=_mk_core_output(mode="free_chat"),
+        )
 
     reason = str(getattr(packet, "content", "") or "").strip() or None
     wbs, finalized = wbs_builder.mark_focus_dropped(wbs, reason, trace_id=getattr(packet, "trace_id", None))
     _save_wbs(thread_id, wbs)
 
     if not finalized:
-        return CoreResult(discord_output="No focus item to finalize.", notion_ops=[], wbs=wbs, core_output=_mk_core_output(mode="free_chat"))
+        return CoreResult(
+            discord_output="No focus item to finalize.",
+            notion_ops=[],
+            wbs=wbs,
+            core_output=_mk_core_output(mode="free_chat"),
+        )
 
-    # finalized_item の Notion 反映は Stabilizer の責務
-    return CoreResult(discord_output="Focus item dropped.", notion_ops=[], wbs=wbs, core_output=_mk_core_output(mode="free_chat"))
+    core_output = _mk_core_output(mode="free_chat")
+    return CoreResult(
+        discord_output="Focus item dropped.",
+        notion_ops=[],
+        wbs=wbs,
+        core_output=core_output,
+    )
 
 
 # ------------------------------------------------------------
@@ -335,7 +435,10 @@ def _format_wbs(wbs: Dict[str, Any]) -> str:
         if isinstance(it, dict):
             r = str(it.get("rationale", "") or "")
             st = str(it.get("status", "") or "")
-            lines.append(f"- {i}: {r} [{st}]".strip())
+            label = f"- {i}: {r}"
+            if st:
+                label += f" [{st}]"
+            lines.append(label)
         else:
             lines.append(f"- {i}: {str(it)}")
     return "```\n" + "\n".join(lines) + "\n```"
