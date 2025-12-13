@@ -43,20 +43,23 @@ for p in sys.path:
 print("=== END SYSPATH ===\n")
 
 # ================================================================
-# Discord Bot 初期化
+# Discord Bot 初期化（Import Boundary）
 # ================================================================
 print("=== BEFORE boundary_gate import ===")
 from ovv.bis.boundary_gate import handle_discord_input
 print("=== AFTER boundary_gate import ===")
 
 print("=== BEFORE debug_commands import ===")
-from ovv.debug.debug_commands import register_debug_commands
+from ovv.bis.utils.debug.debug_commands import register_debug_commands
 print("=== AFTER debug_commands import ===")
 
 print("=== BEFORE deploy_notifier import ===")
-from ovv.debug.deploy_notifier import notify_deploy_ok
+from ovv.bis.utils.debug.deploy_notifier import notify_deploy_ok
 print("=== AFTER deploy_notifier import ===")
 
+# ================================================================
+# Discord Bot Instance
+# ================================================================
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -89,6 +92,7 @@ async def on_ready():
         )
         print("[DEBUG] Deploy notification sent.")
     except Exception as e:
+        # 観測系は Bot 継続を最優先
         print("[DEBUG] Deploy notification failed (ignored):", repr(e))
 
 
