@@ -10,7 +10,7 @@
 #   [DISCORD_IO]   Discord イベント処理
 #   [DELEGATE]     Boundary_Gate への完全委譲
 #   [DEBUG]        起動時の環境可視化 / Debug Command Suite 登録
-#   [OBSERVE]      デプロイ時デバッグ通知（Webhook）
+#   [OBSERVE]      デプロイ時デバッグ通知（Bot 自身による送信）
 #
 # CONSTRAINTS:
 #   - Core / WBS / Persist / Notion を直接触らない
@@ -43,7 +43,7 @@ for p in sys.path:
 print("=== END SYSPATH ===\n")
 
 # ================================================================
-# Discord Bot 初期化（Import Boundary）
+# Import Boundary
 # ================================================================
 print("=== BEFORE boundary_gate import ===")
 from ovv.bis.boundary_gate import handle_discord_input
@@ -53,9 +53,9 @@ print("=== BEFORE debug_commands import ===")
 from ovv.bis.utils.debug.debug_commands import register_debug_commands
 print("=== AFTER debug_commands import ===")
 
-print("=== BEFORE deploy_notifier import ===")
-from ovv.bis.utils.debug.deploy_notifier import notify_deploy_ok
-print("=== AFTER deploy_notifier import ===")
+print("=== BEFORE bot_notifier import ===")
+from ovv.bis.utils.debug.bot_notifier import notify_deploy_ok_via_bot
+print("=== AFTER bot_notifier import ===")
 
 # ================================================================
 # Discord Bot Instance
@@ -83,14 +83,15 @@ async def on_ready():
     print(f"[Discord] Bot logged in as {bot.user}")
 
     try:
-        notify_deploy_ok(
+        await notify_deploy_ok_via_bot(
+            bot,
             checks={
                 "discord_login": "OK",
                 "debug_commands": "registered",
                 "boundary_gate": "ready",
             }
         )
-        print("[DEBUG] Deploy notification sent.")
+        print("[DEBUG] Deploy notification sent via bot.")
     except Exception as e:
         # 観測系は Bot 継続を最優先
         print("[DEBUG] Deploy notification failed (ignored):", repr(e))
