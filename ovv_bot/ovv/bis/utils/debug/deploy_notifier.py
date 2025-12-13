@@ -49,12 +49,11 @@ def _send_webhook(payload: Dict[str, Any]) -> None:
 
     try:
         body = json.dumps(
-            {
-                # Discord Webhook は content or embeds を期待する
-                "content": "```json\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n```"
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
+    {
+        "content": "Ovv deploy ok"
+    },
+    ensure_ascii=False,
+).encode("utf-8")
 
         req = urllib.request.Request(
             WEBHOOK_URL,
