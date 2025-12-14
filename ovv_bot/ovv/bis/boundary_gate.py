@@ -1,6 +1,7 @@
 # ovv/bis/boundary_gate.py
 # ============================================================
-# MODULE CONTRACT: BIS / Boundary_Gate v3.8.1 (Intent Capture)
+# MODULE CONTRACT: BIS / Boundary_Gate v3.8.1
+#   (free_chat pass-through enabled)
 # ============================================================
 
 from __future__ import annotations
@@ -13,24 +14,10 @@ from datetime import datetime, timezone
 
 from .types import InputPacket
 from .interface_box import handle_request
-from .capture_interface_packet import capture  # dbg_packet 用
+from .capture_interface_packet import capture
 
-# Intent (NEW)
-from ovv.intent.types import Intent
-from ovv.intent.store import intent_store
-from ovv.intent.repository import save_intent
-
-
-# ------------------------------------------------------------
-# Debug Flag
-# ------------------------------------------------------------
 
 DEBUG_BIS = True
-
-
-# ------------------------------------------------------------
-# Debug Command Suite (Gate-Assist)
-# ------------------------------------------------------------
 
 _DEBUG_COMMAND_HEADS = {
     "bs", "!bs",
@@ -43,11 +30,6 @@ _DEBUG_COMMAND_HEADS = {
     "dbg_help", "!dbg_help",
 }
 
-
-# ------------------------------------------------------------
-# Debugging Subsystem v1.0 — Checkpoints
-# ------------------------------------------------------------
-
 LAYER_BG = "BG"
 
 CP_BG_ENTRY = "BG_ENTRY"
@@ -57,23 +39,12 @@ CP_BG_DISPATCH_CORE = "BG_DISPATCH_CORE"
 CP_BG_FAILSAFE = "BG_FAILSAFE"
 
 
-# ------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _log_event(
-    *,
-    trace_id: str,
-    checkpoint: str,
-    layer: str,
-    level: str,
-    summary: str,
-    error: Optional[Dict[str, Any]] = None,
-) -> None:
+def _log_event(*, trace_id: str, checkpoint: str, layer: str, level: str,
+               summary: str, error: Optional[Dict[str, Any]] = None) -> None:
     payload: Dict[str, Any] = {
         "trace_id": trace_id,
         "checkpoint": checkpoint,
@@ -97,16 +68,9 @@ def _log_debug(*, trace_id: str, checkpoint: str, summary: str) -> None:
     )
 
 
-def _log_error(
-    *,
-    trace_id: str,
-    checkpoint: str,
-    summary: str,
-    code: str,
-    exc: Exception,
-    at: str,
-    retryable: bool = False,
-) -> None:
+def _log_error(*, trace_id: str, checkpoint: str, summary: str,
+               code: str, exc: Exception, at: str,
+               retryable: bool = False) -> None:
     _log_event(
         trace_id=trace_id,
         checkpoint=checkpoint,
@@ -122,10 +86,6 @@ def _log_error(
         },
     )
 
-
-# ------------------------------------------------------------
-# Command 判定
-# ------------------------------------------------------------
 
 def _detect_command_type(raw: str) -> Optional[str]:
     if not raw:
@@ -148,7 +108,6 @@ def _detect_command_type(raw: str) -> Optional[str]:
         "!wbs": "wbs_show",
         "!w": "wbs_show",
     }
-
     return mapping.get(head)
 
 
@@ -158,10 +117,6 @@ def _strip_head_token(raw: str) -> str:
     parts = raw.strip().split(maxsplit=1)
     return parts[1] if len(parts) == 2 else ""
 
-
-# ------------------------------------------------------------
-# Internal helpers
-# ------------------------------------------------------------
 
 def _safe_get_channel(message: Any) -> Any:
     return getattr(message, "channel", None)
@@ -209,28 +164,15 @@ def _build_input_packet_failsafe(
         task_id=task_id,
         user_meta=user_meta,
         meta=dict(meta),
+        trace_id=trace_id,
     )
-    kwargs["trace_id"] = trace_id
-
     try:
-        return InputPacket(**kwargs)  # type: ignore[arg-type]
+        return InputPacket(**kwargs)
     except TypeError:
         kwargs.pop("trace_id", None)
         kwargs["meta"]["trace_id"] = trace_id
-        return InputPacket(**kwargs)  # type: ignore[arg-type]
+        return InputPacket(**kwargs)
 
-
-def _bg_failsafe_message(trace_id: str, last_checkpoint: str) -> str:
-    return (
-        "[Boundary Error] internal failure in BIS pipeline.\n"
-        f"- trace_id: {trace_id}\n"
-        f"- last_checkpoint: {last_checkpoint}"
-    )
-
-
-# ------------------------------------------------------------
-# Public API
-# ------------------------------------------------------------
 
 async def handle_discord_input(message: Any) -> None:
     trace_id = str(uuid.uuid4())
@@ -249,56 +191,21 @@ async def handle_discord_input(message: Any) -> None:
         if head in _DEBUG_COMMAND_HEADS:
             return
 
-        command_type = _detect_command_type(raw_content)
+        # ★ ここが変更点：None → free_chat
+        command_type = _detect_command_type(raw_content) or "free_chat"
 
         channel_id, thread_name, channel = _extract_discord_context(message)
-        author_id, user_name = _extract_author_meta(message)
+        if not channel_id:
+            return
 
+        author_id, user_name = _extract_author_meta(message)
         context_key = channel_id
         task_id = context_key
 
-        # ====================================================
-        # INTENT CAPTURE (NEW)
-        # ====================================================
-        if command_type is None:
-            intent = Intent(
-                context_key=context_key,
-                raw_text=raw_content,
-                meta={
-                    "author_id": author_id,
-                    "user_name": user_name,
-                    "discord_channel_id": channel_id,
-                    "trace_id": trace_id,
-                },
-            )
+        user_meta = {"user_id": author_id, "user_name": user_name}
+        content = _strip_head_token(raw_content).strip()
 
-            intent_store.push(intent)
-
-            try:
-                save_intent(intent)
-            except Exception as e:
-                _log_error(
-                    trace_id=trace_id,
-                    checkpoint=CP_BG_VALIDATE_INPUT,
-                    summary="intent persist failed (non-fatal)",
-                    code="E_BG_INTENT_SAVE",
-                    exc=e,
-                    at="INTENT_SAVE",
-                    retryable=True,
-                )
-
-            _log_debug(
-                trace_id=trace_id,
-                checkpoint=CP_BG_VALIDATE_INPUT,
-                summary="non-command message captured as intent",
-            )
-            return
-
-        # ====================================================
-        # NORMAL BIS PIPELINE
-        # ====================================================
-        content = _strip_head_token(raw_content)
-
+        last_checkpoint = CP_BG_BUILD_PACKET
         packet = _build_input_packet_failsafe(
             trace_id=trace_id,
             raw_content=raw_content,
@@ -308,7 +215,7 @@ async def handle_discord_input(message: Any) -> None:
             channel_id=channel_id,
             context_key=context_key,
             task_id=task_id,
-            user_meta={"user_id": author_id, "user_name": user_name},
+            user_meta=user_meta,
             meta={
                 "discord_channel_id": channel_id,
                 "discord_message_id": str(getattr(message, "id", "") or ""),
@@ -321,7 +228,9 @@ async def handle_discord_input(message: Any) -> None:
         except Exception:
             pass
 
+        last_checkpoint = CP_BG_DISPATCH_CORE
         final_message = await handle_request(packet)
+
         if final_message and channel is not None:
             await channel.send(final_message)
 
@@ -332,7 +241,7 @@ async def handle_discord_input(message: Any) -> None:
             summary="unexpected boundary exception",
             code="E_BG_UNEXPECTED",
             exc=e,
-            at="BG",
+            at=last_checkpoint,
             retryable=False,
         )
         if DEBUG_BIS:
