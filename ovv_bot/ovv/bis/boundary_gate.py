@@ -1,6 +1,6 @@
 # ovv/bis/boundary_gate.py
 # ============================================================
-# MODULE CONTRACT: BIS / Boundary_Gate v3.8.1
+# MODULE CONTRACT: BIS / Boundary_Gate v3.8.2
 #   (Debugging Subsystem v1.0 compliant: trace_id + checkpoints + failsafe)
 #
 # ROLE:
@@ -23,9 +23,12 @@
 #   - Debug Command Suite は Gate-Assist（discord.py commands）側の責務。
 #     Boundary_Gate は debug 入力を BIS に流さない（二重応答/境界汚染防止）。
 #
-# CHANGELOG (v3.8.1):
-#   - 非コマンド文を drop せず "free_chat" として BIS に流す（UI版Ovv寄せ）
-#   - "!" から始まる未知コマンドは "unknown_command" として Core に委譲
+# CHANGELOG:
+#   - v3.8.1:
+#       - 非コマンド文を drop せず "free_chat" として BIS に流す（UI版Ovv寄せ）
+#       - "!" から始まる未知コマンドは "unknown_command" として Core に委譲
+#   - v3.8.2:
+#       - "!wbs+" を "wbs_show_full" にマップ（Stableを壊さず Volatile overview 表示の入口）
 # ============================================================
 
 from __future__ import annotations
@@ -180,9 +183,12 @@ def _detect_command_type(raw: str) -> Optional[str]:
         "!wd": "wbs_done",
         "!wx": "wbs_drop",
 
-        # WBS show
+        # WBS show (stable)
         "!wbs": "wbs_show",
         "!w": "wbs_show",
+
+        # WBS show (stable + volatile overview)
+        "!wbs+": "wbs_show_full",
 
         # 旧互換
         "!task": "task_create",
