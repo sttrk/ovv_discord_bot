@@ -1,6 +1,15 @@
 # ovv/bis/stabilizer.py
 # ============================================================
-# MODULE CONTRACT: BIS / Stabilizer v3.11 (FIXED)
+# MODULE CONTRACT: BIS / Stabilizer v3.11 (FIXED / SANITIZED)
+#
+# ROLE:
+#   - CoreResult を受け取り、最終的な副作用（Persist / Notion）を制御
+#   - Discord へ返す文字列を唯一保証する「最終安定化層」
+#
+# CONSTRAINTS:
+#   - 推論しない
+#   - Core / WBS の意味構造を改変しない
+#   - 副作用は mode に基づき明示的に制御する
 # ============================================================
 
 from __future__ import annotations
@@ -18,7 +27,7 @@ from database.pg import (
 )
 
 # ============================================================
-# Debugging Subsystem v1.0 — Checkpoints
+# Debugging Subsystem v1.0 — Checkpoints (FIXED)
 # ============================================================
 
 LAYER_ST = "ST"
@@ -95,7 +104,7 @@ def _log_error(
     )
 
 
-def _get_trace_id(context_key: Optional[str], core_output: Dict[str, Any]) -> str:
+def _resolve_trace_id(context_key: Optional[str], core_output: Dict[str, Any]) -> str:
     tid = core_output.get("trace_id")
     if isinstance(tid, str) and tid:
         return tid
@@ -123,7 +132,7 @@ class Stabilizer:
         core_output: Optional[Dict[str, Any]] = None,
         thread_state: Optional[Dict[str, Any]] = None,
     ):
-        self.message_for_user = message_for_user or ""
+        self.message_for_user = str(message_for_user or "")
         self.notion_ops = self._normalize_ops(notion_ops)
 
         self.context_key = context_key
@@ -134,7 +143,7 @@ class Stabilizer:
         self.thread_state = thread_state or {}
 
         self.mode: str = str(self.core_output.get("mode") or "unknown")
-        self.trace_id = _get_trace_id(context_key, self.core_output)
+        self.trace_id = _resolve_trace_id(context_key, self.core_output)
 
         self._last_duration_seconds: Optional[int] = None
 
@@ -151,6 +160,22 @@ class Stabilizer:
         if isinstance(raw, dict):
             return [raw]
         return []
+
+    # ========================================================
+    # [SANITIZE]
+    # ========================================================
+
+    def _sanitize(self) -> None:
+        """
+        Stabilizer 入力の最小正規化。
+        - 副作用条件を壊さない
+        - 文字列 / list / dict のみ保証
+        """
+        self.message_for_user = str(self.message_for_user or "").strip()
+        if not isinstance(self.core_output, dict):
+            self.core_output = {}
+        if not isinstance(self.thread_state, dict):
+            self.thread_state = {}
 
     # ========================================================
     # [PERSIST]
@@ -255,6 +280,13 @@ class Stabilizer:
             checkpoint=CP_ST_RECEIVE_RESULT,
             summary="stabilizer receive result",
         )
+
+        _log_debug(
+            trace_id=self.trace_id,
+            checkpoint=CP_ST_SANITIZE,
+            summary="sanitize stabilizer input",
+        )
+        self._sanitize()
 
         try:
             self._write_persist()
