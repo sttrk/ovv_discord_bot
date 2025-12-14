@@ -1,6 +1,6 @@
 # ovv/bis/interface_box.py
 # ============================================================
-# MODULE CONTRACT: BIS / Interface_Box v1.5
+# MODULE CONTRACT: BIS / Interface_Box v1.5 (STABLE)
 #
 # ROLE:
 #   - Boundary_Gate から受け取った InputPacket を Core に委譲
@@ -132,6 +132,30 @@ def _safe_user_id(packet: InputPacket) -> str:
     return ""
 
 
+def _build_thread_state(core_result: CoreResult) -> Dict[str, Any]:
+    """
+    Stabilizer が参照する thread_state を **包装のみ**で構築する。
+
+    IMPORTANT:
+      - Core の wbs / core_output を改変しない。
+      - thread_state は「wbs を直置き」せず、キー付きで持たせる。
+        （Stabilizer が finalized_item を参照する設計のため、拡張余地が必要）
+    """
+    state: Dict[str, Any] = {}
+
+    if isinstance(core_result.wbs, dict):
+        state["wbs"] = core_result.wbs
+
+    # 将来: Core が core_output["finalized_item"] 等を返すようになった場合に備える
+    co = core_result.core_output
+    if isinstance(co, dict):
+        fi = co.get("finalized_item")
+        if isinstance(fi, dict):
+            state["finalized_item"] = fi
+
+    return state
+
+
 # ============================================================
 # Public entry
 # ============================================================
@@ -194,7 +218,7 @@ async def handle_request(packet: InputPacket) -> str:
         task_id=_safe_str(packet.task_id),
         command_type=_safe_str(packet.command),
         core_output=core_result.core_output or {},   # ★ Core の構造をそのまま
-        thread_state=core_result.wbs or {},          # ★ Core の wbs をそのまま（finalized_item 将来対応）
+        thread_state=_build_thread_state(core_result),  # ★ 包装のみ（改変しない）
     )
 
     try:
